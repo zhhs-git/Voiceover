@@ -1,0 +1,14 @@
+{
+  "name": "audiobook-generator",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces",
+    "web:build": "npm run build --workspace @audiobook-generator/desktop",
+    "web": "npm run web:build && ./workers/python/.venv/bin/python -m audiobook_worker.web_server --frontend-dir apps/desktop/dist",
+    "web:dev": "bash scripts/web-dev.sh"
+  }
+}

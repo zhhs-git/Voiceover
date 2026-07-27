@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audiobook-worker"
+version = "0.1.0"
+description = "Local processing workers for the audiobook generator"
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4>=4.12.0",
+  "ebooklib>=0.18",
+  "pymupdf>=1.24.0",
+  "pytesseract>=0.3.10",
+  "Pillow>=10.0.0",
+  "torch>=2.3.0",
+  "transformers>=4.40.0",
+  "parler-tts>=0.2.0",
+  "soundfile>=0.12.1",
+  "kokoro>=0.9.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.15.0"
+]
+
+[project.scripts]
+audiobook-worker = "audiobook_worker.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

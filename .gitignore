@@ -1,0 +1,38 @@
+.worktrees/
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+dist/
+target/
+apps/desktop/src-tauri/gen/
+.claude/
+.cargo/
+.hermes/
+.pi/
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Runtime data and logs
+data/
+uploads/
+books/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Test and formatter caches
+.pytest_cache/
+.ruff_cache/
+.DS_Store
