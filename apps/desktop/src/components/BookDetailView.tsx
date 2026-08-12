@@ -37,6 +37,7 @@ import {
 import { WorkflowSteps, workflowStatusLabel } from "./WorkflowSteps";
 
 const db = createAudiobookStore();
+const NOOP_SET_CURRENT_STEP = () => {};
 
 const AGE_LABELS: Record<string, string> = {
   child: "儿童",
@@ -198,6 +199,7 @@ export function BookDetailView({
   const narratorVoiceId = book.narratorVoiceId ?? "narrator_female";
   const abortRef = useRef<AbortController | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const selectionWasChangedRef = useRef(false);
   const [providerVoices, setProviderVoices] = useState<VoiceMeta[]>([]);
 
   const voiceOptions: VoiceOption[] = useMemo(
@@ -269,8 +271,6 @@ export function BookDetailView({
         ? selectedChapterId
         : listenableChapters[0]?.id;
 
-  const noopSetCurrentStep = () => {};
-
   const { handleAnalyze } = useChapterAnalysis({
     book,
     analysis: pipeline.analysis,
@@ -287,7 +287,7 @@ export function BookDetailView({
     setChapterAudioPaths: pipeline.setChapterAudioPaths,
     setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
     setAudioAssets: pipeline.setAudioAssets,
-    setCurrentStep: noopSetCurrentStep,
+    setCurrentStep: NOOP_SET_CURRENT_STEP,
     setTab: pipeline.setTab,
     abortRef,
     db,
@@ -319,9 +319,14 @@ export function BookDetailView({
       setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
       setAudioAssets: pipeline.setAudioAssets,
       setGenerationBatch: pipeline.setGenerationBatch,
-      setCurrentStep: noopSetCurrentStep,
+      setWorkflowStatuses: pipeline.setWorkflowStatuses,
+      setCurrentStep: NOOP_SET_CURRENT_STEP,
       abortRef,
     });
+
+  useEffect(() => {
+    selectionWasChangedRef.current = false;
+  }, [book.bookId]);
 
   useEffect(() => {
     return () => {
@@ -452,8 +457,8 @@ export function BookDetailView({
       );
 
       if (cancelled) return;
-      // Restore one complete, book-scoped snapshot. Never merge with the
-      // global pipeline's previous book state.
+      // This is an older async snapshot. It may finish after an active batch
+      // has already published newer data, so only fill missing state here.
       const restoredRoster = mergeCharacters([
         ...restoredCharacters,
         ...scriptCharacters,
@@ -462,15 +467,24 @@ export function BookDetailView({
       // even when a character has not yet been referenced by a loaded script;
       // otherwise a later chapter could analyze against an incomplete roster.
       const characters = restoredRoster;
-      pipeline.setAnalysis(
-        {
-          characters,
-          voices: restoredVoices,
-          scriptPaths,
-        },
+      pipeline.setAnalysis((current) => {
+        if (!current) {
+          return { characters, voices: restoredVoices, scriptPaths };
+        }
+        return {
+          characters: mergeCharacters([...characters, ...current.characters]),
+          voices: [...restoredVoices, ...current.voices].filter(
+            (voice, index, entries) => entries.findIndex((entry) => entry.id === voice.id) === index,
+          ),
+          scriptPaths: { ...scriptPaths, ...current.scriptPaths },
+        };
+      },
         book.bookId,
       );
-      pipeline.setAudioAssets(restoredAudioAssets, book.bookId);
+      pipeline.setAudioAssets(
+        (current) => ({ ...restoredAudioAssets, ...current }),
+        book.bookId,
+      );
 
       const restoredAnalysisWorkflows: Record<string, ReturnType<typeof emptyChapterWorkflow>> = {};
       const restoredGenerationWorkflows: Record<string, ReturnType<typeof emptyChapterWorkflow>> = {};
@@ -485,8 +499,16 @@ export function BookDetailView({
         }),
       );
       if (cancelled) return;
-      pipeline.setWorkflowStatuses("analysis", restoredAnalysisWorkflows, book.bookId);
-      pipeline.setWorkflowStatuses("generation", restoredGenerationWorkflows, book.bookId);
+      pipeline.setWorkflowStatuses(
+        "analysis",
+        (current) => ({ ...restoredAnalysisWorkflows, ...current }),
+        book.bookId,
+      );
+      pipeline.setWorkflowStatuses(
+        "generation",
+        (current) => ({ ...restoredGenerationWorkflows, ...current }),
+        book.bookId,
+      );
 
       // Restore the original voice track and the final mixed track separately.
       const audioCandidates = book.chapters.flatMap((ch) => [
@@ -508,11 +530,22 @@ export function BookDetailView({
           voicePaths[chapter.id] = voicePath;
         }
       }
-      pipeline.setChapterAudioPaths(voicePaths, book.bookId);
-      pipeline.setChapterMixedAudioPaths(mixedPaths, book.bookId);
+      pipeline.setChapterAudioPaths(
+        (current) => ({ ...voicePaths, ...current }),
+        book.bookId,
+      );
+      pipeline.setChapterMixedAudioPaths(
+        (current) => ({ ...mixedPaths, ...current }),
+        book.bookId,
+      );
       // Auto-select chapters that need analysis (no script yet)
       const unanalyzed = book.chapters.filter((c) => !scriptPaths[c.id]).map((c) => c.id);
-      pipeline.setSelectedChapters(new Set(unanalyzed), book.bookId);
+      if (!selectionWasChangedRef.current) {
+        pipeline.setSelectedChapters(
+          (current) => current.size > 0 ? current : new Set(unanalyzed),
+          book.bookId,
+        );
+      }
     }
     restore();
     return () => {
@@ -537,6 +570,7 @@ export function BookDetailView({
   }, []);
 
   function toggleChapter(chapterId: string) {
+    selectionWasChangedRef.current = true;
     pipeline.setSelectedChapters((prev) => {
       const next = new Set(prev);
       next.has(chapterId) ? next.delete(chapterId) : next.add(chapterId);
@@ -552,6 +586,7 @@ export function BookDetailView({
   );
 
   function toggleAllChapters() {
+    selectionWasChangedRef.current = true;
     pipeline.setSelectedChapters(
       allSelected
         ? new Set()

@@ -65,4 +65,71 @@ describe("book-scoped pipeline state", () => {
     expect(current.chapterAudioPaths).toEqual({});
     expect(current.analyzeProgress).toBe("");
   });
+
+  test("a late restore can fill missing data without replacing newer chapter results", () => {
+    const store = usePipelineStore.getState();
+    store.activateBook("book_pei-yin");
+    store.setChapterAudioPaths(
+      { chapter_new: "/books/pei-yin/audio/chapter_new.wav" },
+      "book_pei-yin",
+    );
+    store.setWorkflowStatuses("generation", {
+      chapter_new: {
+        chapterId: "chapter_new",
+        kind: "generation",
+        status: "succeeded",
+        steps: [],
+      },
+    }, "book_pei-yin");
+
+    store.setChapterAudioPaths(
+      (current) => ({
+        chapter_old: "/books/pei-yin/audio/chapter_old.wav",
+        ...current,
+      }),
+      "book_pei-yin",
+    );
+    store.setWorkflowStatuses("generation", (current) => ({
+      chapter_old: {
+        chapterId: "chapter_old",
+        kind: "generation",
+        status: "pending",
+        steps: [],
+      },
+      ...current,
+    }), "book_pei-yin");
+
+    const current = usePipelineStore.getState();
+    expect(current.chapterAudioPaths).toEqual({
+      chapter_old: "/books/pei-yin/audio/chapter_old.wav",
+      chapter_new: "/books/pei-yin/audio/chapter_new.wav",
+    });
+    expect(current.workflows.generation.chapter_new.status).toBe("succeeded");
+    expect(current.workflows.generation.chapter_old.status).toBe("pending");
+  });
+
+  test("an older workflow poll cannot overwrite a newer terminal batch result", () => {
+    const store = usePipelineStore.getState();
+    store.activateBook("book_pei-yin");
+    store.setWorkflowStatus("generation", "chapter_001", {
+      chapterId: "chapter_001",
+      kind: "generation",
+      status: "succeeded",
+      steps: [],
+      updatedAt: 200,
+    }, "book_pei-yin");
+
+    store.setWorkflowStatus("generation", "chapter_001", {
+      chapterId: "chapter_001",
+      kind: "generation",
+      status: "running",
+      steps: [],
+      updatedAt: 100,
+    }, "book_pei-yin");
+
+    expect(usePipelineStore.getState().workflows.generation.chapter_001).toMatchObject({
+      status: "succeeded",
+      updatedAt: 200,
+    });
+  });
 });

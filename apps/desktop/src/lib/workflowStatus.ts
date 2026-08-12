@@ -4,6 +4,10 @@ import type {
   WorkflowStep,
   WorkflowStepStatus,
 } from "../types";
+import type {
+  BatchGenerationChapter,
+  BatchGenerationResponse,
+} from "./batchGeneration";
 
 export type WorkflowKind = "analysis" | "generation";
 
@@ -28,6 +32,59 @@ export const GENERATION_WORKFLOW_DEFINITION: WorkflowDefinition[] = [
   { id: "stable_audio", label: "Stable Audio 背景音/音效" },
   { id: "mix", label: "最终混音" },
 ];
+
+/**
+ * The durable batch queue is the first source to know a chapter has reached
+ * a terminal state. Convert that response into the same shape used by the
+ * workflow UI so completion is visible before the next state.json poll.
+ */
+export function generationWorkflowFromBatchChapter(
+  chapter: BatchGenerationChapter,
+  updatedAt?: number,
+): ChapterWorkflowStatus | null {
+  if (chapter.status !== "succeeded" && chapter.status !== "failed") return null;
+
+  const failureIndex = chapter.status === "failed"
+    ? GENERATION_WORKFLOW_DEFINITION.findIndex((step) => step.id === chapter.currentStage)
+    : -1;
+  const error = chapter.error || "批量生成失败。";
+
+  return {
+    chapterId: chapter.chapterId,
+    kind: "generation",
+    currentStep:
+      chapter.status === "failed" && failureIndex >= 0
+        ? GENERATION_WORKFLOW_DEFINITION[failureIndex].id
+        : undefined,
+    steps: GENERATION_WORKFLOW_DEFINITION.map((step, index) => {
+      if (chapter.status === "succeeded") {
+        return { ...step, status: "succeeded" as const };
+      }
+      if (index < failureIndex) {
+        return { ...step, status: "succeeded" as const };
+      }
+      if (index === failureIndex) {
+        return { ...step, status: "failed" as const, error };
+      }
+      return { ...step, status: "pending" as const };
+    }),
+    status: chapter.status === "succeeded" ? "succeeded" : "failed",
+    detail: chapter.status === "succeeded" ? "批量生成已完成。" : undefined,
+    error: chapter.status === "failed" ? error : undefined,
+    updatedAt,
+  };
+}
+
+export function terminalGenerationWorkflowsFromBatch(
+  batch: Pick<BatchGenerationResponse, "chapters" | "updatedAt">,
+): Record<string, ChapterWorkflowStatus> {
+  const workflows: Record<string, ChapterWorkflowStatus> = {};
+  for (const chapter of batch.chapters) {
+    const workflow = generationWorkflowFromBatchChapter(chapter, batch.updatedAt);
+    if (workflow) workflows[chapter.chapterId] = workflow;
+  }
+  return workflows;
+}
 
 const VALID_STATUSES = new Set<WorkflowStepStatus>([
   "pending",

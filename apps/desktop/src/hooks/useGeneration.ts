@@ -4,6 +4,7 @@ import type {
   AnalysisState,
   AudioAsset,
   BookState,
+  ChapterWorkflowStatus,
   ChapterMeta,
   PipelineStage,
   ProgressDetail,
@@ -19,6 +20,7 @@ import {
   startBatchGeneration,
   type BatchGenerationResponse,
 } from "../lib/batchGeneration";
+import { terminalGenerationWorkflowsFromBatch } from "../lib/workflowStatus";
 import { workerCall } from "../lib/workerCall";
 
 interface UseGenerationDeps {
@@ -58,6 +60,13 @@ interface UseGenerationDeps {
       | ((prev: BatchGenerationResponse | null) => BatchGenerationResponse | null),
     owner?: string,
   ) => void;
+  setWorkflowStatuses: (
+    kind: "generation",
+    statuses:
+      | Record<string, ChapterWorkflowStatus>
+      | ((prev: Record<string, ChapterWorkflowStatus>) => Record<string, ChapterWorkflowStatus>),
+    owner?: string,
+  ) => void;
   setCurrentStep: (step: WorkspaceStep) => void;
   abortRef: React.MutableRefObject<AbortController | null>;
 }
@@ -91,12 +100,15 @@ export function useGeneration(deps: UseGenerationDeps) {
     setChapterMixedAudioPaths,
     setAudioAssets,
     setGenerationBatch,
+    setWorkflowStatuses,
     setCurrentStep,
   } = deps;
   const activeBatchIdRef = useRef<string | null>(null);
   const pollTimerRef = useRef<number | null>(null);
   const requestInFlightRef = useRef(false);
   const activeBookIdRef = useRef<string | null>(null);
+  const setCurrentStepRef = useRef(setCurrentStep);
+  setCurrentStepRef.current = setCurrentStep;
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current !== null) {
@@ -158,6 +170,21 @@ export function useGeneration(deps: UseGenerationDeps) {
       return;
     }
 
+    // The queue response becomes terminal before the next state.json watcher
+    // tick. Publish its chapter outcomes immediately so the current page
+    // reflects completed audio without requiring a chapter reselect/reload.
+    const terminalWorkflows = terminalGenerationWorkflowsFromBatch({
+      chapters: response.chapters,
+      updatedAt: response.updatedAt ?? Date.now() / 1000,
+    });
+    if (Object.keys(terminalWorkflows).length > 0) {
+      setWorkflowStatuses(
+        "generation",
+        (previous) => ({ ...previous, ...terminalWorkflows }),
+        owner,
+      );
+    }
+
     // A completed-with-errors batch may have produced usable audio for some
     // chapters, but it must not look like a clean 100% success in the UI.
     setProgress(
@@ -169,7 +196,7 @@ export function useGeneration(deps: UseGenerationDeps) {
       setAnalyzeProgress(`批量生成完成：${response.succeededCount ?? total} 章已完成。`, owner);
       setSavedMessage("原章节配音、背景音/音效和最终混音已全部生成。", owner);
       setStage("done", owner);
-      setCurrentStep("done");
+      setCurrentStepRef.current("done");
     } else if (response.status === "completed_with_errors") {
       const failures = response.chapters
         .filter((chapter) => chapter.status === "failed")
@@ -195,13 +222,13 @@ export function useGeneration(deps: UseGenerationDeps) {
     setAudioAssets,
     setChapterAudioPaths,
     setChapterMixedAudioPaths,
-    setCurrentStep,
     setError,
     setGenerationBatch,
     setProgress,
     setProgressDetail,
     setSavedMessage,
     setStage,
+    setWorkflowStatuses,
   ]);
 
   const pollBatch = useCallback(async (batchId: string, owner: string) => {

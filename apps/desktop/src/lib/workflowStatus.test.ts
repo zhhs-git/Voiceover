@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseChapterWorkflow } from "./workflowStatus";
+import {
+  generationWorkflowFromBatchChapter,
+  parseChapterWorkflow,
+  terminalGenerationWorkflowsFromBatch,
+} from "./workflowStatus";
 
 describe("parseChapterWorkflow", () => {
   it("parses durable analysis stages and exposes the current step", () => {
@@ -78,5 +82,67 @@ describe("parseChapterWorkflow", () => {
 
     expect(status.status).toBe("succeeded");
     expect(status.steps.every((step) => step.status === "succeeded")).toBe(true);
+  });
+
+  it("immediately projects a successful batch chapter into a completed generation workflow", () => {
+    const workflow = generationWorkflowFromBatchChapter({
+      chapterId: "chapter_1",
+      title: "第一章",
+      position: 0,
+      status: "succeeded",
+      voiceAudioPath: "/books/book_1/audio/chapter_1.wav",
+      mixedAudioPath: "/books/book_1/audio/chapter_1_mixed.wav",
+    }, 1_234);
+
+    expect(workflow).toMatchObject({
+      chapterId: "chapter_1",
+      kind: "generation",
+      status: "succeeded",
+      updatedAt: 1_234,
+    });
+    expect(workflow?.steps.map((step) => step.status)).toEqual([
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded",
+    ]);
+  });
+
+  it("keeps the backend failure stage and error visible without waiting for another workflow poll", () => {
+    const workflow = generationWorkflowFromBatchChapter({
+      chapterId: "chapter_1",
+      title: "第一章",
+      position: 0,
+      status: "failed",
+      currentStage: "stable_audio",
+      error: "Stable Audio 模型不可用",
+    });
+
+    expect(workflow).toMatchObject({
+      status: "failed",
+      currentStep: "stable_audio",
+      error: "Stable Audio 模型不可用",
+    });
+    expect(workflow?.steps.map((step) => step.status)).toEqual([
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "failed",
+      "pending",
+    ]);
+    expect(workflow?.steps[3].error).toBe("Stable Audio 模型不可用");
+  });
+
+  it("only projects terminal chapters from a batch", () => {
+    const workflows = terminalGenerationWorkflowsFromBatch({
+      updatedAt: 1_234,
+      chapters: [
+        { chapterId: "chapter_1", title: "第一章", position: 0, status: "succeeded" },
+        { chapterId: "chapter_2", title: "第二章", position: 1, status: "running" },
+      ],
+    });
+
+    expect(Object.keys(workflows)).toEqual(["chapter_1"]);
   });
 });

@@ -37,8 +37,26 @@ type DetailsUpdate =
 
 type ChaptersUpdate = Set<string> | ((prev: Set<string>) => Set<string>);
 
+type WorkflowStatusesUpdate =
+  | Record<string, ChapterWorkflowStatus>
+  | ((prev: Record<string, ChapterWorkflowStatus>) => Record<string, ChapterWorkflowStatus>);
+
 function canUpdate(bookId: string | null, owner: BookOwner): boolean {
   return owner === undefined || owner === bookId;
+}
+
+function keepNewerWorkflow(
+  current: ChapterWorkflowStatus | undefined,
+  incoming: ChapterWorkflowStatus,
+): ChapterWorkflowStatus {
+  if (
+    current &&
+    typeof current.updatedAt === "number" &&
+    (typeof incoming.updatedAt !== "number" || current.updatedAt >= incoming.updatedAt)
+  ) {
+    return current;
+  }
+  return incoming;
 }
 
 function resetValues(bookId: string | null) {
@@ -108,7 +126,7 @@ interface PipelineState {
   ) => void;
   setWorkflowStatuses: (
     kind: WorkflowKind,
-    statuses: Record<string, ChapterWorkflowStatus>,
+    statuses: WorkflowStatusesUpdate,
     owner?: BookOwner,
   ) => void;
   setSelectedChapters: (chapters: ChaptersUpdate, owner?: BookOwner) => void;
@@ -206,7 +224,7 @@ export const usePipelineStore = create<PipelineState>((set) => ({
           ...state.workflows,
           [kind]: {
             ...state.workflows[kind],
-            [chapterId]: status,
+            [chapterId]: keepNewerWorkflow(state.workflows[kind][chapterId], status),
           },
         },
       };
@@ -217,7 +235,9 @@ export const usePipelineStore = create<PipelineState>((set) => ({
       return {
         workflows: {
           ...state.workflows,
-          [kind]: statuses,
+          [kind]: typeof statuses === "function"
+            ? statuses(state.workflows[kind])
+            : statuses,
         },
       };
     }),
