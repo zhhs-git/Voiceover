@@ -2,6 +2,7 @@ import { useRef, useCallback, useEffect, useMemo, useState } from "react";
 import { convertFileSrc, downloadFile, invoke } from "../lib/platform";
 import type {
   AnalysisState,
+  AudioAsset,
   BookState,
   ChapterMeta,
   CharacterMeta,
@@ -15,13 +16,25 @@ import { usePipelineStore } from "../state/pipelineStore";
 import { useChapterAnalysis } from "../hooks/useChapterAnalysis";
 import { useGeneration } from "../hooks/useGeneration";
 import { workerCall } from "../lib/workerCall";
+import {
+  audioAssetsFromManifest,
+  filterAudioAssetsToScriptPlan,
+} from "../lib/audioAssets";
 import { buildVoiceOptions, localizeVoiceDisplayName } from "../lib/voiceOptions";
 import { ChapterPreview } from "./ChapterPreview";
+import { GeneratedAudioAssetList } from "./GeneratedAudioAssetList";
 import { PersistentChapterAudioList } from "./PersistentChapterAudioList";
+import { BatchGenerationStatusList } from "./BatchGenerationStatusList";
 import {
   buildVoicePreviewRequest,
   buildVoicePreviewScript,
 } from "../lib/voicePreview";
+import {
+  emptyChapterWorkflow,
+  readChapterWorkflow,
+  watchChapterWorkflow,
+} from "../lib/workflowStatus";
+import { WorkflowSteps, workflowStatusLabel } from "./WorkflowSteps";
 
 const db = createAudiobookStore();
 
@@ -83,6 +96,8 @@ function normalizeCharacter(value: Partial<CharacterMeta>): CharacterMeta | null
     voiceProfile: typeof value.voiceProfile === "string" ? value.voiceProfile : undefined,
     fallbackVoiceId:
       typeof value.fallbackVoiceId === "string" ? value.fallbackVoiceId : undefined,
+    voiceDesign:
+      typeof value.voiceDesign === "string" ? value.voiceDesign : undefined,
     voiceDescription:
       typeof value.voiceDescription === "string" ? value.voiceDescription : undefined,
     confidence: typeof value.confidence === "number" ? value.confidence : 0.5,
@@ -115,6 +130,7 @@ function applyVoiceAssignment(target: CharacterMeta, source: CharacterMeta) {
   target.voiceAssignmentVersion = source.voiceAssignmentVersion;
   target.voiceProfile = source.voiceProfile;
   target.fallbackVoiceId = source.fallbackVoiceId;
+  target.voiceDesign = source.voiceDesign;
   target.voiceDescription = source.voiceDescription;
 }
 
@@ -179,7 +195,9 @@ export function BookDetailView({
 }: BookDetailViewProps) {
   const pipeline = usePipelineStore();
   const correctionState = useCorrectionStore();
+  const narratorVoiceId = book.narratorVoiceId ?? "narrator_female";
   const abortRef = useRef<AbortController | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const [providerVoices, setProviderVoices] = useState<VoiceMeta[]>([]);
 
   const voiceOptions: VoiceOption[] = useMemo(
@@ -197,6 +215,59 @@ export function BookDetailView({
     pipeline.stage === "analyzing" ||
     pipeline.stage === "saving" ||
     pipeline.stage === "generating";
+  const selectedChapterId =
+    pipeline.selectedChapters.size === 1
+      ? [...pipeline.selectedChapters][0]
+      : undefined;
+  const runningBatchChapterId = pipeline.generationBatch?.chapters.find(
+    (chapter) => chapter.status === "running",
+  )?.chapterId;
+  const activeGenerationChapterId = runningBatchChapterId ?? selectedChapterId;
+  const activeGenerationWorkflow = activeGenerationChapterId
+    ? pipeline.workflows.generation[activeGenerationChapterId]
+    : undefined;
+  const activeGenerationTitle = activeGenerationChapterId
+    ? book.chapters.find((chapter) => chapter.id === activeGenerationChapterId)?.title
+    : undefined;
+  const [listenChapterId, setListenChapterId] = useState<string>();
+
+  const listenableChapters = useMemo(() => {
+    const chapterIds = new Set<string>([
+      ...Object.keys(pipeline.chapterAudioPaths),
+      ...Object.keys(pipeline.chapterMixedAudioPaths),
+      ...Object.entries(pipeline.audioAssets)
+        .filter(([, assets]) => assets.length > 0)
+        .map(([chapterId]) => chapterId),
+    ]);
+    return book.chapters.filter((chapter) => chapterIds.has(chapter.id));
+  }, [
+    book.chapters,
+    pipeline.audioAssets,
+    pipeline.chapterAudioPaths,
+    pipeline.chapterMixedAudioPaths,
+  ]);
+
+  // The chapter checkboxes drive batch operations.  Listening is intentionally
+  // independent so selecting several chapters does not make the preview list
+  // expand back to the whole book.
+  useEffect(() => {
+    setListenChapterId((current) => {
+      if (current && listenableChapters.some((chapter) => chapter.id === current)) {
+        return current;
+      }
+      if (selectedChapterId && listenableChapters.some((chapter) => chapter.id === selectedChapterId)) {
+        return selectedChapterId;
+      }
+      return listenableChapters[0]?.id;
+    });
+  }, [listenableChapters, selectedChapterId]);
+
+  const activeListenChapterId =
+    listenChapterId && listenableChapters.some((chapter) => chapter.id === listenChapterId)
+      ? listenChapterId
+      : selectedChapterId && listenableChapters.some((chapter) => chapter.id === selectedChapterId)
+        ? selectedChapterId
+        : listenableChapters[0]?.id;
 
   const noopSetCurrentStep = () => {};
 
@@ -211,14 +282,24 @@ export function BookDetailView({
     setChapterStatuses: pipeline.setChapterStatuses,
     setProgressDetail: pipeline.setProgressDetail,
     setProgress: pipeline.setProgress,
+    setWorkflowStatus: pipeline.setWorkflowStatus,
     setAnalysis: pipeline.setAnalysis,
+    setChapterAudioPaths: pipeline.setChapterAudioPaths,
+    setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
+    setAudioAssets: pipeline.setAudioAssets,
     setCurrentStep: noopSetCurrentStep,
     setTab: pipeline.setTab,
     abortRef,
     db,
   });
 
-  const { handleGenerate, handleRegenerateChapter, handleRegenerateAll } =
+  const {
+    handleGenerate,
+    handleStopGeneration,
+    handleRegenerateAudioAsset,
+    handleRegenerateChapter,
+    handleRegenerateAll,
+  } =
     useGeneration({
       book,
       analysis: pipeline.analysis,
@@ -230,19 +311,47 @@ export function BookDetailView({
       },
       setStage: pipeline.setStage,
       setError: pipeline.setError,
+      setSavedMessage: pipeline.setSavedMessage,
       setAnalyzeProgress: pipeline.setAnalyzeProgress,
       setProgressDetail: pipeline.setProgressDetail,
       setProgress: pipeline.setProgress,
       setChapterAudioPaths: pipeline.setChapterAudioPaths,
+      setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
+      setAudioAssets: pipeline.setAudioAssets,
+      setGenerationBatch: pipeline.setGenerationBatch,
       setCurrentStep: noopSetCurrentStep,
       abortRef,
     });
 
   useEffect(() => {
     return () => {
+      // A generation batch is owned by the backend. Leaving or refreshing the
+      // web page must only stop local polling, never cancel the batch.
       abortRef.current?.abort();
     };
   }, [book.bookId]);
+
+  // Keep selected chapters synchronized after a page refresh as well as while
+  // a long-running worker is still active.  The hook-level watchers provide
+  // immediate updates during button actions; this watcher is the durable
+  // recovery path for an already-running or needs-review workflow.
+  useEffect(() => {
+    const stops: Array<() => void> = [];
+    for (const chapterId of pipeline.selectedChapters) {
+      for (const kind of ["analysis", "generation"] as const) {
+        stops.push(
+          watchChapterWorkflow(
+            book.workDir,
+            chapterId,
+            kind,
+            (workflow) => pipeline.setWorkflowStatus(kind, chapterId, workflow, book.bookId),
+            1500,
+          ),
+        );
+      }
+    }
+    return () => stops.forEach((stop) => stop());
+  }, [book.bookId, book.workDir, pipeline.selectedChapters, pipeline.setWorkflowStatus]);
 
   // Restore saved state on mount
   useEffect(() => {
@@ -277,6 +386,7 @@ export function BookDetailView({
               : undefined,
           voiceProfile: c.voiceProfile || undefined,
           fallbackVoiceId: c.fallbackVoiceId || undefined,
+          voiceDesign: c.voiceDesign || undefined,
           voiceDescription: c.voiceDescription || undefined,
           confidence: c.confidence,
         }),
@@ -290,6 +400,8 @@ export function BookDetailView({
       const scriptPaths: Record<string, string> = {};
       const scriptCharacters: CharacterMeta[] = [];
       const restoredVoices: VoiceMeta[] = [];
+      const scriptDataByChapter: Record<string, unknown> = {};
+      const restoredAudioAssets: Record<string, AudioAsset[]> = {};
       for (const ch of chaptersWithScripts) {
         scriptPaths[ch.id] = ch.scriptPath;
         try {
@@ -300,7 +412,9 @@ export function BookDetailView({
           const scriptData = JSON.parse(scriptRaw) as {
             characters?: Array<Partial<CharacterMeta>>;
             voices?: VoiceMeta[];
+            audioPlan?: unknown;
           } | null;
+          scriptDataByChapter[ch.id] = scriptData;
           for (const character of scriptData?.characters ?? []) {
             const normalized = normalizeCharacter(character);
             if (normalized) scriptCharacters.push(normalized);
@@ -317,6 +431,25 @@ export function BookDetailView({
           // A missing or malformed script should not prevent the book from opening.
         }
       }
+
+      await Promise.all(
+        book.chapters.map(async (chapter) => {
+          const manifestPath = `${book.workDir}/audio-assets/${chapter.id}/manifest.json`;
+          try {
+            const manifestRaw = await invoke<string>("run_worker", {
+              command: "_read_file",
+              inputJson: JSON.stringify({ path: manifestPath }),
+            });
+            const assets = filterAudioAssetsToScriptPlan(
+              audioAssetsFromManifest(JSON.parse(manifestRaw)),
+              scriptDataByChapter[chapter.id],
+            );
+            if (assets.length > 0) restoredAudioAssets[chapter.id] = assets;
+          } catch {
+            // Audio assets are optional; a missing manifest is expected.
+          }
+        }),
+      );
 
       if (cancelled) return;
       // Restore one complete, book-scoped snapshot. Never merge with the
@@ -337,19 +470,46 @@ export function BookDetailView({
         },
         book.bookId,
       );
+      pipeline.setAudioAssets(restoredAudioAssets, book.bookId);
 
-      // Fast bulk audio check — single invoke for all paths
-      const audioPaths = book.chapters.map((ch) => `${book.workDir}/audio/${ch.id}.wav`);
-      const existing: string[] = await invoke("file_exists", { paths: audioPaths });
+      const restoredAnalysisWorkflows: Record<string, ReturnType<typeof emptyChapterWorkflow>> = {};
+      const restoredGenerationWorkflows: Record<string, ReturnType<typeof emptyChapterWorkflow>> = {};
+      await Promise.all(
+        book.chapters.map(async (chapter) => {
+          const [analysisWorkflow, generationWorkflow] = await Promise.all([
+            readChapterWorkflow(book.workDir, chapter.id, "analysis"),
+            readChapterWorkflow(book.workDir, chapter.id, "generation"),
+          ]);
+          restoredAnalysisWorkflows[chapter.id] = analysisWorkflow;
+          restoredGenerationWorkflows[chapter.id] = generationWorkflow;
+        }),
+      );
+      if (cancelled) return;
+      pipeline.setWorkflowStatuses("analysis", restoredAnalysisWorkflows, book.bookId);
+      pipeline.setWorkflowStatuses("generation", restoredGenerationWorkflows, book.bookId);
+
+      // Restore the original voice track and the final mixed track separately.
+      const audioCandidates = book.chapters.flatMap((ch) => [
+        `${book.workDir}/audio/${ch.id}_mixed.wav`,
+        `${book.workDir}/audio/${ch.id}.wav`,
+      ]);
+      const existing: string[] = await invoke("file_exists", { paths: audioCandidates });
       if (cancelled) return;
       const existingSet = new Set(existing);
-      const paths: Record<string, string> = {};
-      for (let i = 0; i < book.chapters.length; i++) {
-        if (existingSet.has(audioPaths[i])) {
-          paths[book.chapters[i].id] = audioPaths[i];
+      const voicePaths: Record<string, string> = {};
+      const mixedPaths: Record<string, string> = {};
+      for (const chapter of book.chapters) {
+        const mixedPath = `${book.workDir}/audio/${chapter.id}_mixed.wav`;
+        const voicePath = `${book.workDir}/audio/${chapter.id}.wav`;
+        if (existingSet.has(mixedPath)) {
+          mixedPaths[chapter.id] = mixedPath;
+        }
+        if (existingSet.has(voicePath)) {
+          voicePaths[chapter.id] = voicePath;
         }
       }
-      pipeline.setChapterAudioPaths(paths, book.bookId);
+      pipeline.setChapterAudioPaths(voicePaths, book.bookId);
+      pipeline.setChapterMixedAudioPaths(mixedPaths, book.bookId);
       // Auto-select chapters that need analysis (no script yet)
       const unanalyzed = book.chapters.filter((c) => !scriptPaths[c.id]).map((c) => c.id);
       pipeline.setSelectedChapters(new Set(unanalyzed), book.bookId);
@@ -447,11 +607,17 @@ export function BookDetailView({
     }
   }
 
-  async function handleDownloadChapter(chapterId: string, chapterTitle: string) {
-    const wavPath = pipeline.chapterAudioPaths[chapterId];
+  async function handleDownloadChapter(
+    chapterId: string,
+    chapterTitle: string,
+    audioPathOverride?: string,
+  ) {
+    const wavPath = audioPathOverride ?? pipeline.chapterAudioPaths[chapterId];
     if (!wavPath) return;
     const safeName = chapterTitle.replace(/[/\\:*?"<>|]/g, "_");
-    const dest = `${book.workDir}/downloads/${safeName}.mp3`;
+    const suffix = audioPathOverride ? "_最终配音" : "";
+    const filename = `${safeName}${suffix}.mp3`;
+    const dest = `${book.workDir}/downloads/${filename}`;
     pipeline.setSavedMessage(`正在转换"${chapterTitle}"…`, book.bookId);
     try {
       const result = await workerCall("convert_to_mp3", {
@@ -461,15 +627,43 @@ export function BookDetailView({
       if (result.status !== "succeeded") {
         throw new Error((result.error as any)?.message ?? "转换失败");
       }
-      downloadFile(convertFileSrc(dest), `${safeName}.mp3`);
+      downloadFile(convertFileSrc(dest), filename);
       pipeline.setSavedMessage(`"${chapterTitle}"已保存为 MP3。`, book.bookId);
     } catch (err) {
       pipeline.setError(`下载失败：${String(err)}`, book.bookId);
     }
   }
 
+  async function handleDownloadAudioAsset(asset: AudioAsset, chapter: ChapterMeta) {
+    const chapterName = chapter.title.replace(/[/\\:*?"<>|]/g, "_");
+    const assetName = (asset.path.split("/").pop() || asset.assetId)
+      .replace(/\.[^.]+$/, "")
+      .replace(/[/\\:*?"<>|]/g, "_");
+    const kindName = asset.kind === "music" ? "music" : "sfx";
+    const filename = `${chapterName}_${kindName}_${assetName}.mp3`;
+    const destination = `${book.workDir}/downloads/${filename}`;
+    pipeline.setSavedMessage(`正在转换“${assetName}”为 MP3…`, book.bookId);
+    try {
+      const result = await workerCall("convert_to_mp3", {
+        wavPath: asset.path,
+        outputPath: destination,
+      });
+      if (result.status !== "succeeded") {
+        throw new Error((result.error as { message?: string } | undefined)?.message ?? "转换失败");
+      }
+      downloadFile(convertFileSrc(destination), filename);
+      pipeline.setSavedMessage(`已下载 MP3：${filename}`, book.bookId);
+    } catch (error) {
+      pipeline.setError(`背景音/音效下载失败：${String(error)}`, book.bookId);
+    }
+  }
+
   function handleStop() {
     abortRef.current?.abort();
+    if (pipeline.stage === "generating") {
+      void handleStopGeneration();
+      return;
+    }
     pipeline.setAnalyzeProgress("正在停止…", book.bookId);
   }
 
@@ -497,6 +691,7 @@ export function BookDetailView({
                   voiceAssignmentVersion: undefined,
                   voiceProfile: undefined,
                   fallbackVoiceId: undefined,
+                  voiceDesign: undefined,
                   voiceDescription: undefined,
                 }
               : c,
@@ -513,6 +708,34 @@ export function BookDetailView({
     ],
   );
 
+  const handleVoiceDesignChange = useCallback(
+    (characterId: string, voiceDesign: string) => {
+      correctionState.setVoiceDesign(characterId, voiceDesign);
+      pipeline.setAnalysis((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          characters: current.characters.map((c) =>
+            c.id === characterId
+              ? {
+                  ...c,
+                  voiceDesign,
+                  voiceDescription: voiceDesign,
+                }
+              : c,
+          ),
+        };
+      }, book.bookId);
+      pipeline.setSavedMessage(null, book.bookId);
+    },
+    [
+      book.bookId,
+      correctionState.setVoiceDesign,
+      pipeline.setAnalysis,
+      pipeline.setSavedMessage,
+    ],
+  );
+
   async function handleSaveCorrections() {
     if (!book || !pipeline.analysis) return;
     pipeline.setStage("saving", book.bookId);
@@ -521,6 +744,7 @@ export function BookDetailView({
     try {
       const result = await workerCall("apply_corrections", {
         bookId: book.bookId,
+        narratorVoiceId,
         chapters: book.chapters.map((c) => ({
           chapterId: c.id,
           textPath: c.textPath,
@@ -530,6 +754,7 @@ export function BookDetailView({
           aliasMerges: correctionState.aliasMerges,
           genderOverrides: correctionState.genderOverrides,
           voiceOverrides: correctionState.voiceOverrides,
+          voiceDesignOverrides: correctionState.voiceDesignOverrides,
         },
         // Keep the full roster available so correction-time re-analysis
         // reuses stable character IDs and does not rediscover duplicates.
@@ -545,6 +770,7 @@ export function BookDetailView({
           voiceAssignmentVersion: character.voiceAssignmentVersion,
           voiceProfile: character.voiceProfile,
           fallbackVoiceId: character.fallbackVoiceId,
+          voiceDesign: character.voiceDesign,
           voiceDescription: character.voiceDescription,
         })),
         outputDirectory: `${book.workDir}/scripts`,
@@ -592,6 +818,7 @@ export function BookDetailView({
                 voiceAssignmentVersion: character.voiceAssignmentVersion,
                 voiceProfile: character.voiceProfile,
                 fallbackVoiceId: character.fallbackVoiceId,
+                voiceDesign: character.voiceDesign,
                 voiceDescription: character.voiceDescription,
                 confidence: character.confidence,
                 aliases: JSON.stringify(character.aliases),
@@ -616,6 +843,24 @@ export function BookDetailView({
         }
       }
       correctionState.markSaved(affectedIds);
+      if (affectedIds.length > 0) {
+        const affected = new Set(affectedIds);
+        pipeline.setChapterAudioPaths((prev) => {
+          const next = { ...prev };
+          for (const chapterId of affected) delete next[chapterId];
+          return next;
+        }, book.bookId);
+        pipeline.setChapterMixedAudioPaths((prev) => {
+          const next = { ...prev };
+          for (const chapterId of affected) delete next[chapterId];
+          return next;
+        }, book.bookId);
+        pipeline.setAudioAssets((prev) => {
+          const next = { ...prev };
+          for (const chapterId of affected) delete next[chapterId];
+          return next;
+        }, book.bookId);
+      }
       pipeline.setSavedMessage(
         `${affectedIds.length} 个章节已更新。`,
         book.bookId,
@@ -623,6 +868,33 @@ export function BookDetailView({
       pipeline.setStage("idle", book.bookId);
     } catch (err) {
       pipeline.setError(`保存修改失败：${String(err)}`, book.bookId);
+      pipeline.setStage("error", book.bookId);
+    }
+  }
+
+  async function handleNarratorVoiceChange(
+    nextVoiceId: "narrator_female" | "narrator_male",
+  ) {
+    if (!book || nextVoiceId === narratorVoiceId) return;
+    try {
+      await db.setNarratorVoice(book.bookId, nextVoiceId);
+      onBookUpdate({ ...book, narratorVoiceId: nextVoiceId });
+      pipeline.setChapterAudioPaths((previous) => {
+        const next = { ...previous };
+        for (const chapter of book.chapters) delete next[chapter.id];
+        return next;
+      }, book.bookId);
+      pipeline.setChapterMixedAudioPaths((previous) => {
+        const next = { ...previous };
+        for (const chapter of book.chapters) delete next[chapter.id];
+        return next;
+      }, book.bookId);
+      pipeline.setSavedMessage(
+        `已固定为${nextVoiceId === "narrator_male" ? "男性" : "女性"}旁白，旧旁白音频需要重新生成。`,
+        book.bookId,
+      );
+    } catch (error) {
+      pipeline.setError(`保存旁白音色失败：${String(error)}`, book.bookId);
       pipeline.setStage("error", book.bookId);
     }
   }
@@ -650,7 +922,12 @@ export function BookDetailView({
       const segmentId = `preview_${voiceId}`;
       const result = await workerCall(
         "synthesize_segment_audio",
-        buildVoicePreviewRequest(scriptPath, previewDir, segmentId),
+        buildVoicePreviewRequest(
+          scriptPath,
+          previewDir,
+          segmentId,
+          `${book.workDir}/voice-profiles`,
+        ),
       );
       if (result.status !== "succeeded")
         throw new Error(
@@ -664,7 +941,16 @@ export function BookDetailView({
       if (!existingPaths.includes(audioPath)) {
         throw new Error("音色试听音频文件未生成");
       }
+      previewAudioRef.current?.pause();
       const audio = new Audio(convertFileSrc(audioPath));
+      previewAudioRef.current = audio;
+      audio.addEventListener(
+        "ended",
+        () => {
+          if (previewAudioRef.current === audio) previewAudioRef.current = null;
+        },
+        { once: true },
+      );
       await audio.play();
       if (usePipelineStore.getState().bookId !== book.bookId) return;
       pipeline.setSavedMessage(`正在播放 ${voiceId} 的试听音频。`, book.bookId);
@@ -729,7 +1015,10 @@ export function BookDetailView({
               checked={allSelected}
               onChange={toggleAllChapters}
             />
-            全选
+            <span>全选</span>
+            <span className="select-all-count">
+              已选 {pipeline.selectedChapters.size} / 共 {book.chapters.length} 章
+            </span>
           </label>
           {book.chapters.map((ch) => (
             <label key={ch.id} className="chapter-item">
@@ -774,6 +1063,59 @@ export function BookDetailView({
             </button>
           </nav>
 
+          {/* Keep every audio element mounted while switching tabs. Hiding this
+              container must not unmount the media elements, otherwise browser
+              playback stops as soon as the user opens another tab. */}
+          <div
+            className={`audio-playback-persistence ${pipeline.tab === "generate" ? "is-visible" : "is-hidden"} ${listenableChapters.length > 0 ? "has-listenable-audio" : ""}`}
+            aria-hidden={pipeline.tab !== "generate"}
+          >
+            {pipeline.tab === "generate" && listenableChapters.length > 0 && (
+              <div className="listen-chapter-toolbar">
+                <div>
+                  <strong>试听章节</strong>
+                  <span>只展示当前章节的原配音、混音、背景音乐和音效</span>
+                </div>
+                <label>
+                  <span className="sr-only">选择试听章节</span>
+                  <select
+                    aria-label="选择试听章节"
+                    value={activeListenChapterId ?? ""}
+                    onChange={(event) => setListenChapterId(event.target.value || undefined)}
+                    disabled={listenableChapters.length <= 1}
+                  >
+                    {listenableChapters.map((chapter) => (
+                      <option key={chapter.id} value={chapter.id}>
+                        {chapter.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
+            <GeneratedAudioAssetList
+              chapters={book.chapters}
+              audioAssets={pipeline.audioAssets}
+              activeChapterId={activeListenChapterId}
+              onDownload={handleDownloadAudioAsset}
+              onRegenerate={handleRegenerateAudioAsset}
+              disabled={isBusy}
+            />
+            <PersistentChapterAudioList
+              chapters={book.chapters}
+              chapterAudioPaths={pipeline.chapterAudioPaths}
+              chapterMixedAudioPaths={pipeline.chapterMixedAudioPaths}
+              activeChapterId={activeListenChapterId}
+              visible={pipeline.tab === "generate"}
+              onDownload={handleDownloadChapter}
+              onDownloadMixed={(chapterId, chapterTitle, path) =>
+                handleDownloadChapter(chapterId, chapterTitle, path)
+              }
+              onRegenerate={handleRegenerateChapter}
+              onRegenerateFinal={handleRegenerateChapter}
+            />
+          </div>
+
           {pipeline.tab === "preview" && (
             <ChapterPreview
               book={book}
@@ -783,9 +1125,25 @@ export function BookDetailView({
 
           {pipeline.tab === "analyze" && (() => {
             const chapterMap = new Map(book.chapters.map((c) => [c.id, c]));
-            const statusEntries = Object.entries(pipeline.chapterStatuses);
+            const workflowEntries = Object.entries(pipeline.workflows.analysis).filter(([, workflow]) =>
+              workflow.status !== "pending" || workflow.steps.some((step) => step.status !== "pending"),
+            );
+            const activityIds = new Set([
+              ...Object.keys(pipeline.chapterStatuses),
+              ...workflowEntries.map(([id]) => id),
+            ]);
+            const statusEntries = [...activityIds].map((id) => [
+              id,
+              pipeline.chapterStatuses[id] ?? pipeline.workflows.analysis[id]?.status ?? "pending",
+            ] as const);
             const hasActivity = statusEntries.length > 0;
             const characters = pipeline.analysis?.characters ?? [];
+            const activeAnalysisId = workflowEntries.find(([, workflow]) =>
+              workflow.status === "running" || workflow.status === "needs_review" || workflow.status === "failed",
+            )?.[0] ?? selectedChapterId ?? statusEntries[0]?.[0];
+            const activeAnalysisWorkflow = activeAnalysisId
+              ? pipeline.workflows.analysis[activeAnalysisId]
+              : undefined;
 
             return (
               <div className="tab-panel analyze-panel">
@@ -834,14 +1192,26 @@ export function BookDetailView({
                   <p className="analyze-done-message">{pipeline.analyzeProgress}</p>
                 )}
 
+                {activeAnalysisWorkflow && (
+                  <WorkflowSteps
+                    workflow={activeAnalysisWorkflow}
+                    title={`《${chapterMap.get(activeAnalysisWorkflow.chapterId)?.title ?? activeAnalysisWorkflow.chapterId}》分析阶段`}
+                  />
+                )}
+
                 {/* Per-chapter status rows */}
                 {hasActivity && (
                   <div className="analyze-chapter-list">
                     {statusEntries.map(([id, status]) => {
                       const ch = chapterMap.get(id);
-                      const isRunning = status === "analyzing";
-                      const isDone = status === "done";
-                      const isFailed = status === "failed";
+                      const workflow = pipeline.workflows.analysis[id];
+                      const isRunning = status === "analyzing" || workflow?.status === "running";
+                      const isDone = status === "done" || workflow?.status === "succeeded";
+                      const isFailed = status === "failed" || workflow?.status === "failed";
+                      const currentStep = workflow?.steps.find((step) => step.id === workflow.currentStep);
+                      const displayStatus = workflow
+                        ? workflowStatusLabel(workflow.status)
+                        : isRunning ? "分析中" : isDone ? "已完成" : isFailed ? "失败" : status;
                       return (
                         <div key={id} className={`analyze-chapter-row ${isRunning ? "is-running" : isDone ? "is-done" : isFailed ? "is-failed" : ""}`}>
                           <span className="chapter-status-dot cs-pending" style={
@@ -852,7 +1222,7 @@ export function BookDetailView({
                           } />
                           <span className="analyze-chapter-name">{ch?.title ?? id}</span>
                           <span className={`status-chip ${isRunning ? "chip-running" : isDone ? "chip-done" : isFailed ? "chip-fail" : ""}`}>
-                            {isRunning ? <><span className="spinner" /> 分析中</> : isDone ? "已完成" : isFailed ? "失败" : status}
+                            {isRunning ? <><span className="spinner" /> {currentStep?.label ?? displayStatus}</> : displayStatus}
                           </span>
                         </div>
                       );
@@ -883,6 +1253,7 @@ export function BookDetailView({
                 <thead>
                   <tr>
                     <th>角色</th>
+                    <th>MiMo 音色设计</th>
                     <th>性别</th>
                     <th>年龄</th>
                     <th>音色</th>
@@ -892,20 +1263,31 @@ export function BookDetailView({
                 <tbody>
                   <tr key="narrator">
                     <td style={{ fontWeight: 500 }}>旁白</td>
+                    <td>固定旁白音色</td>
                     <td>
-                      <select value="neutral" disabled aria-label="旁白性别">
-                        <option value="neutral">中性</option>
+                      <select value={narratorVoiceId === "narrator_male" ? "male" : "female"} disabled aria-label="旁白性别">
+                        <option value="female">女性</option>
+                        <option value="male">男性</option>
                       </select>
                     </td>
                       <td>成年</td>
                     <td>
-                      <select value="narrator_default" disabled aria-label="旁白音色">
-                        <option value="narrator_default">旁白（固定）</option>
+                      <select
+                        value={narratorVoiceId === "narrator_male" ? "narrator_male" : "narrator_female"}
+                        onChange={(event) => {
+                          void handleNarratorVoiceChange(
+                            event.target.value as "narrator_female" | "narrator_male",
+                          );
+                        }}
+                        aria-label="旁白音色"
+                      >
+                        <option value="narrator_female">旁白（女性固定）</option>
+                        <option value="narrator_male">旁白（男性固定）</option>
                       </select>
                     </td>
                     <td>
                       <button
-                        onClick={() => handlePreviewVoice("narrator_default")}
+                        onClick={() => handlePreviewVoice(narratorVoiceId)}
                         title="试听旁白音色"
                       >
                         ▶
@@ -921,6 +1303,17 @@ export function BookDetailView({
                             待确认
                           </span>
                         )}
+                      </td>
+                      <td>
+                        <textarea
+                          aria-label={`${c.canonicalName} 的 MiMo 音色设计`}
+                          value={c.voiceDesign ?? ""}
+                          rows={4}
+                          onChange={(e) =>
+                            handleVoiceDesignChange(c.id, e.target.value)
+                          }
+                          placeholder="角色身份、音色质感、说话习惯和固定约束"
+                        />
                       </td>
                       <td>
                         <select
@@ -942,18 +1335,24 @@ export function BookDetailView({
                             handleVoiceChange(c.id, e.target.value)
                           }
                         >
-                          {voiceOptions.map((v) => (
+                          {voiceOptions
+                            .filter(
+                              (v) =>
+                                !["narrator_default", "narrator_female", "narrator_male"].includes(v.id) ||
+                                v.id === c.voiceId,
+                            )
+                            .map((v) => (
                             <option key={v.id} value={v.id} disabled={v.available === false}>
                               {localizeVoiceDisplayName(v.displayName, v.id)}{v.available === false ? "（不可用）" : ""}
                             </option>
-                          ))}
+                            ))}
                         </select>
                       </td>
                       <td>
                         <button
                           onClick={() => handlePreviewVoice(
                             c.voiceId,
-                            c.voiceDescription,
+                            c.voiceDesign ?? c.voiceDescription,
                             c.fallbackVoiceId,
                           )}
                           title="试听音色"
@@ -985,6 +1384,34 @@ export function BookDetailView({
 
           {pipeline.tab === "generate" && (
             <div className="tab-panel">
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                  选中的章节会在后端按顺序完成：原章节配音、Whisper 转录、音频规划、本地 Stable Audio 和最终混音。网页关闭或刷新后任务仍会继续。
+                </div>
+                {activeGenerationWorkflow && activeGenerationChapterId && (
+                  <WorkflowSteps
+                    workflow={activeGenerationWorkflow}
+                    title={`《${activeGenerationTitle ?? activeGenerationChapterId}》音频流水线`}
+                  />
+                )}
+                <button
+                  className="btn-primary"
+                  style={{ width: "auto", alignSelf: "flex-start" }}
+                  onClick={handleGenerate}
+                  disabled={
+                    isBusy ||
+                    !pipeline.analysis ||
+                    pipeline.selectedChapters.size === 0
+                  }
+                >
+                  批量生成（{pipeline.selectedChapters.size}）
+                </button>
+                {pipeline.selectedChapters.size === 0 && (
+                  <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                    请在左侧选择一个或多个已经分析完成的章节。
+                  </span>
+                )}
+              </div>
               {isBusy && (
                 <div className="progress-bar">
                   <div
@@ -1003,6 +1430,37 @@ export function BookDetailView({
                   <span style={{ color: "var(--text-muted)" }}>{d.label}:</span> {d.value}
                 </div>
               ))}
+              {pipeline.savedMessage && (
+                <p className="success-text" style={{ margin: 0 }}>
+                  {pipeline.savedMessage}
+                </p>
+              )}
+              <BatchGenerationStatusList batch={pipeline.generationBatch} />
+              {!pipeline.generationBatch && Object.values(pipeline.workflows.generation).some((workflow) =>
+                workflow.status !== "pending" || workflow.steps.some((step) => step.status !== "pending"),
+              ) && (
+                <div className="workflow-chapter-summary">
+                  <p className="workflow-summary-title">已生成章节状态</p>
+                  {book.chapters.filter((chapter) => {
+                    const workflow = pipeline.workflows.generation[chapter.id];
+                    return workflow && (
+                      workflow.status !== "pending" || workflow.steps.some((step) => step.status !== "pending")
+                    );
+                  }).map((chapter) => {
+                    const workflow = pipeline.workflows.generation[chapter.id];
+                    if (!workflow) return null;
+                    const currentStep = workflow.steps.find((step) => step.id === workflow.currentStep);
+                    return (
+                      <div className="workflow-summary-row" key={chapter.id}>
+                        <span>{chapter.title}</span>
+                        <span className={`workflow-summary-status workflow-${workflow.status}`}>
+                          {currentStep?.label ?? workflowStatusLabel(workflow.status)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               {isBusy && (
                 <button className="btn-secondary" style={{ width: "auto", alignSelf: "flex-start" }} onClick={handleStop}>
                   停止
@@ -1011,13 +1469,6 @@ export function BookDetailView({
             </div>
           )}
 
-          <PersistentChapterAudioList
-            chapters={book.chapters}
-            chapterAudioPaths={pipeline.chapterAudioPaths}
-            visible={pipeline.tab === "generate"}
-            onDownload={handleDownloadChapter}
-            onRegenerate={handleRegenerateChapter}
-          />
         </section>
       </div>
 

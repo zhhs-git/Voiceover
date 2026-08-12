@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -10,6 +11,7 @@ from typing import Any, Callable
 from urllib import request as urllib_request
 from urllib.error import HTTPError
 
+from audiobook_worker.audio_asset_ids import normalize_audio_plan_asset_ids
 from audiobook_worker.dialogue import resolve_text_language, segment_dialogue
 
 
@@ -21,6 +23,7 @@ class CharacterContext:
     aliases: list[str]
     gender: str
     age_class: str = "unknown"
+    voice_design: str = ""
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,92 @@ class ChapterAnalysisRequest:
     text: str
     language: str
     known_characters: list[CharacterContext] = field(default_factory=list)
+    stage_callback: Callable[[str, dict[str, Any]], None] | None = None
+    # Completed stage payloads loaded from the chapter analysis cache.  They
+    # are only reused when ``resume_from_stage`` explicitly says where to
+    # continue; a normal analysis always starts a fresh three-stage run.
+    cached_stages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    resume_from_stage: str | None = None
+
+
+@dataclass(frozen=True)
+class AudioPlanningRequest:
+    """Inputs for the split post-TTS scene, music, and SFX planning stages."""
+
+    book_id: str
+    chapter_id: str
+    text: str
+    language: str
+    segments: list[dict[str, Any]]
+    transcript: list[dict[str, Any]]
+    # This is the active chapter cast, not the full book character roster.
+    # Callers should use ``select_active_audio_characters`` when constructing
+    # the request.  The stage payload applies the same guard as a second line
+    # of defence for older/custom callers.
+    characters: list[dict[str, Any]] = field(default_factory=list)
+    # Audio planning is split into smaller, resumable requests. These fields
+    # remain optional so custom analyzers and older callers keep the old API.
+    stage_callback: Callable[[str, dict[str, Any]], None] | None = None
+    cached_stages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    resume_from_stage: str | None = None
+
+
+_AUDIO_PLANNER_NON_CHARACTER_SPEAKERS = frozenset({"", "narrator", "unknown"})
+
+
+def select_active_audio_characters(
+    characters: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a compact roster containing only characters speaking this chapter.
+
+    Chapter scripts intentionally retain the whole-book roster so character
+    identity and fixed voices remain stable across chapters.  Audio planning
+    does not need inactive characters, so only IDs referenced by the current
+    segment speaker IDs are allowed through.  We also whitelist the fields
+    that the planner can use; this prevents unrelated script metadata from
+    inflating the request again.
+    """
+
+    if not isinstance(characters, list) or not isinstance(segments, list):
+        return []
+
+    active_ids = {
+        str(segment.get("speakerId") or "").strip()
+        for segment in segments
+        if isinstance(segment, dict)
+    }
+    active_ids.difference_update(_AUDIO_PLANNER_NON_CHARACTER_SPEAKERS)
+    if not active_ids:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for character in characters:
+        if not isinstance(character, dict):
+            continue
+        character_id = str(character.get("id") or "").strip()
+        if not character_id or character_id not in active_ids or character_id in seen_ids:
+            continue
+
+        compact: dict[str, Any] = {"id": character_id}
+        for key in ("canonicalName", "gender", "ageClass", "voiceId"):
+            value = character.get(key)
+            if value is not None and str(value).strip():
+                compact[key] = str(value)
+
+        aliases = character.get("aliases")
+        if isinstance(aliases, list):
+            compact["aliases"] = [str(alias) for alias in aliases if str(alias).strip()]
+
+        voice_design = character.get("voiceDesign") or character.get("voiceDescription")
+        if voice_design is not None and str(voice_design).strip():
+            compact["voiceDesign"] = str(voice_design).strip()
+
+        selected.append(compact)
+        seen_ids.add(character_id)
+
+    return selected
 
 
 @dataclass(frozen=True)
@@ -40,6 +129,7 @@ class CharacterAnalysis:
     gender: str
     age_class: str
     confidence: float
+    voice_design: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,9 +143,88 @@ class SegmentAnnotation:
 
 
 @dataclass(frozen=True)
+class MusicPlan:
+    model: str
+    duration_seconds: float
+    prompt: str
+    negative_prompt: str
+    reason_zh: str
+
+
+@dataclass(frozen=True)
+class MusicVariantPlan:
+    """One same-theme Stable Audio music variant for a scene."""
+
+    id: str
+    level: str
+    model: str
+    duration_seconds: float
+    prompt: str
+    negative_prompt: str
+    reason_zh: str
+
+
+@dataclass(frozen=True)
+class MusicCuePlan:
+    """A source-segment range that selects one music variant."""
+
+    id: str
+    start_segment_index: int
+    end_segment_index: int
+    variant_id: str
+    reason_zh: str
+
+
+@dataclass(frozen=True)
+class MusicBreakPlan:
+    """A short, intentional music-only breathing window."""
+
+    after_segment_index: int
+    duration_seconds: float
+    reason_zh: str
+
+
+@dataclass(frozen=True)
+class SfxPlan:
+    id: str
+    model: str
+    anchor_segment_index: int
+    timing: str
+    event_zh: str
+    duration_seconds: float
+    prompt: str
+    negative_prompt: str
+    reason_zh: str
+    anchor_text: str = ""
+
+
+@dataclass(frozen=True)
+class AudioScenePlan:
+    id: str
+    start_segment_index: int
+    end_segment_index: int
+    summary_zh: str
+    energy_arc: str = ""
+    music: MusicPlan | None = None
+    music_palette: dict[str, str] = field(default_factory=dict)
+    music_variants: list[MusicVariantPlan] = field(default_factory=list)
+    music_cues: list[MusicCuePlan] = field(default_factory=list)
+    music_breaks: list[MusicBreakPlan] = field(default_factory=list)
+    sfx: list[SfxPlan] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChapterAudioPlan:
+    scenes: list[AudioScenePlan] = field(default_factory=list)
+    version: int = 1
+
+
+@dataclass(frozen=True)
 class ChapterAnalysisResult:
     characters: list[CharacterAnalysis]
     segment_annotations: list[SegmentAnnotation]
+    audio_plan: ChapterAudioPlan = field(default_factory=ChapterAudioPlan)
+    voice_directions: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -67,6 +236,12 @@ class OpenAICompatibleConfig:
     max_tokens: int | None = None
     timeout_seconds: float = 120.0
     max_retries: int = 3
+    # OpenAI-compatible gateways do not all implement response_format in the
+    # same way. Some Codex-backed routes accept ordinary chat requests but
+    # fail or misreport JSON-mode requests. Keep JSON enforcement in the
+    # prompt and local decoder by default; providers can opt in when this
+    # capability is known to work.
+    supports_response_format: bool = False
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
@@ -181,9 +356,13 @@ Do this silently before producing JSON:
   - `contemptuous`: cold, humourless disdain from above, heavier and colder than `teasing`.
   - `solemn`: grave, ceremonious, befitting oaths, eulogies, or momentous declarations.
   - `bitter`: suppressed resentment and grievance, not open `angry`.
-- `pace`: "slow" | "normal" | "fast". For narration, always return "normal". For \
-  dialogue, apply the mandatory pace rubric below; do not mechanically use the same \
-  pace for every speaker.
+- `pace`: "slow" | "normal" | "fast". Apply the mandatory pace rubric below to both \
+  narration and dialogue; narration may be slow, normal, or fast when the text supports \
+  a change, and must not be forced to "normal". Judge every segment independently; do not \
+  mechanically use the same pace for every speaker or for the whole chapter.
+- For narration, use the rhythm and delivery cues in the prose: descriptive or reflective \
+  passages are normally `normal`, deliberate emphasis, grief, hesitation, or solemn reading \
+  may be `slow`, and urgent action, rapid developments, or compressed narration may be `fast`.
 - Pace means delivery speed, not volume, emotion, age, gender, social status, or \
   the inherent sound of a voice. Do not infer a slow pace merely because a topic is \
   serious, a sentence is long, or a speaker sounds authoritative.
@@ -212,6 +391,9 @@ by mechanical alternation; and does every non-narrator ID exist in the roster?
 
 ## Output format
 Return a single JSON object with exactly two keys: `characters` and `segmentAnnotations`. \
+Each character contains `id`, `canonicalName`, `aliases`, `gender`, `ageClass`, and `confidence`. \
+Each segment annotation contains `segmentIndex`, `speakerId`, `emotion`, `pace`, `confidence`, \
+and `warnings`. \
 No markdown, no extra commentary — only the JSON object.
 """
 
@@ -290,7 +472,7 @@ emotion 只能是以下20种：neutral、happy、sad、angry、afraid、tense、
 - contemptuous：冷蔑鄙视，不带笑意，比 teasing 更冷更刻薄，是居高临下的轻视。
 - solemn：庄严肃穆，适合宣誓、讣告、重要宣告等需要郑重的场合。
 - bitter：压抑的苦涩与积怨，不是公开的 angry，而是咽下去的辛酸与不甘。
-pace 只能是 slow、normal、fast。speakerId="narrator" 的旁白必须返回 normal。语速只表示说话的快慢节奏，不表示音量、音色、年龄、性别、身份地位或声音本身特质；不能因为内容严肃、句子较长、人物年长或身份威严就直接判为 slow。
+pace 只能是 slow、normal、fast。旁白和对白都必须根据文本证据判断语速；旁白可以返回 slow、normal 或 fast，不能强制全部返回 normal。语速只表示说话的快慢节奏，不表示音量、音色、年龄、性别、身份地位或声音本身特质；不能因为内容严肃、句子较长、人物年长或身份威严就直接判为 slow。
 
 ### 语速判断标准（必须遵守，按优先级从高到低）
 
@@ -320,7 +502,7 @@ pace 只能是 slow、normal、fast。speakerId="narrator" 的旁白必须返回
 特别说明：angry 爆发型可 fast，冷怒或一字一顿可 slow，无法判断用 normal；tense 本身不影响语速；whispering 只说明音量，有犹豫停顿证据才用 slow；resolute 坚定有力不意味缓慢，默认 normal。
 
 **第三优先：场景默认规则**
-旁白（narrator）必须返回 normal，无例外。茶肆/街头/集市匿名闲谈：普通聊天用 normal，短促连续问答用 fast，只有明确低声警告或犹豫才用 slow，不能因一句警告将整场对白改为 slow。
+旁白没有明确速度证据时使用 normal；只有文本或动作明确支持时才使用 slow 或 fast。茶肆/街头/集市匿名闲谈：普通聊天用 normal，短促连续问答用 fast，只有明确低声警告或犹豫才用 slow，不能因一句警告将整场对白或旁白改为 slow。
 
 每一句必须独立判断 pace，不能机械复制上一句的语速。冲突时：明确的动作描写 > 情绪默认倾向 > 场景规则；仍无法确定时选 normal。
 confidence 为 0.0 到 1.0。明确姓名发言标签通常可高于 0.9；代词解析或双人轮换应降低；多名候选人时应低于 0.6。
@@ -408,6 +590,10 @@ class MockLLMAnalyzer:
             segment_annotations=annotations,
         )
 
+    def plan_audio(self, request: AudioPlanningRequest) -> ChapterAudioPlan:
+        """Offline mode keeps audio planning empty instead of inventing assets."""
+        return ChapterAudioPlan()
+
 
 @dataclass(frozen=True)
 class ResolvedModel:
@@ -418,6 +604,7 @@ class ResolvedModel:
     api: str
     family: str
     max_tokens: int
+    supports_response_format: bool = False
 
 
 class OpenAICompatibleAnalyzer:
@@ -437,22 +624,58 @@ class OpenAICompatibleAnalyzer:
         return self.config.provider
 
     def analyze_chapter(self, request: ChapterAnalysisRequest) -> ChapterAnalysisResult:
-        request = replace(
-            request,
-            language=resolve_text_language(request.text, request.language),
-        )
+        from audiobook_worker.llm_stages import run_split_chapter_analysis
+
+        try:
+            return run_split_chapter_analysis(self, request)
+        except RuntimeError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            # Keep the worker boundary stable for callers.  Stage parsers use
+            # ValueError internally, while the old analyzer API exposed
+            # analysis failures as RuntimeError.
+            raise RuntimeError(f"Chapter analysis stage validation failed: {error}") from error
+
+    def plan_audio(self, request: AudioPlanningRequest) -> ChapterAudioPlan:
+        from audiobook_worker.llm_stages import run_audio_planning
+
+        try:
+            return run_audio_planning(self, request)
+        except RuntimeError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Audio planning validation failed: {error}") from error
+
+    def _request_stage_json(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        *,
+        stage_name: str = "LLM stage",
+    ) -> dict[str, Any]:
+        """Send one narrowly scoped JSON request for an analysis stage."""
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
         payload = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": _system_prompt(request.language)},
-                {"role": "user", "content": _analysis_prompt(request)},
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(user_payload, ensure_ascii=False),
+                },
             ],
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
         }
+        if self.config.supports_response_format:
+            payload["response_format"] = {"type": "json_object"}
         if self.config.max_tokens is not None:
             payload["max_tokens"] = self.config.max_tokens
+        # DeepSeek's reasoning mode can spend the whole request budget on
+        # internal reasoning for this large structured-analysis prompt. The
+        # prompt already contains the required analysis rules, so disable
+        # provider-specific reasoning for DeepSeek only.
+        if self.config.provider.casefold() == "deepseek":
+            payload["thinking"] = {"type": "disabled"}
 
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries):
@@ -467,25 +690,84 @@ class OpenAICompatibleAnalyzer:
                     self.config.timeout_seconds,
                 )
                 content = response["choices"][0]["message"]["content"]
-                result = _parse_analysis_json(json.loads(content))
-                segment_count = len(
-                    segment_dialogue(request.text, language=request.language)
-                )
-                return _normalize_and_validate_analysis(
-                    result,
-                    request=request,
-                    segment_count=segment_count,
-                )
+                return _decode_model_json(content)
             except Exception as exc:
                 last_error = exc
                 if attempt < self.config.max_retries - 1:
-                    # Exponential backoff: 1s, 2s, 4s
-                    time.sleep(2 ** attempt)
+                    # Ordinary errors use a short exponential backoff. A
+                    # Codex-backed gateway can briefly lose its upstream auth
+                    # lease and report that as 503/auth_unavailable; give it
+                    # a longer recovery window before declaring the stage
+                    # failed.
+                    delay = (
+                        5 * (2 ** attempt)
+                        if _is_transient_auth_error(exc)
+                        else 2 ** attempt
+                    )
+                    time.sleep(delay)
                     continue
 
         raise RuntimeError(
-            f"LLM analysis failed after {self.config.max_retries} attempts: {last_error}"
+            f"{stage_name} failed after {self.config.max_retries} attempts: {last_error}"
         ) from last_error
+
+
+def _is_transient_auth_error(error: Exception) -> bool:
+    """Return whether a gateway error is likely recoverable by waiting."""
+
+    if getattr(error, "code", None) == 503:
+        return True
+    detail = str(error).casefold()
+    return "auth_unavailable" in detail or "http 503" in detail
+
+
+def _decode_model_json(content: Any) -> dict[str, Any]:
+    """Decode JSON returned by providers with minor wrapper variations.
+
+    OpenAI-compatible providers normally return a JSON string, but some model
+    versions wrap it in a Markdown fence or return an array of text parts.  A
+    wrapper variation should not be confused with a chapter-analysis failure.
+    """
+
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        content = "".join(parts)
+    if not isinstance(content, str):
+        raise ValueError("LLM response content must contain a JSON object")
+
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Recover a single JSON object surrounded by a short accidental
+        # preamble/postscript.  Do not attempt to repair arbitrary JSON.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("LLM response did not contain a JSON object") from None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as error:
+            raise ValueError("LLM response did not contain valid JSON") from error
+
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response JSON must be an object")
+    return parsed
 
 
 def default_analyzer():
@@ -584,6 +866,7 @@ def analyzer_from_resolved_model(
             base_url=resolved.base_url,
             model=resolved.model_id,
             max_tokens=resolved.max_tokens,
+            supports_response_format=resolved.supports_response_format,
         ),
         transport=transport,
     )
@@ -622,6 +905,12 @@ def _resolved_model(
         api=provider_config.get("api", "openai-completions"),
         family=provider_config.get("family", "default"),
         max_tokens=int(model_entry.get("maxTokens", 8192)),
+        supports_response_format=bool(
+            model_entry.get(
+                "supportsResponseFormat",
+                provider_config.get("supportsResponseFormat", False),
+            )
+        ),
     )
 
 
@@ -689,6 +978,1047 @@ def _analysis_prompt(request: ChapterAnalysisRequest) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+_AUDIO_MODELS = {"sm-music", "sm-sfx"}
+_AUDIO_TIMINGS = {"before", "during", "after"}
+_MAX_AUDIO_DURATION_SECONDS = 120.0
+
+
+def _audio_model(
+    item: dict[str, Any],
+    path: str,
+    *,
+    expected: str,
+) -> str:
+    """Normalize the planner's model label to a supported Stable Audio model.
+
+    The planner has one supported model per asset kind.  Models sometimes
+    return the friendly labels ``music``/``sfx`` or omit the field entirely;
+    those should not silently erase an otherwise valid asset during validation.
+    Manual Stable Audio scripts are still validated separately by
+    ``stable_audio.py``.
+    """
+
+    value = item.get("model")
+    if value is None:
+        return expected
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"audio plan field {path}.model must be a string")
+    # The planner cannot select another backend model: Stable Audio exposes
+    # exactly one supported model for each asset kind. Treat the returned
+    # label as a hint and bind the asset to that kind's supported model.
+    return expected
+
+
+def _audio_string(item: dict[str, Any], key: str, path: str, *, required: bool = True) -> str:
+    value = item.get(key)
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"audio plan field {path}.{key} must be a non-empty string")
+    return value.strip()
+
+
+def _audio_int(item: dict[str, Any], key: str, path: str) -> int:
+    value = item.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"audio plan field {path}.{key} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            parsed = math.nan
+        if math.isfinite(parsed) and parsed.is_integer():
+            return int(parsed)
+    raise ValueError(f"audio plan field {path}.{key} must be an integer")
+
+
+def _audio_duration(item: dict[str, Any], path: str) -> float:
+    value = item.get("durationSeconds")
+    if isinstance(value, bool):
+        raise ValueError(f"audio plan field {path}.durationSeconds must be a number")
+    if isinstance(value, (int, float)):
+        duration = float(value)
+    elif isinstance(value, str):
+        try:
+            duration = float(value.strip())
+        except ValueError as error:
+            raise ValueError(
+                f"audio plan field {path}.durationSeconds must be a number"
+            ) from error
+    else:
+        raise ValueError(f"audio plan field {path}.durationSeconds must be a number")
+    if not math.isfinite(duration) or not 0 < duration <= _MAX_AUDIO_DURATION_SECONDS:
+        raise ValueError(
+            f"audio plan field {path}.durationSeconds must be between 0 and "
+            f"{_MAX_AUDIO_DURATION_SECONDS:g}"
+        )
+    return duration
+
+
+def _optional_audio_string(
+    item: dict[str, Any],
+    key: str,
+) -> str:
+    """Read an optional text field without letting a model type error abort analysis."""
+
+    value = item.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+_MUSIC_PROMPT_MAX_CHARACTERS = 260
+_MUSIC_PROMPT_PREFIX = "TrackType: Music, VocalType: Instrumental"
+_MUSIC_PROMPT_REDUNDANCY_PATTERNS = (
+    r"\bno vocals\b",
+    r"\bno lyrics\b",
+    r"\bseamless loopable bed\b",
+    r"\bseamless background bed\b",
+    r"\bno abrupt ending\b",
+    r"\bcontinuous audiobook background music bed\b",
+    r"\bclearly audible but restrained under speech\b",
+)
+
+
+def _compact_music_prompt(value: Any) -> str:
+    """Keep Stable Audio music prompts short and tag-led.
+
+    Stable Audio's official prompt guide gets useful results from a compact
+    combination of TrackType/VocalType, genre, instruments, mood/energy, and
+    BPM.  The planner may still return verbose prose, so normalize redundant
+    audiobook/mixing instructions before persisting or sending a prompt to
+    Stable Audio.
+    """
+
+    text = " ".join(str(value or "").split()).strip()
+    for pattern in _MUSIC_PROMPT_REDUNDANCY_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"(?:,\s*){2,}", ", ", text)
+    text = text.strip(" ,.;，。；")
+
+    has_track_type = re.search(r"\bTrackType\s*:\s*Music\b", text, re.IGNORECASE)
+    has_vocal_type = re.search(
+        r"\bVocalType\s*:\s*Instrumental\b", text, re.IGNORECASE
+    )
+    if not has_track_type:
+        text = f"{_MUSIC_PROMPT_PREFIX}, {text}" if text else _MUSIC_PROMPT_PREFIX
+    elif not has_vocal_type:
+        text = re.sub(
+            r"^\s*TrackType\s*:\s*Music\s*,?\s*",
+            f"{_MUSIC_PROMPT_PREFIX}, ",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    if len(text) > _MUSIC_PROMPT_MAX_CHARACTERS:
+        cutoff = text.rfind(",", 0, _MUSIC_PROMPT_MAX_CHARACTERS)
+        if cutoff < len(_MUSIC_PROMPT_PREFIX):
+            cutoff = _MUSIC_PROMPT_MAX_CHARACTERS
+        text = text[:cutoff].rstrip(" ,.;，。；")
+    return text
+
+
+def _parse_music_plan(value: Any, path: str) -> MusicPlan:
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must be an object")
+    return MusicPlan(
+        model=_audio_model(value, path, expected="sm-music"),
+        duration_seconds=_audio_duration(value, path),
+        prompt=_compact_music_prompt(_audio_string(value, "prompt", path)),
+        negative_prompt=_optional_audio_string(value, "negativePrompt"),
+        reason_zh=_optional_audio_string(value, "reasonZh"),
+    )
+
+
+def _parse_music_variant(value: Any, path: str) -> MusicVariantPlan:
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must be an object")
+    variant_id = _audio_string(value, "id", path)
+    level = _optional_audio_string(value, "level").lower()
+    if level not in {"low", "medium", "high"}:
+        raise ValueError(f"{path}.level must be low, medium, or high")
+    return MusicVariantPlan(
+        id=variant_id,
+        level=level,
+        model=_audio_model(value, path, expected="sm-music"),
+        duration_seconds=_audio_duration(value, path),
+        prompt=_compact_music_prompt(_audio_string(value, "prompt", path)),
+        negative_prompt=_optional_audio_string(value, "negativePrompt"),
+        reason_zh=_optional_audio_string(value, "reasonZh"),
+    )
+
+
+def _parse_audio_plan(value: Any) -> ChapterAudioPlan:
+    """Parse the optional audio plan defensively.
+
+    Character and segment analysis is still useful when the model makes a type
+    mistake in an optional Stable Audio field.  Invalid scenes/assets are
+    discarded here and the core analysis continues; downstream validation still
+    checks the surviving plan against the real segment timeline.
+    """
+
+    if value is None:
+        return ChapterAudioPlan()
+    if not isinstance(value, dict):
+        return ChapterAudioPlan()
+
+    raw_scenes = value.get("scenes", [])
+    if not isinstance(raw_scenes, list):
+        return ChapterAudioPlan()
+
+    raw_version = value.get("version", 1)
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError):
+        version = 1
+
+    scenes: list[AudioScenePlan] = []
+    seen_scene_ids: set[str] = set()
+    for scene_index, raw_scene in enumerate(raw_scenes):
+        path = f"audioPlan.scenes[{scene_index}]"
+        if not isinstance(raw_scene, dict):
+            continue
+        try:
+            scene_id = _audio_string(raw_scene, "id", path)
+            start_segment_index = _audio_int(
+                raw_scene, "startSegmentIndex", path
+            )
+            end_segment_index = _audio_int(raw_scene, "endSegmentIndex", path)
+        except (TypeError, ValueError):
+            # A scene without a usable identity or range cannot be safely
+            # placed on the narration timeline, so ignore just that scene.
+            continue
+        if scene_id in seen_scene_ids:
+            continue
+        seen_scene_ids.add(scene_id)
+
+        music: MusicPlan | None = None
+        raw_music = raw_scene.get("music")
+        if isinstance(raw_music, dict):
+            music_path = f"{path}.music"
+            try:
+                music = _parse_music_plan(raw_music, music_path)
+            except (TypeError, ValueError):
+                # `music` is optional.  In particular, models sometimes emit
+                # a prompt string instead of the documented object; dropping
+                # that asset is safer than failing the complete chapter.
+                music = None
+
+        palette: dict[str, str] = {}
+        raw_palette = raw_scene.get("musicPalette")
+        if isinstance(raw_palette, dict):
+            palette = {
+                str(key): str(item).strip()
+                for key, item in raw_palette.items()
+                if str(item).strip()
+            }
+
+        variants: list[MusicVariantPlan] = []
+        seen_variant_ids: set[str] = set()
+        raw_variants = raw_scene.get("musicVariants", [])
+        if isinstance(raw_variants, list):
+            for variant_index, raw_variant in enumerate(raw_variants):
+                variant_path = f"{path}.musicVariants[{variant_index}]"
+                try:
+                    variant = _parse_music_variant(raw_variant, variant_path)
+                except (TypeError, ValueError):
+                    continue
+                if variant.id in seen_variant_ids:
+                    continue
+                seen_variant_ids.add(variant.id)
+                variants.append(variant)
+
+        cues: list[MusicCuePlan] = []
+        seen_cue_ids: set[str] = set()
+        raw_cues = raw_scene.get("musicCues", [])
+        if isinstance(raw_cues, list):
+            for cue_index, raw_cue in enumerate(raw_cues):
+                cue_path = f"{path}.musicCues[{cue_index}]"
+                if not isinstance(raw_cue, dict):
+                    continue
+                try:
+                    cue = MusicCuePlan(
+                        id=_audio_string(raw_cue, "id", cue_path),
+                        start_segment_index=_audio_int(
+                            raw_cue, "startSegmentIndex", cue_path
+                        ),
+                        end_segment_index=_audio_int(
+                            raw_cue, "endSegmentIndex", cue_path
+                        ),
+                        variant_id=_audio_string(raw_cue, "variantId", cue_path),
+                        reason_zh=_optional_audio_string(raw_cue, "reasonZh"),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if cue.id in seen_cue_ids:
+                    continue
+                seen_cue_ids.add(cue.id)
+                cues.append(cue)
+
+        breaks: list[MusicBreakPlan] = []
+        seen_break_indices: set[int] = set()
+        raw_breaks = raw_scene.get("musicBreaks", [])
+        if isinstance(raw_breaks, list):
+            for break_index, raw_break in enumerate(raw_breaks):
+                break_path = f"{path}.musicBreaks[{break_index}]"
+                if not isinstance(raw_break, dict):
+                    continue
+                try:
+                    item = MusicBreakPlan(
+                        after_segment_index=_audio_int(
+                            raw_break, "afterSegmentIndex", break_path
+                        ),
+                        duration_seconds=_audio_duration(raw_break, break_path),
+                        reason_zh=_optional_audio_string(raw_break, "reasonZh"),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if item.after_segment_index in seen_break_indices:
+                    continue
+                seen_break_indices.add(item.after_segment_index)
+                breaks.append(item)
+
+        raw_sfx = raw_scene.get("sfx", [])
+        if not isinstance(raw_sfx, list):
+            raw_sfx = []
+        sfx: list[SfxPlan] = []
+        seen_sfx_ids: set[str] = set()
+        for sfx_index, raw_effect in enumerate(raw_sfx):
+            sfx_path = f"{path}.sfx[{sfx_index}]"
+            if not isinstance(raw_effect, dict):
+                continue
+            try:
+                effect_id = _audio_string(raw_effect, "id", sfx_path)
+                effect = SfxPlan(
+                    id=effect_id,
+                    model=_audio_model(raw_effect, sfx_path, expected="sm-sfx"),
+                    anchor_segment_index=_audio_int(
+                        raw_effect, "anchorSegmentIndex", sfx_path
+                    ),
+                    timing=_audio_string(raw_effect, "timing", sfx_path),
+                    event_zh=_optional_audio_string(raw_effect, "eventZh"),
+                    duration_seconds=_audio_duration(raw_effect, sfx_path),
+                    prompt=_audio_string(raw_effect, "prompt", sfx_path),
+                    negative_prompt=_optional_audio_string(
+                        raw_effect, "negativePrompt"
+                    ),
+                    reason_zh=_optional_audio_string(raw_effect, "reasonZh"),
+                    anchor_text=_optional_audio_string(raw_effect, "anchorText"),
+                )
+            except (TypeError, ValueError):
+                continue
+            if effect_id in seen_sfx_ids:
+                continue
+            seen_sfx_ids.add(effect_id)
+            sfx.append(effect)
+
+        scenes.append(
+            AudioScenePlan(
+                id=scene_id,
+                start_segment_index=start_segment_index,
+                end_segment_index=end_segment_index,
+                summary_zh=_optional_audio_string(raw_scene, "summaryZh"),
+                energy_arc=_optional_audio_string(raw_scene, "energyArc"),
+                music=music,
+                music_palette=palette,
+                music_variants=variants,
+                music_cues=cues,
+                music_breaks=breaks,
+                sfx=sfx,
+            )
+        )
+
+    if any(
+        scene.music_variants or scene.music_cues or scene.music_breaks or scene.music_palette
+        for scene in scenes
+    ):
+        version = max(version, 2)
+    return ChapterAudioPlan(scenes=scenes, version=version)
+
+
+def _normalize_audio_anchor_text(value: Any) -> str:
+    """Normalize cue text for matching across punctuation and segment breaks."""
+
+    return "".join(
+        character.casefold()
+        for character in str(value or "")
+        if character.isalnum()
+    )
+
+
+def _find_audio_anchor_segment(
+    anchor_text: str,
+    segment_texts: list[str],
+    preferred_index: int,
+    *,
+    minimum_index: int = 0,
+    maximum_index: int | None = None,
+) -> tuple[int, bool] | None:
+    """Find an SFX cue in normalized chapter text.
+
+    Returns the first segment containing the cue and whether the cue begins at
+    the beginning of the chapter.  Matching the concatenated normalized text
+    lets a cue survive punctuation differences and a dialogue splitter that
+    separated one action across adjacent segments.
+    """
+
+    needle = _normalize_audio_anchor_text(anchor_text)
+    if not needle or not segment_texts:
+        return None
+
+    normalized_segments = [
+        _normalize_audio_anchor_text(text) for text in segment_texts
+    ]
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for text in normalized_segments:
+        end = cursor + len(text)
+        offsets.append((cursor, end))
+        cursor = end
+    haystack = "".join(normalized_segments)
+    if not haystack:
+        return None
+
+    upper_bound = (
+        len(segment_texts) - 1
+        if maximum_index is None
+        else min(maximum_index, len(segment_texts) - 1)
+    )
+    lower_bound = max(0, minimum_index)
+    if lower_bound > upper_bound:
+        return None
+
+    candidates: list[tuple[int, int, bool]] = []
+    search_from = 0
+    while True:
+        position = haystack.find(needle, search_from)
+        if position < 0:
+            break
+        start_index = next(
+            (
+                index
+                for index, (start, end) in enumerate(offsets)
+                if start <= position < end
+            ),
+            None,
+        )
+        if start_index is not None and lower_bound <= start_index <= upper_bound:
+            candidates.append((start_index, position, position == 0))
+        search_from = position + 1
+
+    if not candidates:
+        return None
+    start_index, position, starts_at_chapter_start = min(
+        candidates,
+        key=lambda item: (abs(item[0] - preferred_index), item[1]),
+    )
+    return start_index, starts_at_chapter_start
+
+
+def normalize_audio_plan_anchors(
+    audio_plan: ChapterAudioPlan,
+    segment_texts: list[str],
+) -> ChapterAudioPlan:
+    """Repair model-produced SFX anchors against the actual segment text.
+
+    This is intentionally conservative: it only changes an index when the
+    supplied anchor text can be found verbatim after removing punctuation and
+    whitespace.  A cue at chapter offset zero cannot occur ``before`` the
+    chapter, so it is changed to ``during`` before the script is persisted.
+    """
+
+    if not segment_texts or not audio_plan.scenes:
+        return audio_plan
+
+    normalized_scenes: list[AudioScenePlan] = []
+    for scene in audio_plan.scenes:
+        normalized_effects: list[SfxPlan] = []
+        for effect in scene.sfx:
+            match = _find_audio_anchor_segment(
+                effect.anchor_text,
+                segment_texts,
+                effect.anchor_segment_index,
+                minimum_index=scene.start_segment_index,
+                maximum_index=scene.end_segment_index,
+            )
+            if match is None:
+                normalized_effects.append(effect)
+                continue
+
+            anchor_index, starts_at_chapter_start = match
+            timing = (
+                "during"
+                if effect.timing == "before" and starts_at_chapter_start
+                else effect.timing
+            )
+            normalized_effects.append(
+                replace(
+                    effect,
+                    anchor_segment_index=anchor_index,
+                    timing=timing,
+                )
+            )
+        normalized_scenes.append(replace(scene, sfx=normalized_effects))
+    return replace(audio_plan, scenes=normalized_scenes)
+
+
+def _validate_audio_plan(
+    audio_plan: ChapterAudioPlan,
+    *,
+    segment_count: int,
+    segment_texts: list[str] | None = None,
+) -> ChapterAudioPlan:
+    if segment_texts is not None:
+        audio_plan = normalize_audio_plan_anchors(audio_plan, segment_texts)
+
+    # Never reject otherwise usable chapter analysis because the model placed
+    # one scene or asset outside the timeline. Keep only the safe, ordered
+    # subset; the planner stage adds the mandatory full-chapter music bed after
+    # this defensive validation.
+    valid_scenes: list[AudioScenePlan] = []
+    previous_end = -1
+    for scene in audio_plan.scenes:
+        if not 0 <= scene.start_segment_index <= scene.end_segment_index < segment_count:
+            continue
+        if scene.start_segment_index <= previous_end:
+            continue
+        previous_end = scene.end_segment_index
+
+        music = (
+            scene.music
+            if scene.music is not None and scene.music.model == "sm-music"
+            else None
+        )
+        valid_variants: list[MusicVariantPlan] = []
+        variant_ids: set[str] = set()
+        for variant in scene.music_variants:
+            if (
+                variant.model != "sm-music"
+                or variant.level not in {"low", "medium", "high"}
+                or not variant.id
+                or variant.id in variant_ids
+            ):
+                continue
+            variant_ids.add(variant.id)
+            valid_variants.append(variant)
+
+        valid_cues: list[MusicCuePlan] = []
+        previous_cue_end = scene.start_segment_index - 1
+        cue_ids: set[str] = set()
+        for cue in sorted(
+            scene.music_cues,
+            key=lambda item: (item.start_segment_index, item.end_segment_index),
+        ):
+            if (
+                not cue.id
+                or cue.id in cue_ids
+                or cue.variant_id not in variant_ids
+                or not scene.start_segment_index
+                <= cue.start_segment_index
+                <= cue.end_segment_index
+                <= scene.end_segment_index
+                or cue.start_segment_index <= previous_cue_end
+            ):
+                continue
+            cue_ids.add(cue.id)
+            previous_cue_end = cue.end_segment_index
+            valid_cues.append(cue)
+
+        valid_breaks: list[MusicBreakPlan] = []
+        break_indices: set[int] = set()
+        # Keep one deliberate breathing window per scene. More windows make a
+        # long bed feel chopped up and are better represented as cue changes.
+        for item in sorted(
+            scene.music_breaks,
+            key=lambda value: value.after_segment_index,
+        ):
+            if (
+                item.after_segment_index in break_indices
+                or not scene.start_segment_index
+                <= item.after_segment_index
+                < scene.end_segment_index
+                or not 2.0 <= item.duration_seconds <= 6.0
+                or valid_breaks
+            ):
+                continue
+            break_indices.add(item.after_segment_index)
+            valid_breaks.append(item)
+
+        valid_effects: list[SfxPlan] = []
+        for effect in scene.sfx:
+            if (
+                effect.model != "sm-sfx"
+                or effect.timing not in _AUDIO_TIMINGS
+                or not scene.start_segment_index
+                <= effect.anchor_segment_index
+                <= scene.end_segment_index
+            ):
+                continue
+            valid_effects.append(effect)
+        valid_scenes.append(
+            replace(
+                scene,
+                music=music,
+                music_variants=valid_variants,
+                music_cues=valid_cues,
+                music_breaks=valid_breaks,
+                sfx=valid_effects,
+            )
+        )
+
+    return replace(audio_plan, scenes=valid_scenes)
+
+
+_DEFAULT_CONTINUOUS_MUSIC = {
+    "zh": MusicPlan(
+        model="sm-music",
+        duration_seconds=30.0,
+        prompt=(
+            "TrackType: Music, VocalType: Instrumental, Genre: historical ambient, "
+            "Instruments: guqin, xiao, low strings, 68 BPM, restrained nocturnal "
+            "suspense, sparse background texture"
+        ),
+        negative_prompt=(
+            "speech, vocals, lyrics, sound effects, abrupt hits"
+        ),
+        reason_zh="确保整章文本始终有连续、克制且不遮挡对白的背景音乐。",
+    ),
+    "en": MusicPlan(
+        model="sm-music",
+        duration_seconds=30.0,
+        prompt=(
+            "TrackType: Music, VocalType: Instrumental, Genre: historical ambient, "
+            "Instruments: guqin, xiao, low strings, 68 BPM, restrained nocturnal "
+            "suspense, sparse background texture"
+        ),
+        negative_prompt=(
+            "speech, vocals, lyrics, sound effects, abrupt hits"
+        ),
+        reason_zh="Keep a continuous restrained music bed under the full chapter.",
+    ),
+}
+
+
+def _ensure_variant_audio_music_coverage(
+    audio_plan: ChapterAudioPlan,
+    *,
+    segment_count: int,
+    language: str,
+) -> ChapterAudioPlan:
+    """Normalize v2 scenes without erasing intentional music breaks."""
+
+    if segment_count <= 0:
+        return audio_plan
+
+    fallback = _DEFAULT_CONTINUOUS_MUSIC[
+        "zh" if str(language).lower().startswith("zh") else "en"
+    ]
+    scenes = list(audio_plan.scenes)
+    normalized: list[AudioScenePlan] = []
+    used_ids = {scene.id for scene in scenes}
+    cursor = 0
+    fill_number = 1
+
+    def append_fill(start: int, end: int) -> None:
+        nonlocal fill_number
+        if start > end:
+            return
+        scene_id = f"music_fill_{fill_number:03d}"
+        while scene_id in used_ids:
+            fill_number += 1
+            scene_id = f"music_fill_{fill_number:03d}"
+        used_ids.add(scene_id)
+        fill_music = replace(
+            fallback,
+            prompt=_compact_music_prompt(
+                f"{fallback.prompt}, sparse neutral transition, section {fill_number}"
+            ),
+            reason_zh="补齐新版音乐计划缺失的场景范围。",
+        )
+        normalized.append(
+            AudioScenePlan(
+                id=scene_id,
+                start_segment_index=start,
+                end_segment_index=end,
+                summary_zh="补齐背景音乐覆盖",
+                music=fill_music,
+                sfx=[],
+            )
+        )
+        fill_number += 1
+
+    for scene in scenes:
+        start = max(0, scene.start_segment_index)
+        end = min(segment_count - 1, scene.end_segment_index)
+        if end < cursor:
+            continue
+        if start > cursor:
+            append_fill(cursor, start - 1)
+        start = max(start, cursor)
+
+        variants = list(scene.music_variants)
+        cues = [
+            cue
+            for cue in scene.music_cues
+            if start <= cue.start_segment_index <= cue.end_segment_index <= end
+            and any(variant.id == cue.variant_id for variant in variants)
+        ]
+        if variants and not cues:
+            preferred = next(
+                (variant for variant in variants if variant.level == "low"),
+                variants[0],
+            )
+            cues = [
+                MusicCuePlan(
+                    id=f"{scene.id}_cue_001",
+                    start_segment_index=start,
+                    end_segment_index=end,
+                    variant_id=preferred.id,
+                    reason_zh="没有可用变体调度时使用低能量同主题铺底。",
+                )
+            ]
+        normalized.append(
+            replace(
+                scene,
+                start_segment_index=start,
+                end_segment_index=end,
+                # v2 variants are the canonical assets; do not generate a
+                # duplicate legacy scene asset when a model emitted both.
+                music=None if variants else scene.music,
+                music_variants=variants,
+                music_cues=cues,
+                music_breaks=[
+                    item
+                    for item in scene.music_breaks
+                    if start <= item.after_segment_index < end
+                ],
+                sfx=[
+                    effect
+                    for effect in scene.sfx
+                    if start <= effect.anchor_segment_index <= end
+                ],
+            )
+        )
+        cursor = end + 1
+
+    if cursor < segment_count:
+        append_fill(cursor, segment_count - 1)
+    if not normalized:
+        append_fill(0, segment_count - 1)
+    return ChapterAudioPlan(scenes=normalized, version=max(2, audio_plan.version))
+
+
+def ensure_audio_music_coverage(
+    audio_plan: ChapterAudioPlan,
+    *,
+    segment_count: int,
+    language: str = "zh",
+    segments: list[dict[str, Any]] | None = None,
+) -> ChapterAudioPlan:
+    """Guarantee continuous, scene-aware music over the complete timeline.
+
+    The planner must not leave dialogue-only gaps, but preserving every
+    model-produced music scene is important: collapsing scenes into one asset
+    makes a long chapter monotonous. This function only fills missing ranges
+    or missing music objects. A model-produced prompt is preferred; the
+    built-in prompt is a safety net for malformed or incomplete output.
+    """
+
+    if segment_count <= 0:
+        return audio_plan
+
+    if any(
+        scene.music_variants or scene.music_cues or scene.music_breaks
+        for scene in audio_plan.scenes
+    ):
+        return _ensure_variant_audio_music_coverage(
+            audio_plan,
+            segment_count=segment_count,
+            language=language,
+        )
+
+    source_segments = segments or []
+    scenes = list(audio_plan.scenes)
+    source_music = next(
+        (scene for scene in scenes if scene.music is not None),
+        None,
+    )
+    music = (
+        source_music.music
+        if source_music is not None and source_music.music is not None
+        else _DEFAULT_CONTINUOUS_MUSIC[
+            "zh" if str(language).lower().startswith("zh") else "en"
+        ]
+    )
+
+    def section_music(
+        start: int,
+        end: int,
+        section_number: int,
+        base_music: MusicPlan | None = None,
+    ) -> MusicPlan:
+        base = base_music or music
+        text = " ".join(
+            str(item.get("text") or "")
+            for item in source_segments[start : min(end + 1, len(source_segments))]
+            if isinstance(item, dict)
+        )
+        emotions = {
+            str(item.get("emotion") or "neutral").strip().lower()
+            for item in source_segments[start : min(end + 1, len(source_segments))]
+            if isinstance(item, dict)
+        }
+        if emotions & {"tense", "afraid", "nervous", "angry", "contemptuous"}:
+            variation = "darker suspense, restrained pulse"
+        elif emotions & {"sad", "grief", "tired", "solemn", "bitter"}:
+            variation = "somber reflection, slow sustained tones"
+        elif emotions & {"happy", "excited", "teasing", "gentle"}:
+            variation = "warm uplift, light rhythmic motion"
+        elif any(keyword in text for keyword in ("火堆", "营地", "帐篷", "夜")):
+            variation = "warm night ambience, gentle plucked motion"
+        elif any(keyword in text for keyword in ("仇家", "宗", "危险", "追", "伤")):
+            variation = "watchful tension, muted low strings"
+        else:
+            variation = "curious reflection, gentle motion"
+        phase_palette = (
+            "low strings and muted woodwind",
+            "warm plucked strings and soft woodwind",
+            "bamboo flute and high strings",
+        )[(section_number - 1) % 3]
+        prompt = _compact_music_prompt(
+            f"{base.prompt}, {variation}, {phase_palette}, section {section_number}"
+        )
+        reason = base.reason_zh or "补齐连续背景音乐覆盖。"
+        return replace(
+            base,
+            prompt=prompt,
+            reason_zh=f"{reason} 根据第 {start}–{end} 段文本与情绪补充段落变化。",
+        )
+
+    if not scenes:
+        scenes = [
+            AudioScenePlan(
+                id="chapter_music",
+                start_segment_index=0,
+                end_segment_index=segment_count - 1,
+                summary_zh="整章连续背景音乐",
+                music=section_music(0, segment_count - 1, 1),
+                sfx=[],
+            )
+        ]
+
+    normalized: list[AudioScenePlan] = []
+    used_ids = {scene.id for scene in scenes}
+    cursor = 0
+    fill_number = 1
+
+    def append_fill(start: int, end: int) -> None:
+        nonlocal fill_number
+        if start > end:
+            return
+        scene_id = f"music_fill_{fill_number:03d}"
+        while scene_id in used_ids:
+            fill_number += 1
+            scene_id = f"music_fill_{fill_number:03d}"
+        used_ids.add(scene_id)
+        normalized.append(
+            AudioScenePlan(
+                id=scene_id,
+                start_segment_index=start,
+                end_segment_index=end,
+                summary_zh="补齐连续背景音乐覆盖",
+                music=section_music(start, end, fill_number),
+                sfx=[],
+            )
+        )
+        fill_number += 1
+
+    for scene_number, scene in enumerate(scenes, start=1):
+        start = max(0, scene.start_segment_index)
+        end = min(segment_count - 1, scene.end_segment_index)
+        if end < cursor:
+            continue
+        if start > cursor:
+            append_fill(cursor, start - 1)
+        start = max(start, cursor)
+        scene_music = scene.music or section_music(start, end, scene_number)
+        scene_sfx = [
+            effect
+            for effect in scene.sfx
+            if start <= effect.anchor_segment_index <= end
+        ]
+        normalized.append(
+            replace(
+                scene,
+                start_segment_index=start,
+                end_segment_index=end,
+                music=scene_music,
+                sfx=scene_sfx,
+            )
+        )
+        cursor = end + 1
+
+    if cursor < segment_count:
+        append_fill(cursor, segment_count - 1)
+
+    if not normalized:
+        normalized.append(
+            AudioScenePlan(
+                id="chapter_music",
+                start_segment_index=0,
+                end_segment_index=segment_count - 1,
+                summary_zh="整章连续背景音乐",
+                music=section_music(0, segment_count - 1, 1),
+                sfx=[],
+            )
+        )
+
+    def phase_count(start: int, end: int) -> int:
+        length = end - start + 1
+        if length < 45:
+            return 1
+        count = max(1, math.ceil(length / 40))
+        # A chapter around the size of a normal long audiobook scene should
+        # not fall back to one chapter-wide bed just because the planner
+        # returned one broad scene.  Three phases is the minimum useful
+        # amount of change for a 90+ segment chapter.
+        if segment_count >= 90 and length >= 80:
+            count = max(3, count)
+        return count
+
+    expanded: list[AudioScenePlan] = []
+    for scene_number, scene in enumerate(normalized, start=1):
+        count = phase_count(scene.start_segment_index, scene.end_segment_index)
+        if count == 1:
+            expanded.append(scene)
+            continue
+
+        start = scene.start_segment_index
+        length = scene.end_segment_index - start + 1
+        for phase in range(count):
+            phase_start = start + (length * phase) // count
+            phase_end = start + (length * (phase + 1)) // count - 1
+            phase_id = f"{scene.id}_phase_{phase + 1:03d}"
+            phase_effects = [
+                effect
+                for effect in scene.sfx
+                if phase_start <= effect.anchor_segment_index <= phase_end
+            ]
+            expanded.append(
+                replace(
+                    scene,
+                    id=phase_id,
+                    start_segment_index=phase_start,
+                    end_segment_index=phase_end,
+                    summary_zh=(
+                        f"{scene.summary_zh}（音乐阶段 {phase + 1}/{count}）"
+                    ).strip("（）"),
+                    music=section_music(
+                        phase_start,
+                        phase_end,
+                        scene_number * 100 + phase + 1,
+                        scene.music,
+                    ),
+                    sfx=phase_effects,
+                )
+            )
+
+    return ChapterAudioPlan(scenes=expanded)
+
+
+def audio_plan_to_dict(audio_plan: ChapterAudioPlan) -> dict[str, Any]:
+    """Serialize the analysis audio plan into the chapter-script JSON shape."""
+    serialized_scenes: list[dict[str, Any]] = []
+    has_v2_fields = audio_plan.version >= 2
+    for scene in audio_plan.scenes:
+        item: dict[str, Any] = {
+            "id": scene.id,
+            "startSegmentIndex": scene.start_segment_index,
+            "endSegmentIndex": scene.end_segment_index,
+            "summaryZh": scene.summary_zh,
+            "music": (
+                {
+                    "model": scene.music.model,
+                    "durationSeconds": scene.music.duration_seconds,
+                    "prompt": scene.music.prompt,
+                    "negativePrompt": scene.music.negative_prompt,
+                    "reasonZh": scene.music.reason_zh,
+                }
+                if scene.music is not None
+                else None
+            ),
+            "sfx": [
+                {
+                    "id": effect.id,
+                    "model": effect.model,
+                    "anchorSegmentIndex": effect.anchor_segment_index,
+                    "anchorText": effect.anchor_text,
+                    "timing": effect.timing,
+                    "eventZh": effect.event_zh,
+                    "durationSeconds": effect.duration_seconds,
+                    "prompt": effect.prompt,
+                    "negativePrompt": effect.negative_prompt,
+                    "reasonZh": effect.reason_zh,
+                }
+                for effect in scene.sfx
+            ],
+        }
+        if scene.energy_arc:
+            item["energyArc"] = scene.energy_arc
+        if (
+            scene.music_palette
+            or scene.music_variants
+            or scene.music_cues
+            or scene.music_breaks
+        ):
+            has_v2_fields = True
+            item["musicPalette"] = dict(scene.music_palette)
+            item["musicVariants"] = [
+                {
+                    "id": variant.id,
+                    "level": variant.level,
+                    "model": variant.model,
+                    "durationSeconds": variant.duration_seconds,
+                    "prompt": variant.prompt,
+                    "negativePrompt": variant.negative_prompt,
+                    "reasonZh": variant.reason_zh,
+                }
+                for variant in scene.music_variants
+            ]
+            item["musicCues"] = [
+                {
+                    "id": cue.id,
+                    "startSegmentIndex": cue.start_segment_index,
+                    "endSegmentIndex": cue.end_segment_index,
+                    "variantId": cue.variant_id,
+                    "reasonZh": cue.reason_zh,
+                }
+                for cue in scene.music_cues
+            ]
+            item["musicBreaks"] = [
+                {
+                    "afterSegmentIndex": item.after_segment_index,
+                    "durationSeconds": item.duration_seconds,
+                    "reasonZh": item.reason_zh,
+                }
+                for item in scene.music_breaks
+            ]
+        serialized_scenes.append(item)
+
+    payload: dict[str, Any] = {"scenes": serialized_scenes}
+    if has_v2_fields:
+        payload["version"] = max(2, audio_plan.version)
+    # The planner may restart SFX/variant numbering in each scene. Normalize
+    # at the serialization boundary so every newly persisted chapter plan is
+    # safe for the chapter-wide Stable Audio manifest.
+    normalize_audio_plan_asset_ids(payload)
+    return payload
+
+
 def _parse_analysis_json(payload: dict[str, Any]) -> ChapterAnalysisResult:
     characters = [
         CharacterAnalysis(
@@ -698,6 +2028,7 @@ def _parse_analysis_json(payload: dict[str, Any]) -> ChapterAnalysisResult:
             gender=str(item.get("gender", "unknown")),
             age_class=str(item.get("ageClass", "unknown")),
             confidence=float(item.get("confidence", 0.0)),
+            voice_design=str(item.get("voiceDesign", "") or "").strip(),
         )
         for item in payload.get("characters", [])
     ]
@@ -712,7 +2043,11 @@ def _parse_analysis_json(payload: dict[str, Any]) -> ChapterAnalysisResult:
         )
         for item in payload.get("segmentAnnotations", [])
     ]
-    return ChapterAnalysisResult(characters=characters, segment_annotations=annotations)
+    return ChapterAnalysisResult(
+        characters=characters,
+        segment_annotations=annotations,
+        audio_plan=_parse_audio_plan(payload.get("audioPlan")),
+    )
 
 
 def _normalize_and_validate_analysis(
@@ -720,6 +2055,7 @@ def _normalize_and_validate_analysis(
     *,
     request: ChapterAnalysisRequest,
     segment_count: int,
+    segment_texts: list[str] | None = None,
 ) -> ChapterAnalysisResult:
     indices = [annotation.segment_index for annotation in result.segment_annotations]
     expected_indices = list(range(segment_count))
@@ -776,6 +2112,7 @@ def _normalize_and_validate_analysis(
                     else character.age_class
                 ),
                 confidence=character.confidence,
+                voice_design=character.voice_design or known.voice_design,
             )
 
         if normalized.id not in seen_character_ids:
@@ -815,9 +2152,17 @@ def _normalize_and_validate_analysis(
             f"unknown speakerId references: {', '.join(invalid_speakers)}"
         )
 
+    audio_plan = _validate_audio_plan(
+        result.audio_plan,
+        segment_count=segment_count,
+        segment_texts=segment_texts,
+    )
+
     return ChapterAnalysisResult(
         characters=normalized_characters,
         segment_annotations=normalized_annotations,
+        audio_plan=audio_plan,
+        voice_directions=result.voice_directions,
     )
 
 

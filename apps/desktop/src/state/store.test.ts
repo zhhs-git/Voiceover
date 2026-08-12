@@ -70,4 +70,15 @@ describe("audiobook state store", () => {
       bookId: "book_123",
     });
   });
+
+  test("persists the book-scoped narrator voice", async () => {
+    const store = createAudiobookStore();
+
+    await store.setNarratorVoice("book_123", "narrator_male");
+
+    expect(invoke).toHaveBeenCalledWith("db_set_narrator_voice", {
+      bookId: "book_123",
+      narratorVoiceId: "narrator_male",
+    });
+  });
 });

@@ -3,7 +3,9 @@ import type { CharacterMeta, VoiceMeta, VoiceOption } from "../types";
 const AUTO_CHARACTER_VOICE_PREFIX = "character_auto_";
 
 const VOICE_NAMES_ZH: Record<string, string> = {
-  narrator_default: "旁白（温暖女声）",
+  narrator_default: "旁白（女性固定）",
+  narrator_female: "旁白（女性固定）",
+  narrator_male: "旁白（男性固定）",
   female_adult_01: "女声 — 温暖有表现力",
   female_adult_02: "女声 — 明亮清澈",
   female_adult_03: "女声 — 温柔细腻",

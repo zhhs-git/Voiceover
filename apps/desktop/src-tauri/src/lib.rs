@@ -20,7 +20,8 @@ fn get_db() -> &'static Db {
             "CREATE TABLE IF NOT EXISTS books (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, source_path TEXT NOT NULL,
                 source_language TEXT NOT NULL, output_language TEXT NOT NULL, work_dir TEXT NOT NULL,
-                imported_at TEXT, updated_at TEXT
+                imported_at TEXT, updated_at TEXT,
+                narrator_voice_id TEXT NOT NULL DEFAULT 'narrator_female'
             );
             CREATE TABLE IF NOT EXISTS chapters (
                 id TEXT NOT NULL, book_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -30,7 +31,7 @@ fn get_db() -> &'static Db {
             CREATE TABLE IF NOT EXISTS characters (
                 id TEXT NOT NULL, book_id TEXT NOT NULL, canonical_name TEXT NOT NULL,
                 gender TEXT, age_class TEXT, identity_status TEXT DEFAULT 'confirmed', voice_id TEXT, voice_source TEXT,
-                voice_assignment_version INTEGER, voice_profile TEXT, fallback_voice_id TEXT, voice_description TEXT,
+                voice_assignment_version INTEGER, voice_profile TEXT, fallback_voice_id TEXT, voice_design TEXT, voice_description TEXT,
                 confidence REAL DEFAULT 0.0,
                 aliases TEXT DEFAULT '[]', updated_at TEXT,
                 PRIMARY KEY (id, book_id)
@@ -63,6 +64,7 @@ fn get_db() -> &'static Db {
             ("voice_assignment_version", "INTEGER"),
             ("voice_profile", "TEXT"),
             ("fallback_voice_id", "TEXT"),
+            ("voice_design", "TEXT"),
             ("voice_description", "TEXT"),
         ] {
             let has_column = conn
@@ -76,6 +78,16 @@ fn get_db() -> &'static Db {
                 .unwrap_or_else(|_| panic!("failed to add {column} column"));
             }
         }
+        let has_narrator_voice_id = conn
+            .prepare("SELECT narrator_voice_id FROM books LIMIT 1")
+            .is_ok();
+        if !has_narrator_voice_id {
+            conn.execute(
+                "ALTER TABLE books ADD COLUMN narrator_voice_id TEXT NOT NULL DEFAULT 'narrator_female'",
+                [],
+            )
+            .expect("failed to add narrator_voice_id column");
+        }
         Db(Mutex::new(conn))
     })
 }
@@ -83,11 +95,16 @@ fn get_db() -> &'static Db {
 // ── Book commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn db_create_book(id: String, title: String, source_path: String, work_dir: String) -> Result<(), String> {
+fn db_create_book(
+    id: String,
+    title: String,
+    source_path: String,
+    work_dir: String,
+) -> Result<(), String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     let now = Utc::now().to_rfc3339();
     db.execute(
-        "INSERT OR REPLACE INTO books (id, title, source_path, source_language, output_language, work_dir, imported_at, updated_at) VALUES (?1, ?2, ?3, 'en', 'en', ?4, ?5, ?5)",
+        "INSERT OR REPLACE INTO books (id, title, source_path, source_language, output_language, work_dir, imported_at, updated_at, narrator_voice_id) VALUES (?1, ?2, ?3, 'en', 'en', ?4, ?5, ?5, 'narrator_female')",
         rusqlite::params![id, title, source_path, work_dir, now],
     )
     .map_err(|e| e.to_string())?;
@@ -127,7 +144,10 @@ fn db_delete_book(book_id: String) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         let deleted = tx
-            .execute("DELETE FROM books WHERE id = ?1", rusqlite::params![book_id])
+            .execute(
+                "DELETE FROM books WHERE id = ?1",
+                rusqlite::params![book_id],
+            )
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         (work_dir, deleted)
@@ -143,7 +163,52 @@ fn db_delete_book(book_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn db_upsert_chapter(id: String, book_id: String, title: String, status: String, script_path: Option<String>) -> Result<(), String> {
+fn db_set_narrator_voice(book_id: String, narrator_voice_id: String) -> Result<(), String> {
+    let normalized = match narrator_voice_id.as_str() {
+        "narrator_male" => "narrator_male",
+        "narrator_female" => "narrator_female",
+        "narrator_default" => "narrator_default",
+        _ => return Err("invalid narrator voice id".to_string()),
+    };
+    let db = get_db().0.lock().map_err(|e| e.to_string())?;
+    let work_dir = db
+        .query_row(
+            "SELECT work_dir FROM books WHERE id = ?1",
+            rusqlite::params![book_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(work_dir) = work_dir else {
+        return Err("book not found".to_string());
+    };
+    db.execute(
+        "UPDATE books SET narrator_voice_id = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![normalized, Utc::now().to_rfc3339(), book_id],
+    )
+    .map_err(|e| e.to_string())?;
+    drop(db);
+
+    let audio_dir = std::path::Path::new(&work_dir).join("audio");
+    if let Ok(entries) = std::fs::read_dir(audio_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("wav") {
+                std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn db_upsert_chapter(
+    id: String,
+    book_id: String,
+    title: String,
+    status: String,
+    script_path: Option<String>,
+) -> Result<(), String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     db.execute(
         "INSERT OR REPLACE INTO chapters (id, book_id, title, status, script_path) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -178,7 +243,7 @@ fn db_get_chapters_with_scripts(book_id: String) -> Result<Vec<serde_json::Value
 fn db_list_books() -> Result<Vec<serde_json::Value>, String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     let mut stmt = db
-        .prepare("SELECT id, title, source_path, work_dir, imported_at FROM books ORDER BY imported_at DESC")
+        .prepare("SELECT id, title, source_path, work_dir, imported_at, narrator_voice_id FROM books ORDER BY imported_at DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -187,7 +252,8 @@ fn db_list_books() -> Result<Vec<serde_json::Value>, String> {
                 "title": row.get::<_, String>(1)?,
                 "sourcePath": row.get::<_, String>(2)?,
                 "workDir": row.get::<_, String>(3)?,
-                "importedAt": row.get::<_, Option<String>>(4)?
+                "importedAt": row.get::<_, Option<String>>(4)?,
+                "narratorVoiceId": row.get::<_, Option<String>>(5)?
             }))
         })
         .map_err(|e| e.to_string())?;
@@ -202,7 +268,7 @@ fn db_list_books() -> Result<Vec<serde_json::Value>, String> {
 fn db_get_book(source_path: String) -> Result<Option<serde_json::Value>, String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     let mut stmt = db
-        .prepare("SELECT id, title, source_path, work_dir, imported_at FROM books WHERE source_path = ?1")
+        .prepare("SELECT id, title, source_path, work_dir, imported_at, narrator_voice_id FROM books WHERE source_path = ?1")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query_map(rusqlite::params![source_path], |row| {
@@ -211,7 +277,8 @@ fn db_get_book(source_path: String) -> Result<Option<serde_json::Value>, String>
                 "title": row.get::<_, String>(1)?,
                 "sourcePath": row.get::<_, String>(2)?,
                 "workDir": row.get::<_, String>(3)?,
-                "importedAt": row.get::<_, Option<String>>(4)?
+                "importedAt": row.get::<_, Option<String>>(4)?,
+                "narratorVoiceId": row.get::<_, Option<String>>(5)?
             }))
         })
         .map_err(|e| e.to_string())?;
@@ -224,12 +291,21 @@ fn db_get_book(source_path: String) -> Result<Option<serde_json::Value>, String>
 
 #[tauri::command]
 fn db_upsert_character(
-    id: String, book_id: String, canonical_name: String,
-    gender: Option<String>, age_class: Option<String>, identity_status: Option<String>, voice_id: Option<String>,
-    voice_source: Option<String>, voice_assignment_version: Option<i64>,
-    voice_profile: Option<String>, fallback_voice_id: Option<String>,
+    id: String,
+    book_id: String,
+    canonical_name: String,
+    gender: Option<String>,
+    age_class: Option<String>,
+    identity_status: Option<String>,
+    voice_id: Option<String>,
+    voice_source: Option<String>,
+    voice_assignment_version: Option<i64>,
+    voice_profile: Option<String>,
+    fallback_voice_id: Option<String>,
+    voice_design: Option<String>,
     voice_description: Option<String>,
-    confidence: Option<f64>, aliases: Option<String>,
+    confidence: Option<f64>,
+    aliases: Option<String>,
 ) -> Result<(), String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     let now = Utc::now().to_rfc3339();
@@ -252,16 +328,21 @@ fn db_upsert_character(
         let mut found: Option<String> = None;
         let rows = stmt
             .query_map(rusqlite::params![book_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
         for row in rows {
             let (existing_id, existing_name, existing_aliases) = row.map_err(|e| e.to_string())?;
-            let existing_names = character_names(
-                &existing_name,
-                existing_aliases.as_deref().unwrap_or("[]"),
-            );
-            if incoming_names.iter().any(|name| existing_names.contains(name)) {
+            let existing_names =
+                character_names(&existing_name, existing_aliases.as_deref().unwrap_or("[]"));
+            if incoming_names
+                .iter()
+                .any(|name| existing_names.contains(name))
+            {
                 found = Some(existing_id);
                 break;
             }
@@ -271,8 +352,8 @@ fn db_upsert_character(
 
     let target_id = matching_id.unwrap_or(id);
     db.execute(
-        "INSERT INTO characters (id, book_id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_description, confidence, aliases, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "INSERT INTO characters (id, book_id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_design, voice_description, confidence, aliases, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id, book_id) DO UPDATE SET
            canonical_name = excluded.canonical_name,
            gender = COALESCE(excluded.gender, characters.gender),
@@ -304,6 +385,10 @@ fn db_upsert_character(
              WHEN excluded.voice_source = 'manual' THEN NULL
              ELSE COALESCE(excluded.fallback_voice_id, characters.fallback_voice_id)
            END,
+           voice_design = CASE
+             WHEN characters.voice_source = 'manual' AND excluded.voice_source <> 'manual' THEN characters.voice_design
+             ELSE COALESCE(excluded.voice_design, characters.voice_design)
+           END,
            voice_description = CASE
              WHEN characters.voice_source = 'manual' AND excluded.voice_source <> 'manual' THEN characters.voice_description
              WHEN excluded.voice_source = 'manual' THEN excluded.voice_description
@@ -312,7 +397,7 @@ fn db_upsert_character(
            confidence = COALESCE(excluded.confidence, characters.confidence),
            aliases = excluded.aliases,
            updated_at = excluded.updated_at",
-        rusqlite::params![target_id, book_id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_description, confidence, incoming_aliases, now],
+        rusqlite::params![target_id, book_id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_design, voice_description, confidence, incoming_aliases, now],
     ).map_err(|e| e.to_string())?;
     db.execute(
         "DELETE FROM character_aliases WHERE book_id = ?1 AND character_id = ?2",
@@ -344,11 +429,44 @@ fn character_names(canonical_name: &str, aliases_json: &str) -> Vec<String> {
 fn is_generic_character_label(value: &str) -> bool {
     matches!(
         value,
-        "小姐" | "少爷" | "姑娘" | "公子" | "夫人" | "太太" | "老爷" | "殿下"
-            | "陛下" | "皇上" | "皇后" | "公主" | "王爷" | "世子" | "大人"
-            | "先生" | "女士" | "母亲" | "父亲" | "娘" | "爹" | "妈妈" | "爸爸"
-            | "mother" | "father" | "wife" | "husband" | "miss" | "mrs" | "ms"
-            | "mr" | "sir" | "madam" | "lady" | "lord" | "girl" | "boy" | "woman"
+        "小姐"
+            | "少爷"
+            | "姑娘"
+            | "公子"
+            | "夫人"
+            | "太太"
+            | "老爷"
+            | "殿下"
+            | "陛下"
+            | "皇上"
+            | "皇后"
+            | "公主"
+            | "王爷"
+            | "世子"
+            | "大人"
+            | "先生"
+            | "女士"
+            | "母亲"
+            | "父亲"
+            | "娘"
+            | "爹"
+            | "妈妈"
+            | "爸爸"
+            | "mother"
+            | "father"
+            | "wife"
+            | "husband"
+            | "miss"
+            | "mrs"
+            | "ms"
+            | "mr"
+            | "sir"
+            | "madam"
+            | "lady"
+            | "lord"
+            | "girl"
+            | "boy"
+            | "woman"
             | "man"
     )
 }
@@ -357,7 +475,7 @@ fn is_generic_character_label(value: &str) -> bool {
 fn db_get_characters(book_id: String) -> Result<Vec<serde_json::Value>, String> {
     let db = get_db().0.lock().map_err(|e| e.to_string())?;
     let mut stmt = db
-        .prepare("SELECT id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_description, confidence, aliases FROM characters WHERE book_id = ?1")
+        .prepare("SELECT id, canonical_name, gender, age_class, identity_status, voice_id, voice_source, voice_assignment_version, voice_profile, fallback_voice_id, voice_design, voice_description, confidence, aliases FROM characters WHERE book_id = ?1")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params![book_id], |row| {
@@ -372,9 +490,10 @@ fn db_get_characters(book_id: String) -> Result<Vec<serde_json::Value>, String> 
                 "voiceAssignmentVersion": row.get::<_, Option<i64>>(7)?,
                 "voiceProfile": row.get::<_, Option<String>>(8)?,
                 "fallbackVoiceId": row.get::<_, Option<String>>(9)?,
-                "voiceDescription": row.get::<_, Option<String>>(10)?,
-                "confidence": row.get::<_, Option<f64>>(11)?,
-                "aliases": row.get::<_, Option<String>>(12)?
+                "voiceDesign": row.get::<_, Option<String>>(10)?,
+                "voiceDescription": row.get::<_, Option<String>>(11)?,
+                "confidence": row.get::<_, Option<f64>>(12)?,
+                "aliases": row.get::<_, Option<String>>(13)?
             }))
         })
         .map_err(|e| e.to_string())?;
@@ -431,8 +550,14 @@ async fn run_worker(command: String, input_json: String) -> Result<String, Strin
     std::fs::write(&input_path, &input_json).map_err(|e| e.to_string())?;
 
     let worker_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap().parent().unwrap()
-        .join("workers").join("python");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("workers")
+        .join("python");
 
     let python = worker_dir.join(".venv").join("bin").join("python3");
     let input = input_path.to_str().unwrap().to_string();
@@ -450,13 +575,19 @@ async fn run_worker(command: String, input_json: String) -> Result<String, Strin
         let _ = tx.send(result);
     });
 
-    let result = rx.recv().map_err(|_| "Worker thread panicked".to_string())?
+    let result = rx
+        .recv()
+        .map_err(|_| "Worker thread panicked".to_string())?
         .map_err(|e| format!("Failed to spawn worker: {}", e))?;
 
     if let Ok(output) = std::fs::read_to_string(&output_path) {
         return Ok(output);
     }
-    Err(format!("Worker exited {:?}: {}", result.status.code(), String::from_utf8_lossy(&result.stderr)))
+    Err(format!(
+        "Worker exited {:?}: {}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    ))
 }
 
 #[tauri::command]
@@ -467,7 +598,10 @@ async fn copy_file(from: String, to: String) -> Result<String, String> {
 
 #[tauri::command]
 fn file_exists(paths: Vec<String>) -> Vec<String> {
-    paths.into_iter().filter(|p| std::path::Path::new(p).exists()).collect()
+    paths
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect()
 }
 
 // ── App entry ───────────────────────────────────────────────────────────────
@@ -479,9 +613,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            run_worker, copy_file, file_exists,
-            db_create_book, db_delete_book, db_upsert_chapter, db_get_chapters_with_scripts, book_work_dir,
-            db_list_books, db_get_book, db_upsert_character, db_get_characters, db_get_chapters,
+            run_worker,
+            copy_file,
+            file_exists,
+            db_create_book,
+            db_delete_book,
+            db_upsert_chapter,
+            db_get_chapters_with_scripts,
+            book_work_dir,
+            db_list_books,
+            db_get_book,
+            db_set_narrator_voice,
+            db_upsert_character,
+            db_get_characters,
+            db_get_chapters,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

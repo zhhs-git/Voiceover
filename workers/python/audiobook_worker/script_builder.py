@@ -4,7 +4,41 @@ import hashlib
 import re
 
 from audiobook_worker.dialogue import resolve_text_language, segment_dialogue
-from audiobook_worker.llm import CharacterContext, ChapterAnalysisRequest, MockLLMAnalyzer
+from audiobook_worker.llm import (
+    CharacterContext,
+    ChapterAnalysisRequest,
+    MockLLMAnalyzer,
+)
+
+
+NARRATOR_FEMALE_VOICE_ID = "narrator_female"
+NARRATOR_MALE_VOICE_ID = "narrator_male"
+# Kept for scripts produced before the book-scoped narrator setting existed.
+# It is the same stable female voice as narrator_female.
+LEGACY_NARRATOR_VOICE_ID = "narrator_default"
+DEFAULT_NARRATOR_VOICE_ID = LEGACY_NARRATOR_VOICE_ID
+
+
+def normalize_narrator_voice_id(value: object = None) -> str:
+    """Return one of the two supported stable narrator identities.
+
+    Unknown, missing, and legacy values intentionally resolve to the existing
+    female narrator so old books remain compatible and never become random.
+    """
+    normalized = str(value or "").strip().casefold()
+    if normalized == NARRATOR_MALE_VOICE_ID:
+        return NARRATOR_MALE_VOICE_ID
+    if normalized == NARRATOR_FEMALE_VOICE_ID:
+        return NARRATOR_FEMALE_VOICE_ID
+    return DEFAULT_NARRATOR_VOICE_ID
+
+
+def is_narrator_voice_id(value: object) -> bool:
+    return str(value or "").strip().casefold() in {
+        LEGACY_NARRATOR_VOICE_ID,
+        NARRATOR_FEMALE_VOICE_ID,
+        NARRATOR_MALE_VOICE_ID,
+    }
 
 
 VOICE_REGISTRY = {
@@ -12,7 +46,7 @@ VOICE_REGISTRY = {
     "narrator_default": {
         "id": "narrator_default",
         "displayName": "Narrator (Warm Female)",
-        "genderPresentation": "neutral",
+        "genderPresentation": "female",
         "ageClass": "adult",
         "languages": ["en"],
         "styles": ["neutral", "tense", "sad", "happy"],
@@ -23,13 +57,24 @@ VOICE_REGISTRY = {
     "narrator_female": {
         "id": "narrator_female",
         "displayName": "Narrator (Female)",
-        "genderPresentation": "neutral",
+        "genderPresentation": "female",
         "ageClass": "adult",
         "languages": ["en"],
         "styles": ["neutral", "tense", "sad", "happy"],
         "backend": "kokoro",
         "licenseNotes": "Kokoro-82M Apache 2.0",
-        "kokoroVoice": "bf_emma",
+        "kokoroVoice": "af_heart",
+    },
+    "narrator_male": {
+        "id": "narrator_male",
+        "displayName": "Narrator (Stable Male)",
+        "genderPresentation": "male",
+        "ageClass": "adult",
+        "languages": ["en"],
+        "styles": ["neutral", "tense", "sad", "happy"],
+        "backend": "kokoro",
+        "licenseNotes": "Kokoro-82M Apache 2.0",
+        "kokoroVoice": "am_michael",
     },
 
     # ── Female voices (5 distinct) ──────────────────────────────────────
@@ -295,7 +340,12 @@ def build_chapter_script(
     language: str,
     analyzer=None,
     known_characters: list[dict] | None = None,
+    analysis_stage_callback=None,
+    analysis_cached_stages: dict[str, dict] | None = None,
+    analysis_resume_from_stage: str | None = None,
+    narrator_voice_id: str | None = None,
 ) -> dict:
+    narrator_voice_id = normalize_narrator_voice_id(narrator_voice_id)
     language = resolve_text_language(text, language)
     raw_segments = segment_dialogue(text, language=language)
     analyzer = analyzer or MockLLMAnalyzer()
@@ -316,6 +366,11 @@ def build_chapter_script(
             aliases=character["aliases"],
             gender=character["gender"],
             age_class=character["ageClass"],
+            voice_design=(
+                str(character.get("voiceDesign") or "")
+                if str(character.get("voiceDesignSource") or "").strip().lower() != "fallback"
+                else ""
+            ),
         )
         for character in known_script_characters
     ]
@@ -327,6 +382,9 @@ def build_chapter_script(
             text=text,
             language=language,
             known_characters=ctx,
+            stage_callback=analysis_stage_callback,
+            cached_stages=analysis_cached_stages or {},
+            resume_from_stage=analysis_resume_from_stage,
         )
     )
     annotations = {
@@ -343,7 +401,7 @@ def build_chapter_script(
     )
 
     segments = []
-    voice_ids = {"narrator_default"}
+    voice_ids = {narrator_voice_id}
     for index, raw_segment in enumerate(raw_segments):
         annotation = annotations.get(index)
         speaker_id = "narrator"
@@ -355,6 +413,7 @@ def build_chapter_script(
         segment_type = raw_segment.type
         if annotation:
             warnings = sorted(set(warnings + annotation.warnings))
+            pace = _normalize_pace(annotation.pace)
 
         # A quoted-material marker is a high-confidence semantic decision from
         # the pre-segmentation pass (or from the model).  Never let a bad model
@@ -364,7 +423,6 @@ def build_chapter_script(
         if is_quoted_material:
             speaker_id = "narrator"
             emotion = "neutral"
-            pace = "normal"
             confidence = annotation.confidence if annotation else 0.9
             segment_type = "narration"
         elif annotation:
@@ -380,15 +438,13 @@ def build_chapter_script(
                 # Preserve an explicit taunt even when the model reduces it to
                 # cheerful speech because of a light interjection or smile.
                 emotion = "teasing"
-            if speaker_id != "narrator":
-                pace = _normalize_pace(annotation.pace)
             confidence = annotation.confidence
             segment_type = "narration" if speaker_id == "narrator" else "dialogue"
         elif raw_segment.type == "dialogue":
             speaker_id = "unknown"
             confidence = 0.35
 
-        voice_id = _assign_voice(speaker_id, characters)
+        voice_id = _assign_voice(speaker_id, characters, narrator_voice_id)
         voice_description = _voice_description_for_speaker(speaker_id, characters)
         fallback_voice_id = _fallback_voice_for_speaker(speaker_id, characters)
         voice_ids.add(voice_id)
@@ -409,6 +465,7 @@ def build_chapter_script(
             "warnings": warnings,
         }
         if voice_description:
+            segment["voiceDesign"] = voice_description
             segment["voiceDescription"] = voice_description
         if fallback_voice_id:
             segment["fallbackVoiceId"] = fallback_voice_id
@@ -419,9 +476,11 @@ def build_chapter_script(
         "chapterId": chapter_id,
         "title": title,
         "language": language,
+        "narratorVoiceId": narrator_voice_id,
         "characters": characters,
         "voices": _voice_metadata_for_ids(voice_ids, characters),
         "segments": segments,
+        "audioPlan": {"scenes": []},
     }
 
 
@@ -435,6 +494,7 @@ def build_chapter_script_with_corrections(
     corrections: dict,
     analyzer=None,
     known_characters: list[dict] | None = None,
+    narrator_voice_id: str | None = None,
 ) -> dict:
     if corrections is None:
         raise ValueError("corrections must be a dict, got None")
@@ -496,6 +556,16 @@ def build_chapter_script_with_corrections(
     for override in corrections.get("voiceOverrides", []):
         voice_overrides[override["characterId"]] = override["voiceId"]
 
+    voice_design_overrides: dict[str, str] = {}
+    for override in corrections.get("voiceDesignOverrides", []):
+        if "characterId" not in override:
+            raise KeyError("voiceDesignOverrides item missing required key 'characterId'")
+        if "voiceDesign" not in override:
+            raise KeyError("voiceDesignOverrides item missing required key 'voiceDesign'")
+        voice_design_overrides[override["characterId"]] = str(
+            override["voiceDesign"]
+        ).strip()
+
     script = build_chapter_script(
         book_id=book_id,
         chapter_id=chapter_id,
@@ -504,6 +574,7 @@ def build_chapter_script_with_corrections(
         language=language,
         analyzer=analyzer,
         known_characters=known_characters,
+        narrator_voice_id=narrator_voice_id,
     )
 
     character_ids = {character["id"] for character in script["characters"]}
@@ -517,6 +588,7 @@ def build_chapter_script_with_corrections(
 
     gender_overrides = resolve_override_ids(gender_overrides)
     voice_overrides = resolve_override_ids(voice_overrides)
+    voice_design_overrides = resolve_override_ids(voice_design_overrides)
 
     for character in script["characters"]:
         char_id = character["id"]
@@ -536,6 +608,11 @@ def build_chapter_script_with_corrections(
             character.pop("voiceDescription", None)
             character.pop("fallbackVoiceId", None)
 
+        if char_id in voice_design_overrides and voice_design_overrides[char_id]:
+            character["voiceDesign"] = voice_design_overrides[char_id]
+            character["voiceDesignSource"] = "manual"
+            character["voiceDescription"] = voice_design_overrides[char_id]
+
     _ensure_unique_character_voices(script["characters"])
 
     character_voices = {
@@ -543,7 +620,7 @@ def build_chapter_script_with_corrections(
         for character in script["characters"]
     }
     character_descriptions = {
-        character["id"]: character.get("voiceDescription")
+        character["id"]: character.get("voiceDesign") or character.get("voiceDescription")
         for character in script["characters"]
     }
     character_fallbacks = {
@@ -558,8 +635,10 @@ def build_chapter_script_with_corrections(
             segment["voiceId"] = character_voices[speaker_id]
         description = character_descriptions.get(speaker_id)
         if description and speaker_id not in voice_overrides:
+            segment["voiceDesign"] = description
             segment["voiceDescription"] = description
         else:
+            segment.pop("voiceDesign", None)
             segment.pop("voiceDescription", None)
         fallback_voice_id = character_fallbacks.get(speaker_id)
         if fallback_voice_id and speaker_id not in voice_overrides:
@@ -567,15 +646,28 @@ def build_chapter_script_with_corrections(
         else:
             segment.pop("fallbackVoiceId", None)
 
+    narrator_voice_id = normalize_narrator_voice_id(
+        narrator_voice_id or script.get("narratorVoiceId")
+    )
+    for segment in script["segments"]:
+        if segment.get("speakerId") == "narrator":
+            segment["voiceId"] = narrator_voice_id
+            segment.pop("voiceDesign", None)
+            segment.pop("voiceDescription", None)
+            segment.pop("fallbackVoiceId", None)
+    script["narratorVoiceId"] = narrator_voice_id
     voice_ids = {s["voiceId"] for s in script["segments"]}
-    voice_ids.add("narrator_default")
+    voice_ids.add(narrator_voice_id)
     script["voices"] = _voice_metadata_for_ids(voice_ids, script["characters"])
 
     return script
 
 
 def refresh_script_voice_assignments(
-    script: dict, *, force_legacy_auto: bool = False
+    script: dict,
+    *,
+    force_legacy_auto: bool = False,
+    narrator_voice_id: str | None = None,
 ) -> dict:
     """Upgrade the voice routing of an already analysed chapter script.
 
@@ -617,7 +709,10 @@ def refresh_script_voice_assignments(
     result = dict(script)
     result["characters"] = characters
     segments: list[dict] = []
-    voice_ids = {"narrator_default"}
+    narrator_voice_id = normalize_narrator_voice_id(
+        narrator_voice_id or script.get("narratorVoiceId")
+    )
+    voice_ids = {narrator_voice_id}
     for raw_segment in script.get("segments", []):
         if not isinstance(raw_segment, dict):
             continue
@@ -627,7 +722,8 @@ def refresh_script_voice_assignments(
         )
         segment["speakerId"] = speaker_id
         if speaker_id == "narrator":
-            segment["voiceId"] = "narrator_default"
+            segment["voiceId"] = narrator_voice_id
+            segment.pop("voiceDesign", None)
             segment.pop("voiceDescription", None)
             segment.pop("fallbackVoiceId", None)
         elif speaker_id == "unknown":
@@ -651,7 +747,45 @@ def refresh_script_voice_assignments(
         segments.append(segment)
 
     result["segments"] = segments
+    result["narratorVoiceId"] = narrator_voice_id
     result["voices"] = _voice_metadata_for_ids(voice_ids, characters)
+    return result
+
+
+def apply_narrator_voice(script: dict, narrator_voice_id: str | None = None) -> dict:
+    """Normalize narrator routing in an existing script without re-analysis."""
+    if not isinstance(script, dict):
+        raise ValueError("script must be a dict")
+    inferred_voice_id = next(
+        (
+            segment.get("voiceId")
+            for segment in script.get("segments", [])
+            if isinstance(segment, dict)
+            and segment.get("speakerId") == "narrator"
+            and segment.get("voiceId")
+        ),
+        None,
+    )
+    selected = normalize_narrator_voice_id(
+        narrator_voice_id or script.get("narratorVoiceId") or inferred_voice_id
+    )
+    result = dict(script)
+    result["narratorVoiceId"] = selected
+    segments = []
+    voice_ids: set[str] = {selected}
+    for raw_segment in script.get("segments", []):
+        if not isinstance(raw_segment, dict):
+            continue
+        segment = dict(raw_segment)
+        if segment.get("speakerId") == "narrator":
+            segment["voiceId"] = selected
+            segment.pop("voiceDesign", None)
+            segment.pop("voiceDescription", None)
+            segment.pop("fallbackVoiceId", None)
+        voice_ids.add(str(segment.get("voiceId") or "neutral_dialogue_01"))
+        segments.append(segment)
+    result["segments"] = segments
+    result["voices"] = _voice_metadata_for_ids(voice_ids, result.get("characters", []))
     return result
 
 
@@ -814,6 +948,13 @@ def _normalize_script_character(character: dict) -> dict:
         "identityStatus": identity_status,
         "confidence": confidence,
     }
+    voice_design = str(character.get("voiceDesign") or "").strip()
+    if voice_design:
+        normalized["voiceDesign"] = voice_design
+        design_source = str(character.get("voiceDesignSource") or "").strip().lower()
+        normalized["voiceDesignSource"] = design_source or (
+            "manual" if source == "manual" else "llm"
+        )
     if source == "manual":
         if character.get("voiceDescription"):
             normalized["voiceDescription"] = str(character["voiceDescription"])
@@ -945,6 +1086,16 @@ def _merge_character_record(existing: dict, incoming: dict) -> None:
     ):
         existing["ageClass"] = incoming["ageClass"]
 
+    incoming_voice_design = str(incoming.get("voiceDesign") or "").strip()
+    existing_design_source = str(existing.get("voiceDesignSource") or "").strip().lower()
+    incoming_design_source = str(incoming.get("voiceDesignSource") or "llm").strip().lower()
+    if incoming_voice_design and existing.get("voiceSource") != "manual" and (
+        not str(existing.get("voiceDesign") or "").strip()
+        or existing_design_source == "fallback"
+    ):
+        existing["voiceDesign"] = incoming_voice_design
+        existing["voiceDesignSource"] = incoming_design_source
+
     if incoming.get("identityStatus") == "confirmed":
         existing["identityStatus"] = "confirmed"
     elif existing.get("identityStatus") not in _IDENTITY_STATUSES:
@@ -960,6 +1111,9 @@ def _merge_character_record(existing: dict, incoming: dict) -> None:
             existing["voiceDescription"] = incoming["voiceDescription"]
         else:
             existing.pop("voiceDescription", None)
+        if incoming_voice_design:
+            existing["voiceDesign"] = incoming_voice_design
+            existing["voiceDesignSource"] = incoming_design_source
         existing.pop("fallbackVoiceId", None)
         existing.pop("voiceAssignmentVersion", None)
         existing.pop("voiceProfile", None)
@@ -1139,15 +1293,20 @@ def _character_to_script(character) -> dict:
         "aliases": character.aliases,
         "gender": character.gender,
         "ageClass": character.age_class,
+        "voiceDesign": getattr(character, "voice_design", ""),
         "voiceSource": "auto",
         "confidence": character.confidence,
         }
     )
 
 
-def _assign_voice(speaker_id: str, characters: list[dict]) -> str:
+def _assign_voice(
+    speaker_id: str,
+    characters: list[dict],
+    narrator_voice_id: str | None = None,
+) -> str:
     if speaker_id == "narrator":
-        return "narrator_default"
+        return normalize_narrator_voice_id(narrator_voice_id)
     for character in characters:
         if character["id"] == speaker_id:
             return character["voiceId"]
@@ -1159,7 +1318,7 @@ def _voice_description_for_speaker(
 ) -> str | None:
     for character in characters:
         if character["id"] == speaker_id:
-            description = character.get("voiceDescription")
+            description = character.get("voiceDesign") or character.get("voiceDescription")
             return str(description) if description else None
     return None
 
@@ -1239,9 +1398,13 @@ def _finalize_automatic_voice(character: dict) -> None:
         aliases,
         character_id,
     )
-    description = _voice_description_for_character(
-        gender, age_class, canonical_name, aliases, character_id
-    )
+    description = str(character.get("voiceDesign") or "").strip()
+    if not description:
+        description = _voice_description_for_character(
+            gender, age_class, canonical_name, aliases, character_id
+        )
+        character["voiceDesign"] = description
+        character["voiceDesignSource"] = "fallback"
     if description:
         character["voiceDescription"] = description
     else:
@@ -1413,7 +1576,9 @@ def _is_current_auto_assignment(character: dict, profile: str) -> bool:
         version == VOICE_ASSIGNMENT_VERSION
         and str(character.get("voiceProfile") or "") == profile
         and str(character.get("voiceId") or "").startswith(_AUTO_CHARACTER_VOICE_PREFIX)
-        and bool(str(character.get("voiceDescription") or "").strip())
+        and bool(
+            str(character.get("voiceDesign") or character.get("voiceDescription") or "").strip()
+        )
         and bool(str(character.get("fallbackVoiceId") or "").strip())
     )
 

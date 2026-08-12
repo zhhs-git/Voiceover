@@ -46,6 +46,7 @@ export function App() {
             workDir: string;
             sourcePath: string;
             chapters: { id: string; title: string; textLength: number; textPath: string }[];
+            narratorVoiceId?: "narrator_female" | "narrator_male" | "narrator_default";
           };
         }>
       )[0];
@@ -54,6 +55,7 @@ export function App() {
         bookId: artifact.metadata.bookId,
         workDir: artifact.metadata.workDir,
         chapters: artifact.metadata.chapters,
+        narratorVoiceId: artifact.metadata.narratorVoiceId ?? "narrator_female",
       };
       navigateToBook(extracted, artifact.metadata.sourcePath);
     } catch (err) {
@@ -87,7 +89,10 @@ export function App() {
               }),
           });
           if (cache) {
-            navigateToBook(cache, libBook.sourcePath);
+            navigateToBook(
+              { ...cache, narratorVoiceId: cache.narratorVoiceId ?? libBook.narratorVoiceId ?? "narrator_female" },
+              libBook.sourcePath,
+            );
             return;
           }
           const chapters = await db.getChapters(libBook.id);
@@ -95,6 +100,7 @@ export function App() {
             title: libBook.title,
             bookId: libBook.id,
             workDir: libBook.workDir,
+            narratorVoiceId: libBook.narratorVoiceId ?? "narrator_female",
             chapters: chapters.map((c) => ({
               id: c.id,
               title: c.title,
@@ -115,6 +121,7 @@ export function App() {
       sourcePath: activeSourcePath,
       workDir: activeBook.workDir,
       importedAt: null,
+      narratorVoiceId: activeBook.narratorVoiceId ?? "narrator_female",
     };
     return (
       <BookDetailView

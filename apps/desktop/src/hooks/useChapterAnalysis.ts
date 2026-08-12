@@ -3,6 +3,7 @@ import { invoke } from "../lib/platform";
 
 import type {
   AnalysisState,
+  AudioAsset,
   BookState,
   CharacterMeta,
   PipelineStage,
@@ -11,6 +12,7 @@ import type {
 } from "../types";
 import { workerCall } from "../lib/workerCall";
 import type { DetailTab } from "../state/pipelineStore";
+import { watchChapterWorkflow } from "../lib/workflowStatus";
 
 interface UseChapterAnalysisDeps {
   book: BookState | null;
@@ -26,11 +28,29 @@ interface UseChapterAnalysisDeps {
     owner?: string,
   ) => void;
   setProgress: (progress: number, owner?: string) => void;
+  setWorkflowStatus: (
+    kind: "analysis" | "generation",
+    chapterId: string,
+    status: import("../types").ChapterWorkflowStatus,
+    owner?: string,
+  ) => void;
   setAnalysis: (
     analysis:
       | AnalysisState
       | null
       | ((prev: AnalysisState | null) => AnalysisState | null),
+    owner?: string,
+  ) => void;
+  setChapterAudioPaths: (
+    paths: Record<string, string> | ((prev: Record<string, string>) => Record<string, string>),
+    owner?: string,
+  ) => void;
+  setChapterMixedAudioPaths: (
+    paths: Record<string, string> | ((prev: Record<string, string>) => Record<string, string>),
+    owner?: string,
+  ) => void;
+  setAudioAssets: (
+    assets: Record<string, AudioAsset[]> | ((prev: Record<string, AudioAsset[]>) => Record<string, AudioAsset[]>),
     owner?: string,
   ) => void;
   setCurrentStep: (step: WorkspaceStep) => void;
@@ -51,6 +71,7 @@ interface UseChapterAnalysisDeps {
       voiceId?: string | null; voiceSource?: "auto" | "manual" | null;
       voiceAssignmentVersion?: number | null; voiceProfile?: string | null;
       fallbackVoiceId?: string | null;
+      voiceDesign?: string | null;
       voiceDescription?: string | null;
       confidence?: number; aliases?: string;
     }) => Promise<unknown>;
@@ -69,7 +90,11 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     setChapterStatuses,
     setProgressDetail,
     setProgress,
+    setWorkflowStatus,
     setAnalysis,
+    setChapterAudioPaths,
+    setChapterMixedAudioPaths,
+    setAudioAssets,
     setCurrentStep,
     setTab,
     abortRef,
@@ -97,7 +122,6 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     const chaptersToAnalyze = book.chapters.filter((c) =>
       selectedChapters.has(c.id),
     );
-
     // Characters accumulated across this run (seeded with previously-found ones).
     // Each chapter receives the full list so the LLM can maintain consistency.
     type KnownChar = {
@@ -112,6 +136,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
       voiceAssignmentVersion?: number | null;
       voiceProfile?: string | null;
       fallbackVoiceId?: string | null;
+      voiceDesign?: string | null;
       voiceDescription?: string | null;
       confidence?: number;
     };
@@ -130,6 +155,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
       voiceAssignmentVersion: c.voiceAssignmentVersion,
       voiceProfile: c.voiceProfile,
       fallbackVoiceId: c.fallbackVoiceId,
+      voiceDesign: c.voiceDesign,
       voiceDescription: c.voiceDescription,
       confidence: c.confidence,
     }));
@@ -146,6 +172,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     try {
       const statuses: Record<string, string> = {};
       let doneCount = 0;
+      const failureMessages: string[] = [];
 
       for (let i = 0; i < chaptersToAnalyze.length; i++) {
         if (controller.signal.aborted) break;
@@ -170,6 +197,12 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
         ], book.bookId);
         statuses[chapter.id] = "analyzing";
         setChapterStatuses({ ...statuses }, book.bookId);
+        const stopWorkflowWatch = watchChapterWorkflow(
+          book.workDir,
+          chapter.id,
+          "analysis",
+          (workflow) => setWorkflowStatus("analysis", chapter.id, workflow, book.bookId),
+        );
 
         try {
           const result = await workerCall("analyze_chapter", {
@@ -178,12 +211,23 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
             title: chapter.title,
             chapterTextPath: chapter.textPath,
             outputDirectory: `${book.workDir}/scripts`,
+            narratorVoiceId: book.narratorVoiceId ?? "narrator_female",
             // Pass accumulated character context for cross-chapter consistency
             knownCharacters: knownCharacters.length > 0 ? knownCharacters : undefined,
           });
 
           if (result.status !== "succeeded") {
             statuses[chapter.id] = "failed";
+            const detail = (
+              result.error?.message ||
+              result.error?.code ||
+              "Worker 未返回可用的分析结果"
+            ).slice(0, 500);
+            failureMessages.push(`${chapter.title}：${detail}`);
+            setAnalyzeProgress(
+              `《${chapter.title}》分析失败：${detail}`,
+              book.bookId,
+            );
             setChapterStatuses({ ...statuses }, book.bookId);
             continue;
           }
@@ -191,6 +235,25 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
           const artifact = (result.artifacts as Array<{ path: string }>)[0];
           statuses[chapter.id] = "done";
           doneCount++;
+
+          // The new scene plan invalidates all derived audio for this chapter.
+          // Clear the live UI snapshot together with the worker-side files so
+          // an old track cannot be played or mixed with the new script.
+          setChapterAudioPaths((prev) => {
+            const next = { ...prev };
+            delete next[chapter.id];
+            return next;
+          }, book.bookId);
+          setChapterMixedAudioPaths((prev) => {
+            const next = { ...prev };
+            delete next[chapter.id];
+            return next;
+          }, book.bookId);
+          setAudioAssets((prev) => {
+            const next = { ...prev };
+            delete next[chapter.id];
+            return next;
+          }, book.bookId);
 
           db.upsertChapter({
             id: chapter.id,
@@ -230,6 +293,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
                 voiceAssignmentVersion: c.voiceAssignmentVersion,
                 voiceProfile: c.voiceProfile,
                 fallbackVoiceId: c.fallbackVoiceId,
+                voiceDesign: c.voiceDesign,
                 voiceDescription: c.voiceDescription,
                 confidence: c.confidence,
               });
@@ -247,6 +311,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
               existing.voiceAssignmentVersion = c.voiceAssignmentVersion;
               existing.voiceProfile = c.voiceProfile;
               existing.fallbackVoiceId = c.fallbackVoiceId;
+              existing.voiceDesign = c.voiceDesign;
               existing.voiceDescription = c.voiceDescription;
             }
           }
@@ -266,6 +331,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
               voiceAssignmentVersion: c.voiceAssignmentVersion,
               voiceProfile: c.voiceProfile,
               fallbackVoiceId: c.fallbackVoiceId,
+              voiceDesign: c.voiceDesign,
               voiceDescription: c.voiceDescription,
               confidence: c.confidence,
               aliases: JSON.stringify(c.aliases),
@@ -293,6 +359,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
                   voiceAssignmentVersion: character.voiceAssignmentVersion,
                   voiceProfile: character.voiceProfile,
                   fallbackVoiceId: character.fallbackVoiceId,
+                  voiceDesign: character.voiceDesign,
                   voiceDescription: character.voiceDescription,
                 };
               }
@@ -313,8 +380,19 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
               },
             };
           }, book.bookId);
-        } catch {
+        } catch (error) {
           statuses[chapter.id] = "failed";
+          const detail = (error instanceof Error ? error.message : String(error)).slice(
+            0,
+            500,
+          );
+          failureMessages.push(`${chapter.title}：${detail}`);
+          setAnalyzeProgress(
+            `《${chapter.title}》分析失败：${detail}`,
+            book.bookId,
+          );
+        } finally {
+          stopWorkflowWatch();
         }
 
         setChapterStatuses({ ...statuses }, book.bookId);
@@ -326,15 +404,21 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
 
       setProgress(100, book.bookId);
       setProgressDetail([], book.bookId);
-        setAnalyzeProgress(
+      setAnalyzeProgress(
           wasStopped
           ? `已停止，完成 ${doneCount} / ${chaptersToAnalyze.length} 章。`
           : failedCount > 0
-            ? `分析完成：${doneCount} 章成功，${failedCount} 章失败。`
+            ? `分析完成：${doneCount} 章成功，${failedCount} 章失败。${failureMessages.length > 0 ? ` ${failureMessages.slice(0, 2).join("；")}` : ""}`
             : `已分析 ${doneCount} 章。`,
         book.bookId,
       );
       setStage("idle", book.bookId);
+      if (failedCount > 0 && failureMessages.length > 0) {
+        setError(
+          `分析失败详情：${failureMessages.slice(0, 2).join("；")}`,
+          book.bookId,
+        );
+      }
       clearController();
 
       if (doneCount > 0) {
@@ -363,11 +447,15 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     abortRef,
     db,
     setAnalysis,
+    setAudioAssets,
+    setChapterAudioPaths,
+    setChapterMixedAudioPaths,
     setAnalyzeProgress,
     setChapterStatuses,
     setCurrentStep,
     setError,
     setProgress,
+    setWorkflowStatus,
     setProgressDetail,
     setSavedMessage,
     setStage,

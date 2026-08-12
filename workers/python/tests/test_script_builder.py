@@ -1,6 +1,15 @@
 from audiobook_worker.dialogue import segment_dialogue
-from audiobook_worker.llm import CharacterAnalysis, ChapterAnalysisResult, SegmentAnnotation
+from audiobook_worker.llm import (
+    AudioScenePlan,
+    ChapterAnalysisResult,
+    ChapterAudioPlan,
+    CharacterAnalysis,
+    MusicPlan,
+    SegmentAnnotation,
+    SfxPlan,
+)
 from audiobook_worker.script_builder import (
+    apply_narrator_voice,
     build_chapter_script,
     refresh_script_voice_assignments,
 )
@@ -13,6 +22,131 @@ class CapturingAnalyzer:
     def analyze_chapter(self, request):
         self.request = request
         return ChapterAnalysisResult(characters=[], segment_annotations=[])
+
+
+class AudioPlanAnalyzer:
+    def analyze_chapter(self, request):
+        return ChapterAnalysisResult(
+            characters=[],
+            segment_annotations=[],
+            audio_plan=ChapterAudioPlan(
+                scenes=[
+                    AudioScenePlan(
+                        id="scene_001",
+                        start_segment_index=0,
+                        end_segment_index=0,
+                        summary_zh="雨夜街道",
+                        music=MusicPlan(
+                            model="sm-music",
+                            duration_seconds=30,
+                            prompt="Dark historical suspense instrumental bed, sparse guqin",
+                            negative_prompt="vocals, speech",
+                            reason_zh="旁白下的悬疑氛围",
+                        ),
+                        sfx=[
+                            SfxPlan(
+                                id="sfx_001",
+                                model="sm-sfx",
+                                anchor_segment_index=0,
+                                timing="before",
+                                event_zh="雨声",
+                                duration_seconds=5,
+                                prompt="TrackType: SFX, heavy rain on wet stone pavement",
+                                negative_prompt="music, speech",
+                                reason_zh="强化雨夜环境",
+                                anchor_text="Rain fell on the street",
+                            )
+                        ],
+                    )
+                ]
+            ),
+        )
+
+
+class VoiceDesignAnalyzer:
+    def analyze_chapter(self, request):
+        parts = segment_dialogue(request.text, language=request.language)
+        return ChapterAnalysisResult(
+            characters=[
+                CharacterAnalysis(
+                    id="张三",
+                    canonical_name="张三",
+                    aliases=[],
+                    gender="male",
+                    age_class="adult",
+                    confidence=0.95,
+                    voice_design="角色：沉着的年轻将领。音色中低沉稳，咬字利落，句尾收紧。",
+                )
+            ],
+            segment_annotations=[
+                SegmentAnnotation(
+                    segment_index=index,
+                    speaker_id="张三" if part.type == "dialogue" else "narrator",
+                    emotion="neutral",
+                    pace="normal",
+                    confidence=0.95,
+                )
+                for index, part in enumerate(parts)
+            ],
+            voice_directions={
+                index: "语速中等偏快，句尾收紧。"
+                for index in range(len(parts))
+            },
+        )
+
+
+def test_build_chapter_script_leaves_audio_plan_for_post_tts_stage():
+    script = build_chapter_script(
+        book_id="book_123",
+        chapter_id="chapter_001",
+        title="Chapter 1",
+        text="Rain fell on the street.",
+        language="en",
+        analyzer=AudioPlanAnalyzer(),
+    )
+
+    assert script["segments"][0]["text"] == "Rain fell on the street."
+    assert script["audioPlan"] == {"scenes": []}
+
+
+class PostTtsAudioPlanAnalyzer:
+    def analyze_chapter(self, request):
+        return ChapterAnalysisResult(
+            characters=[],
+            segment_annotations=[
+                SegmentAnnotation(
+                    segment_index=0,
+                    speaker_id="narrator",
+                    emotion="tense",
+                    pace="slow",
+                    confidence=0.9,
+                )
+            ],
+            audio_plan=ChapterAudioPlan(
+                scenes=[
+                    AudioScenePlan(
+                        id="scene_1",
+                        start_segment_index=0,
+                        end_segment_index=0,
+                        summary_zh="雨夜等待",
+                    )
+                ]
+            ),
+        )
+
+
+def test_post_tts_audio_plan_is_not_attached_to_initial_tts_segments():
+    script = build_chapter_script(
+        book_id="book_123",
+        chapter_id="chapter_001",
+        title="Chapter 1",
+        text="Rain fell on the street.",
+        language="en",
+        analyzer=PostTtsAudioPlanAnalyzer(),
+    )
+
+    assert script["audioPlan"] == {"scenes": []}
+    assert "sceneId" not in script["segments"][0]
 
 
 def test_builds_dialogue_aware_chapter_script():
@@ -41,6 +175,34 @@ def test_builds_dialogue_aware_chapter_script():
     assert voice_metadata["backend"] == "mimo"
     assert script["segments"][1]["emotion"] == "neutral"
     assert script["segments"][1]["confidence"] >= 0.7
+
+
+def test_llm_voice_design_replaces_legacy_deterministic_description():
+    script = build_chapter_script(
+        book_id="book_zh",
+        chapter_id="chapter_001",
+        title="第一章",
+        text="张三说道：“走吧。”",
+        language="zh",
+        analyzer=VoiceDesignAnalyzer(),
+        known_characters=[
+            {
+                "id": "char_zhangsan",
+                "canonicalName": "张三",
+                "aliases": [],
+                "gender": "male",
+                "ageClass": "adult",
+                "voiceId": "character_auto_legacy",
+                "voiceSource": "auto",
+            }
+        ],
+    )
+
+    character = script["characters"][0]
+    assert "沉着的年轻将领" in character["voiceDesign"]
+    dialogue = next(segment for segment in script["segments"] if segment["type"] == "dialogue")
+    assert dialogue["voiceDesign"] == character["voiceDesign"]
+    assert all("voiceDirection" not in segment for segment in script["segments"])
 
 
 def test_unknown_dialogue_uses_neutral_fallback_voice():
@@ -204,7 +366,7 @@ class PaceAwareAnalyzer:
         )
 
 
-def test_narration_keeps_fixed_pace_while_character_pace_follows_analysis():
+def test_narration_and_character_pace_follow_analysis():
     script = build_chapter_script(
         book_id="book_zh",
         chapter_id="chapter_001",
@@ -215,9 +377,54 @@ def test_narration_keeps_fixed_pace_while_character_pace_follows_analysis():
     )
 
     assert script["segments"][0]["speakerId"] == "narrator"
-    assert script["segments"][0]["pace"] == "normal"
+    assert script["segments"][0]["pace"] == "fast"
     assert script["segments"][1]["speakerId"] == script["characters"][0]["id"]
     assert script["segments"][1]["pace"] == "slow"
+
+
+def test_book_narrator_voice_is_used_for_every_narration_segment():
+    script = build_chapter_script(
+        book_id="book_zh",
+        chapter_id="chapter_001",
+        title="第一章",
+        text="夜色落下来。“走吧。”",
+        language="zh",
+        analyzer=PaceAwareAnalyzer(),
+        narrator_voice_id="narrator_male",
+    )
+
+    narrator_segments = [
+        segment for segment in script["segments"] if segment["speakerId"] == "narrator"
+    ]
+    assert narrator_segments
+    assert {segment["voiceId"] for segment in narrator_segments} == {"narrator_male"}
+    assert script["narratorVoiceId"] == "narrator_male"
+
+
+def test_existing_script_narrator_voice_can_be_migrated_without_reanalysis():
+    migrated = apply_narrator_voice(
+        {
+            "segments": [
+                {
+                    "id": "seg_0001",
+                    "speakerId": "narrator",
+                    "voiceId": "narrator_default",
+                    "voiceDesign": "旧的动态旁白设计",
+                },
+                {
+                    "id": "seg_0002",
+                    "speakerId": "character_1",
+                    "voiceId": "male_adult_01",
+                },
+            ]
+        },
+        "narrator_male",
+    )
+
+    assert migrated["narratorVoiceId"] == "narrator_male"
+    assert migrated["segments"][0]["voiceId"] == "narrator_male"
+    assert "voiceDesign" not in migrated["segments"][0]
+    assert migrated["segments"][1]["voiceId"] == "male_adult_01"
 
 
 class RenamedCharacterAnalyzer:

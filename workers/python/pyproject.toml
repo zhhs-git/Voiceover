@@ -18,6 +18,7 @@ dependencies = [
   "parler-tts>=0.2.0",
   "soundfile>=0.12.1",
   "kokoro>=0.9.4",
+  "mlx-whisper>=0.4.2",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,7 @@ dev = [
 
 [project.scripts]
 audiobook-worker = "audiobook_worker.cli:main"
+audio-quality-check = "audiobook_worker.audio_quality:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

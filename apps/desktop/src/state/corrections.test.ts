@@ -13,6 +13,7 @@ describe("corrections store", () => {
     expect(store.get().aliasMerges).toEqual([]);
     expect(store.get().genderOverrides).toEqual([]);
     expect(store.get().voiceOverrides).toEqual([]);
+    expect(store.get().voiceDesignOverrides).toEqual([]);
     expect(store.get().dirty).toBe(false);
   });
 
@@ -47,6 +48,7 @@ describe("corrections store", () => {
       aliasMerges: [{ from: "Lizzy", to: "Elizabeth" }],
       genderOverrides: [],
       voiceOverrides: [],
+      voiceDesignOverrides: [],
     });
   });
 
@@ -69,6 +71,15 @@ describe("corrections store", () => {
     store.setVoice("elizabeth", "female_adult_01");
     store.setVoice("elizabeth", "male_adult_01");
     expect(store.get().voiceOverrides).toEqual([{ characterId: "elizabeth", voiceId: "male_adult_01" }]);
+  });
+
+  test("setVoiceDesign replaces existing design for same character", () => {
+    const store = createCorrectionsStore();
+    store.setVoiceDesign("elizabeth", "温柔清亮的女声。");
+    store.setVoiceDesign("elizabeth", "低沉克制的女声。");
+    expect(store.get().voiceDesignOverrides).toEqual([
+      { characterId: "elizabeth", voiceDesign: "低沉克制的女声。" },
+    ]);
   });
 
   test("reset clears all state", () => {

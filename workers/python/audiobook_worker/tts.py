@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
 import math
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.request
@@ -11,7 +14,12 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from audiobook_worker.script_builder import VOICE_REGISTRY
+from audiobook_worker.script_builder import (
+    DEFAULT_NARRATOR_VOICE_ID,
+    VOICE_REGISTRY,
+    is_narrator_voice_id,
+    normalize_narrator_voice_id,
+)
 
 # ---------------------------------------------------------------------------
 # Shared data
@@ -48,12 +56,23 @@ _PACE_MODIFIERS: dict[str, str] = {
 
 _DEFAULT_MODEL_ID = "parler-tts/parler-tts-mini-v1"
 _MIMO_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions"
-_MIMO_MODEL_ID = "mimo-v2.5-tts-voicedesign"
+_MIMO_VOICE_DESIGN_MODEL_ID = "mimo-v2.5-tts-voicedesign"
+_MIMO_VOICE_CLONE_MODEL_ID = "mimo-v2.5-tts-voiceclone"
+# Voice cloning is the safe default: a caller must explicitly opt into
+# voice-design when it is generating a reference profile.
+_MIMO_MODEL_ID = _MIMO_VOICE_CLONE_MODEL_ID
 _MIMO_KEYCHAIN_SERVICE = "audiobook-generator.mimo-api-key"
+_MIMO_VOICE_PROFILE_VERSION = 1
+_MIMO_REFERENCE_TEXT = (
+    "这是一段稳定的声音样本。请保持自然、清晰、连贯地说完这段话，"
+    "不要刻意表演，也不要改变自己的基础音色。"
+)
+_MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
 
 _MIMO_VOICE_DESIGNS: dict[str, str] = {
-    "narrator_default": "一位三十岁左右的中文女声，温暖沉静，咬字清晰，像专业有声书演播者，叙述自然克制。",
-    "narrator_female": "一位成熟的中文女声，柔和优雅，气息稳定，适合娓娓道来的长篇叙事。",
+    "narrator_default": "角色：一位专业中文有声书旁白，固定为同一位成年女性。声音洪亮饱满而温暖、柔和、清晰，气息稳定，胸腔共鸣自然，口腔共鸣自然，咬字清楚；保持稳定统一的旁白声线，连贯耐听，不代入任何角色，不使用夸张播音腔。",
+    "narrator_female": "角色：一位专业中文有声书旁白，固定为同一位成年女性。声音洪亮饱满而温暖、柔和、清晰，气息稳定，胸腔共鸣自然，口腔共鸣自然，咬字清楚；保持稳定统一的旁白声线，连贯耐听，不代入任何角色，不使用夸张播音腔。",
+    "narrator_male": "角色：一位专业中文有声书旁白，固定为同一位成年男性。音色沉稳、温暖、饱满，声线中低沉但清晰，胸腔共鸣自然，气息稳定，咬字清楚，声线连贯耐听；不代入任何角色，不使用夸张播音腔。",
     "female_adult_01": "一位二十多岁的中文女性，声音温暖且富有表现力，清晰自然。",
     "female_adult_02": "一位年轻中文女性，声线明亮清澈，咬字轻巧，富有活力。",
     "female_adult_03": "一位年轻中文女性，嗓音柔软细腻，语气温柔治愈。",
@@ -117,7 +136,7 @@ class MockTTSBackend:
 
 
 # ---------------------------------------------------------------------------
-# Xiaomi MiMo TTS backend (cloud voice-design model)
+# Xiaomi MiMo TTS backend (cloud voice-design / voice-clone models)
 # ---------------------------------------------------------------------------
 
 class MiMoTTSBackend:
@@ -129,6 +148,8 @@ class MiMoTTSBackend:
         model_id: str = _MIMO_MODEL_ID,
         request_audio=None,
         key_loader=None,
+        voice_profile_directory: Path | str | None = None,
+        reference_model_id: str = _MIMO_VOICE_DESIGN_MODEL_ID,
     ) -> None:
         loader = key_loader or _load_mimo_api_key
         self._api_key = api_key or os.environ.get("MIMO_API_KEY") or loader()
@@ -139,18 +160,22 @@ class MiMoTTSBackend:
             )
         self._model_id = model_id
         self._request_audio = request_audio or self._request_audio_from_api
+        self._voice_profile_directory = (
+            Path(voice_profile_directory) if voice_profile_directory else None
+        )
+        self._reference_model_id = reference_model_id
+        self._reference_audio_cache: dict[str, str] = {}
 
     def synthesize_segment(self, segment: dict, output_directory: Path | str) -> AudioArtifact:
         directory = Path(output_directory)
         directory.mkdir(parents=True, exist_ok=True)
         output_path = directory / f"{segment['id']}.wav"
-        encoded_audio = self._request_audio(self._build_request(segment))
-        try:
-            audio_bytes = base64.b64decode(encoded_audio, validate=True)
-        except (ValueError, TypeError) as error:
-            raise RuntimeError("MiMo returned invalid Base64 audio data.") from error
-        if not audio_bytes.startswith(b"RIFF"):
-            raise RuntimeError("MiMo response is not a WAV audio file.")
+        voice_sample: str | None = None
+        if self._model_id == _MIMO_VOICE_CLONE_MODEL_ID:
+            profile_directory = self._voice_profile_directory or directory / ".voice-profiles"
+            voice_sample = self._ensure_voice_sample(segment, profile_directory)
+        encoded_audio = self._request_audio(self._build_request(segment, voice_sample))
+        audio_bytes = _decode_mimo_wav(encoded_audio, "MiMo")
         output_path.write_bytes(audio_bytes)
         try:
             with wave.open(str(output_path), "rb") as wav_file:
@@ -160,33 +185,172 @@ class MiMoTTSBackend:
             raise RuntimeError("MiMo returned an unreadable WAV audio file.") from error
         return AudioArtifact("segment_audio", output_path, duration)
 
-    def _build_request(self, segment: dict) -> dict:
+    def _voice_context(self, segment: dict) -> tuple[str, bool, str]:
         voice_id = segment.get("voiceId", "narrator_default")
-        description = segment.get("voiceDescription") or _MIMO_VOICE_DESIGNS.get(
-            voice_id, _MIMO_VOICE_DESIGNS["narrator_default"]
+        is_narrator = (
+            str(segment.get("speakerId") or "").strip() == "narrator"
+            or is_narrator_voice_id(voice_id)
         )
+        if is_narrator or is_narrator_voice_id(voice_id):
+            voice_id = normalize_narrator_voice_id(voice_id)
+            # Narrator identity is never taken from a per-segment design. The
+            # segment may change delivery, but not the book's base voice.
+            description = _MIMO_VOICE_DESIGNS[voice_id]
+        else:
+            description = segment.get("voiceDesign") or segment.get("voiceDescription") or _MIMO_VOICE_DESIGNS.get(
+                voice_id, _MIMO_VOICE_DESIGNS[DEFAULT_NARRATOR_VOICE_ID]
+            )
+        return str(voice_id), is_narrator, str(description).strip()
+
+    def _build_request(self, segment: dict, voice_sample: str | None = None) -> dict:
+        _, is_narrator, description = self._voice_context(segment)
         emotion = _MIMO_STYLE_DIRECTIONS.get(
             segment.get("emotion", "neutral"), _MIMO_STYLE_DIRECTIONS["neutral"]
         )
-        pace_id = "normal" if segment.get("speakerId") == "narrator" else segment.get(
-            "pace", "normal"
-        )
+        pace_id = segment.get("pace", "normal")
         pace = _MIMO_PACE_DIRECTIONS.get(pace_id, _MIMO_PACE_DIRECTIONS["normal"])
+        direction = str(segment.get("voiceDirection") or "").strip()
+        if not direction:
+            direction = f"{emotion}；{pace}"
+        if is_narrator:
+            direction = (
+                f"{direction}；保持当前旁白的固定性别、年龄、音高和基础音色，"
+                "不要模仿角色，不要因情绪或语速改变成另一种声音。"
+            )
+        scene = str(
+            segment.get("voiceSceneContext")
+            or segment.get("sceneContext")
+            or "当前片段的叙事或对白场景。"
+        ).strip()
+        fixed_design = str(description).strip()
+        if not fixed_design.startswith(("角色：", "角色:")):
+            fixed_design = f"角色：{fixed_design}"
+        if self._model_id == _MIMO_VOICE_CLONE_MODEL_ID:
+            if not voice_sample:
+                raise RuntimeError("MiMo voiceclone requires a reusable voice sample.")
+            return {
+                "model": self._model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "角色：严格复用参考音频中的同一位说话者。保持参考音频的固定性别、"
+                            "年龄、音高、基础音色、共鸣位置、气息质感和咬字基线；不得因场景、"
+                            "情绪、语速或角色扮演改变为另一种声音。\n\n"
+                            f"基础声线设计（只用于身份约束，不重新设计声音）：{fixed_design}\n\n"
+                            f"场景：{scene}\n\n"
+                            f"指导：{direction}"
+                        ),
+                    },
+                    {"role": "assistant", "content": segment["text"]},
+                ],
+                "audio": {"format": "wav", "voice": voice_sample},
+            }
         return {
             "model": self._model_id,
             "messages": [
-                {"role": "user", "content": f"{description}{emotion}，{pace}。"},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{fixed_design}\n\n"
+                        f"场景：{scene}\n\n"
+                        f"指导：{direction}"
+                    ),
+                },
                 {"role": "assistant", "content": segment["text"]},
             ],
             "audio": {"format": "wav", "optimize_text_preview": False},
         }
+
+    def _ensure_voice_sample(self, segment: dict, profile_directory: Path) -> str:
+        voice_id, is_narrator, description = self._voice_context(segment)
+        profile_directory.mkdir(parents=True, exist_ok=True)
+        profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
+        metadata_path = profile_path.with_suffix(".json")
+        signature = _voice_profile_signature(
+            voice_id=voice_id,
+            description=description,
+            reference_model_id=self._reference_model_id,
+        )
+
+        cached = self._reference_audio_cache.get(signature)
+        if cached and _is_readable_wav(profile_path):
+            return cached
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        if (
+            metadata.get("signature") == signature
+            and metadata.get("version") == _MIMO_VOICE_PROFILE_VERSION
+            and _is_readable_wav(profile_path)
+        ):
+            data_uri = _audio_data_uri(profile_path.read_bytes())
+            self._reference_audio_cache[signature] = data_uri
+            return data_uri
+
+        # This request deliberately excludes the current segment's scene,
+        # emotion, and pace. It creates the stable identity anchor reused by
+        # every chapter and every subsequent segment for this voice.
+        fixed_design = description
+        if not fixed_design.startswith(("角色：", "角色:")):
+            fixed_design = f"角色：{fixed_design}"
+        reference_request = {
+            "model": self._reference_model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{fixed_design}\n\n"
+                        "指导：生成一段自然、稳定、克制的基础音色参考样本。"
+                        "只建立固定的性别、年龄、音高、音色、共鸣、气息和咬字基线；"
+                        "不要加入临时场景、明显情绪、角色模仿、夸张表演或后期效果。"
+                    ),
+                },
+                {"role": "assistant", "content": _MIMO_REFERENCE_TEXT},
+            ],
+            "audio": {"format": "wav", "optimize_text_preview": False},
+        }
+        encoded_reference = self._request_audio(reference_request)
+        reference_bytes = _decode_mimo_wav(encoded_reference, "MiMo voice design")
+        # Validate before replacing an existing profile so a failed refresh
+        # never destroys the last known-good identity anchor.
+        temporary_path = profile_path.with_name(f".{profile_path.name}.tmp")
+        try:
+            temporary_path.write_bytes(reference_bytes)
+            if not _is_readable_wav(temporary_path):
+                raise RuntimeError("MiMo voice design returned an unreadable reference WAV.")
+            temporary_path.replace(profile_path)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "version": _MIMO_VOICE_PROFILE_VERSION,
+                        "signature": signature,
+                        "voiceId": voice_id,
+                        "voiceDesign": description,
+                        "referenceModel": self._reference_model_id,
+                        "referenceText": _MIMO_REFERENCE_TEXT,
+                        "isNarrator": is_narrator,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+        data_uri = _audio_data_uri(reference_bytes)
+        self._reference_audio_cache[signature] = data_uri
+        return data_uri
 
     def _request_audio_from_api(self, payload: dict) -> str:
         request = urllib.request.Request(
             _MIMO_ENDPOINT,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {self._api_key}",
+                "api-key": self._api_key,
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -203,6 +367,69 @@ class MiMoTTSBackend:
             return result["choices"][0]["message"]["audio"]["data"]
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError("MiMo response did not contain choices[0].message.audio.data.") from error
+
+
+def _safe_voice_profile_name(voice_id: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(voice_id)).strip("._")
+    return normalized or "voice"
+
+
+def _voice_profile_signature(
+    *,
+    voice_id: str,
+    description: str,
+    reference_model_id: str,
+) -> str:
+    payload = {
+        "version": _MIMO_VOICE_PROFILE_VERSION,
+        "voiceId": voice_id,
+        "voiceDesign": description,
+        "referenceModel": reference_model_id,
+        "referenceText": _MIMO_REFERENCE_TEXT,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _decode_mimo_wav(encoded_audio: str, source: str) -> bytes:
+    try:
+        audio_bytes = base64.b64decode(encoded_audio, validate=True)
+    except (ValueError, TypeError) as error:
+        raise RuntimeError(f"{source} returned invalid Base64 audio data.") from error
+    if not audio_bytes.startswith(b"RIFF"):
+        raise RuntimeError(f"{source} response is not a WAV audio file.")
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            if wav_file.getnframes() <= 0 or wav_file.getframerate() <= 0:
+                raise RuntimeError(f"{source} returned an empty WAV audio file.")
+    except (wave.Error, EOFError, ZeroDivisionError) as error:
+        raise RuntimeError(f"{source} returned an unreadable WAV audio file.") from error
+    return audio_bytes
+
+
+def _audio_data_uri(audio_bytes: bytes) -> str:
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    data_uri = f"data:audio/wav;base64,{encoded}"
+    if len(encoded) > _MIMO_MAX_REFERENCE_BASE64_LENGTH:
+        raise RuntimeError(
+            "MiMo voice reference audio exceeds the official 10 MB Base64 limit."
+        )
+    return data_uri
+
+
+def _is_readable_wav(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            return wav_file.getnframes() > 0 and wav_file.getframerate() > 0
+    except (OSError, wave.Error, ZeroDivisionError):
+        return False
 
 
 _MIMO_STYLE_DIRECTIONS = {
@@ -275,9 +502,12 @@ class KokoroTTSBackend:
         directory.mkdir(parents=True, exist_ok=True)
         output_path = directory / f"{segment['id']}.wav"
 
-        voice_id = segment.get("fallbackVoiceId") or segment.get(
-            "voiceId", "narrator_default"
-        )
+        if str(segment.get("speakerId") or "").strip() == "narrator":
+            voice_id = normalize_narrator_voice_id(segment.get("voiceId"))
+        else:
+            voice_id = segment.get("fallbackVoiceId") or segment.get(
+                "voiceId", DEFAULT_NARRATOR_VOICE_ID
+            )
         voice_name = _kokoro_voice_for(voice_id)
         text = segment["text"]
 
@@ -380,9 +610,19 @@ class ParlerTTSBackend:
 
     def _build_description(self, segment: dict) -> str:
         voice_id = segment.get("voiceId", "narrator_default")
-        voice_entry = VOICE_REGISTRY.get(voice_id, VOICE_REGISTRY["narrator_default"])
-        base = segment.get("voiceDescription") or voice_entry.get(
-            "parlerDescription", "A clear speaker."
+        is_narrator = (
+            str(segment.get("speakerId") or "").strip() == "narrator"
+            or is_narrator_voice_id(voice_id)
+        )
+        if is_narrator:
+            voice_id = normalize_narrator_voice_id(voice_id)
+        voice_entry = VOICE_REGISTRY.get(voice_id, VOICE_REGISTRY[DEFAULT_NARRATOR_VOICE_ID])
+        base = (
+            voice_entry.get("parlerDescription", "A clear speaker.")
+            if is_narrator
+            else segment.get("voiceDesign") or segment.get("voiceDescription") or voice_entry.get(
+                "parlerDescription", "A clear speaker."
+            )
         )
 
         emotion = segment.get("emotion", "neutral")
@@ -390,8 +630,8 @@ class ParlerTTSBackend:
 
         emotion_mod = _EMOTION_MODIFIERS.get(emotion, _EMOTION_MODIFIERS["neutral"])
         pace_mod = _PACE_MODIFIERS.get(pace, "")
-
-        parts = [base, emotion_mod]
+        direction = str(segment.get("voiceDirection") or "").strip()
+        parts = [base, emotion_mod, direction]
         if pace_mod:
             parts.append(pace_mod)
         return " ".join(p for p in parts if p)

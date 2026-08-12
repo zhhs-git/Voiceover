@@ -4,7 +4,11 @@ import {
   AssembleChapterAudioRequestSchema,
   DetectChaptersRequestSchema,
   ExtractBookTextRequestSchema,
+  GenerateAudioAssetsRequestSchema,
+  MixChapterAudioRequestSchema,
+  PlanChapterAudioRequestSchema,
   SynthesizeSegmentAudioRequestSchema,
+  TranscribeChapterAudioRequestSchema,
   WorkerResponseSchema
 } from "./workers";
 
@@ -38,10 +42,34 @@ describe("worker protocol schemas", () => {
       chapterId: "chapter_001",
       chapterTextPath: "/tmp/book/chapters/chapter_001.txt",
       characterBiblePath: "/tmp/book/scripts/characters.json",
-      outputDirectory: "/tmp/book/scripts"
+      outputDirectory: "/tmp/book/scripts",
+      resumeFromStage: "delivery"
     });
 
     expect(parsed.chapterId).toBe("chapter_001");
+    expect(parsed.resumeFromStage).toBe("delivery");
+  });
+
+  test("accepts post-TTS transcription and audio planning requests", () => {
+    const transcript = TranscribeChapterAudioRequestSchema.parse({
+      command: "transcribe_chapter_audio",
+      bookId: "book_123",
+      chapterId: "chapter_001",
+      scriptPath: "/tmp/book/scripts/chapter_001.json",
+      voiceAudioPath: "/tmp/book/audio/chapter_001.wav",
+      analysisDirectory: "/tmp/book/analysis/chapter_001"
+    });
+    const plan = PlanChapterAudioRequestSchema.parse({
+      command: "plan_chapter_audio",
+      bookId: "book_123",
+      chapterId: "chapter_001",
+      scriptPath: "/tmp/book/scripts/chapter_001.json",
+      transcriptPath: "/tmp/book/analysis/chapter_001/transcript.json",
+      chapterTextPath: "/tmp/book/chapters/chapter_001.txt"
+    });
+
+    expect(transcript.command).toBe("transcribe_chapter_audio");
+    expect(plan.command).toBe("plan_chapter_audio");
   });
 
   test("accepts synthesize segment audio requests", () => {
@@ -51,10 +79,14 @@ describe("worker protocol schemas", () => {
       chapterId: "chapter_001",
       segmentId: "seg_0001",
       scriptPath: "/tmp/book/scripts/chapter_001.json",
-      outputDirectory: "/tmp/book/audio/segments"
+      outputDirectory: "/tmp/book/audio/segments",
+      modelId: "mimo-v2.5-tts-voiceclone",
+      voiceProfileDirectory: "/tmp/book/voice-profiles"
     });
 
     expect(parsed.segmentId).toBe("seg_0001");
+    expect(parsed.modelId).toBe("mimo-v2.5-tts-voiceclone");
+    expect(parsed.voiceProfileDirectory).toBe("/tmp/book/voice-profiles");
   });
 
   test("accepts assemble chapter audio requests", () => {
@@ -67,6 +99,37 @@ describe("worker protocol schemas", () => {
     });
 
     expect(parsed.outputPath.endsWith(".mp3")).toBe(true);
+  });
+
+  test("accepts Stable Audio asset generation requests", () => {
+    const parsed = GenerateAudioAssetsRequestSchema.parse({
+      command: "generate_audio_assets",
+      bookId: "book_123",
+      chapterId: "chapter_001",
+      scriptPath: "/tmp/book/scripts/chapter_001.json",
+      outputDirectory: "/tmp/book/audio-assets/chapter_001",
+      force: false
+    });
+
+    expect(parsed.command).toBe("generate_audio_assets");
+    expect(parsed.force).toBe(false);
+  });
+
+  test("accepts chapter mixing requests", () => {
+    const parsed = MixChapterAudioRequestSchema.parse({
+      command: "mix_chapter_audio",
+      bookId: "book_123",
+      chapterId: "chapter_001",
+      scriptPath: "/tmp/book/scripts/chapter_001.json",
+      segmentAudioDirectory: "/tmp/book/segments/chapter_001",
+      voiceAudioPath: "/tmp/book/audio/chapter_001.wav",
+      audioAssetsDirectory: "/tmp/book/audio-assets/chapter_001",
+      outputPath: "/tmp/book/audio/chapter_001_mixed.wav",
+      gapSeconds: 0.5
+    });
+
+    expect(parsed.command).toBe("mix_chapter_audio");
+    expect(parsed.outputPath.endsWith("_mixed.wav")).toBe(true);
   });
 
   test("requires worker responses to include status, warnings, artifacts, and optional error", () => {

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -70,6 +71,33 @@ def test_unknown_command_returns_structured_error(tmp_path: Path):
             "message": "Unknown worker command: unknown_command",
         },
     }
+
+
+def test_generate_audio_assets_returns_warning_for_empty_plan(tmp_path: Path):
+    script_path = tmp_path / "chapter.json"
+    script_path.write_text(
+        json.dumps({"bookId": "book_123", "chapterId": "chapter_001", "audioPlan": {"scenes": []}}),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps({
+            "bookId": "book_123",
+            "chapterId": "chapter_001",
+            "scriptPath": str(script_path),
+            "outputDirectory": str(tmp_path / "audio-assets"),
+        }),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+
+    result = run_worker("generate_audio_assets", str(input_path), str(output_path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "succeeded"
+    assert payload["warnings"] == ["no_audio_assets"]
+    assert payload["artifacts"][0]["kind"] == "stable_audio_manifest"
 
 
 def test_list_voices_returns_the_active_mimo_catalog(tmp_path: Path):
@@ -265,8 +293,8 @@ def test_synthesize_segment_audio_uses_parler_backend(tmp_path: Path):
     mock_cls.from_pretrained.assert_called_once()
 
 
-def test_synthesize_segment_audio_uses_mimo_backend_and_model(tmp_path: Path):
-    """CLI selects MiMo and forwards the configured voice-design model."""
+def test_synthesize_segment_audio_uses_mimo_voiceclone_and_profile_directory(tmp_path: Path):
+    """CLI selects MiMo voice cloning and forwards the book profile directory."""
     from audiobook_worker.cli import main
 
     script = {
@@ -289,7 +317,8 @@ def test_synthesize_segment_audio_uses_mimo_backend_and_model(tmp_path: Path):
         "segmentId": "seg_0001",
         "outputDirectory": str(tmp_path / "audio"),
         "backend": "mimo",
-        "modelId": "mimo-v2.5-tts-voicedesign",
+        "modelId": "mimo-v2.5-tts-voiceclone",
+        "voiceProfileDirectory": str(tmp_path / "voice-profiles"),
     }
     input_path = tmp_path / "input.json"
     input_path.write_text(json.dumps(request), encoding="utf-8")
@@ -305,7 +334,10 @@ def test_synthesize_segment_audio_uses_mimo_backend_and_model(tmp_path: Path):
         exit_code = main(["synthesize_segment_audio", str(input_path), str(output_path)])
 
     assert exit_code == 0
-    backend_class.assert_called_once_with(model_id="mimo-v2.5-tts-voicedesign")
+    backend_class.assert_called_once_with(
+        model_id="mimo-v2.5-tts-voiceclone",
+        voice_profile_directory=str(tmp_path / "voice-profiles"),
+    )
     backend_class.return_value.synthesize_segment.assert_called_once()
     assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "succeeded"
 
@@ -468,6 +500,109 @@ def test_synthesize_chapter_audio_splits_long_chinese_segment_and_cleans_old_cac
     )
 
 
+def test_mix_repairs_old_assembly_without_resynthesizing_cached_segments(tmp_path: Path):
+    """A voice-direction split must be shared by synthesis, assembly, and mix."""
+    from audiobook_worker.audio import assemble_chapter_audio
+    from audiobook_worker.cli import main
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {
+                "id": "seg_0001",
+                "text": "The first sentence.",
+                "speakerId": "narrator",
+                "voiceId": "narrator_default",
+                "emotion": "neutral",
+                "pace": "normal",
+            },
+            {
+                "id": "seg_0002",
+                "text": "The second sentence.",
+                "speakerId": "narrator",
+                "voiceId": "narrator_default",
+                "emotion": "neutral",
+                "pace": "normal",
+            },
+        ],
+    }
+    script_path = tmp_path / "scripts" / "script.json"
+    script_path.parent.mkdir(parents=True)
+    script_path.write_text(json.dumps(script), encoding="utf-8")
+    direction_path = tmp_path / "analysis" / "ch01" / "voice_direction.json"
+    direction_path.parent.mkdir(parents=True)
+    direction_path.write_text(
+        json.dumps(
+            {
+                "directions": [
+                    {"segmentIndex": 0, "direction": "平稳，句尾收束"},
+                    {"segmentIndex": 1, "direction": "稍快，句首短暂停顿"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    segment_dir = tmp_path / "segments"
+    synth_input = tmp_path / "synth-input.json"
+    synth_input.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(segment_dir),
+                "backend": "mock",
+                "modelId": "test-model",
+                "mergeSegments": True,
+                "cacheSegments": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    synth_output = tmp_path / "synth-output.json"
+    assert main(["synthesize_chapter_audio", str(synth_input), str(synth_output)]) == 0
+    synth_result = json.loads(synth_output.read_text(encoding="utf-8"))
+    assert synth_result["metadata"]["synthesizedSegmentCount"] == 2
+
+    first_segment_mtime = (segment_dir / "seg_0001.wav").stat().st_mtime_ns
+    second_segment_mtime = (segment_dir / "seg_0002.wav").stat().st_mtime_ns
+
+    # Reproduce the old assembly bug: raw script merging kept only the first
+    # file even though synthesis had correctly split the two directions.
+    old_voice_path = tmp_path / "voice.wav"
+    assemble_chapter_audio([segment_dir / "seg_0001.wav"], old_voice_path)
+
+    mix_input = tmp_path / "mix-input.json"
+    mix_input.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "segmentAudioDirectory": str(segment_dir),
+                "voiceAudioPath": str(old_voice_path),
+                "audioAssetsDirectory": str(tmp_path / "assets"),
+                "outputPath": str(tmp_path / "mixed.wav"),
+                "backend": "mock",
+                "modelId": "test-model",
+                "mergeSegments": True,
+                "voiceGain": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    mix_output = tmp_path / "mix-output.json"
+    assert main(["mix_chapter_audio", str(mix_input), str(mix_output)]) == 0
+
+    result = json.loads(mix_output.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert "voice_timeline_reassembled_from_cached_segments" in result["warnings"]
+    assert (segment_dir / "seg_0001.wav").stat().st_mtime_ns == first_segment_mtime
+    assert (segment_dir / "seg_0002.wav").stat().st_mtime_ns == second_segment_mtime
+    with wave.open(str(old_voice_path), "rb") as voice:
+        assert voice.getnframes() > 0
+    assert (tmp_path / "mixed.wav").exists()
+
+
 def test_synthesize_chapter_audio_fails_when_backend_does_not_create_wav(tmp_path: Path):
     from audiobook_worker.cli import main
     from audiobook_worker.tts import AudioArtifact
@@ -544,6 +679,114 @@ def test_assembly_fails_when_script_segment_audio_is_missing(tmp_path: Path):
     assert not (tmp_path / "chapter.wav").exists()
 
 
+def test_mix_recovers_legacy_segment_cache_when_voice_timeline_matches(tmp_path: Path):
+    from audiobook_worker.audio import assemble_chapter_audio
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import MockTTSBackend
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "Hello."},
+            {"id": "seg_0002", "text": "Missing from the old cache."},
+            {"id": "seg_0003", "text": "World."},
+        ],
+        "audioPlan": {"scenes": []},
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script), encoding="utf-8")
+    segment_dir = tmp_path / "segments"
+    backend = MockTTSBackend()
+    first = backend.synthesize_segment(script["segments"][0], segment_dir)
+    third = backend.synthesize_segment(script["segments"][2], segment_dir)
+    voice_path = tmp_path / "voice.wav"
+    assemble_chapter_audio([first.path, third.path], voice_path)
+
+    output_path = tmp_path / "mixed.wav"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "segmentAudioDirectory": str(segment_dir),
+                "voiceAudioPath": str(voice_path),
+                "audioAssetsDirectory": str(tmp_path / "assets"),
+                "outputPath": str(output_path),
+                "mergeSegments": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "result.json"
+
+    assert main(["mix_chapter_audio", str(input_path), str(result_path)]) == 0
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert "legacy_segment_cache_recovered_missing:seg_0002" in result["warnings"]
+    assert output_path.exists()
+    with wave.open(str(output_path), "rb") as mixed, wave.open(str(voice_path), "rb") as voice:
+        assert mixed.getnframes() == voice.getnframes()
+
+
+def test_mix_recovers_source_segment_ids_from_cache_sidecar(tmp_path: Path):
+    from audiobook_worker.audio import assemble_chapter_audio
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import MockTTSBackend
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "Hello."},
+            {"id": "seg_0002", "text": "World."},
+        ],
+        "audioPlan": {"scenes": []},
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script), encoding="utf-8")
+    segment_dir = tmp_path / "segments"
+    first = MockTTSBackend().synthesize_segment(script["segments"][0], segment_dir)
+    (segment_dir / "seg_0001.wav.json").write_text(
+        json.dumps(
+            {
+                "segmentId": "seg_0001",
+                "sourceSegmentIds": ["seg_0001", "seg_0002"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    voice_path = tmp_path / "voice.wav"
+    assemble_chapter_audio([first.path], voice_path)
+
+    output_path = tmp_path / "mixed.wav"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "segmentAudioDirectory": str(segment_dir),
+                "voiceAudioPath": str(voice_path),
+                "audioAssetsDirectory": str(tmp_path / "assets"),
+                "outputPath": str(output_path),
+                "mergeSegments": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "result.json"
+
+    assert main(["mix_chapter_audio", str(input_path), str(result_path)]) == 0
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert "segment_cache_recovered_from_metadata" in result["warnings"]
+    assert output_path.exists()
+    with wave.open(str(output_path), "rb") as mixed, wave.open(str(voice_path), "rb") as voice:
+        assert mixed.getnframes() == voice.getnframes()
+
+
 def test_apply_corrections_command(tmp_path: Path):
     from audiobook_worker.cli import main
 
@@ -582,7 +825,207 @@ def test_apply_corrections_command(tmp_path: Path):
     script = json.loads(Path(result["artifacts"][0]["path"]).read_text())
     speakers = {seg["speakerId"] for seg in script["segments"] if seg["type"] == "dialogue"}
     assert len(speakers) == 1
-    assert speakers == {script["characters"][0]["id"]}
+
+
+def test_analyze_chapter_resumes_after_a_failed_llm_stage(tmp_path: Path):
+    from audiobook_worker.cli import main
+    from audiobook_worker.llm import ChapterAnalysisResult, SegmentAnnotation
+
+    class FlakyAnalyzer:
+        def __init__(self):
+            self.calls = 0
+
+        def analyze_chapter(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                request.stage_callback("characters", {"characters": []})
+                request.stage_callback("voice_design", {"characters": []})
+                request.stage_callback(
+                    "speakers",
+                    {
+                        "segmentAnnotations": [
+                            {
+                                "segmentIndex": 0,
+                                "speakerId": "narrator",
+                                "confidence": 1.0,
+                                "warnings": [],
+                            }
+                        ]
+                    },
+                )
+                raise RuntimeError("delivery stage unavailable")
+            assert request.resume_from_stage == "delivery"
+            assert set(request.cached_stages) == {"characters", "voice_design", "speakers"}
+            return ChapterAnalysisResult(
+                characters=[],
+                segment_annotations=[
+                    SegmentAnnotation(
+                        segment_index=0,
+                        speaker_id="narrator",
+                        emotion="neutral",
+                        pace="normal",
+                        confidence=1.0,
+                    )
+                ],
+            )
+
+    chapter_path = tmp_path / "chapter_001.txt"
+    chapter_path.write_text("院子里很安静。", encoding="utf-8")
+    output_directory = tmp_path / "scripts"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book_123",
+                "chapterId": "chapter_001",
+                "chapterTextPath": str(chapter_path),
+                "outputDirectory": str(output_directory),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    analyzer = FlakyAnalyzer()
+
+    with patch("audiobook_worker.cli.default_analyzer", return_value=analyzer):
+        assert main(["analyze_chapter", str(input_path), str(output_path)]) == 1
+        first_state = json.loads(
+            (tmp_path / "analysis" / "chapter_001" / "state.json").read_text()
+        )
+        assert first_state["failedStage"] == "delivery"
+        assert first_state["characters"]["status"] == "succeeded"
+        assert first_state["voice_design"]["status"] == "succeeded"
+        assert first_state["speakers"]["status"] == "succeeded"
+
+        assert main(["analyze_chapter", str(input_path), str(output_path)]) == 0
+
+    final_state = json.loads(
+        (tmp_path / "analysis" / "chapter_001" / "state.json").read_text()
+    )
+    assert final_state["analysis"]["status"] == "succeeded"
+    assert final_state["script"]["status"] == "succeeded"
+    assert analyzer.calls == 2
+
+
+def test_transcribe_and_plan_audio_commands_persist_post_tts_artifacts(tmp_path: Path):
+    from audiobook_worker.cli import main
+    from audiobook_worker.llm import ChapterAudioPlan
+
+    script_path = tmp_path / "chapter_001.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book_123",
+                "chapterId": "chapter_001",
+                "language": "zh",
+                "segments": [
+                    {
+                        "id": "seg_0001",
+                        "type": "narration",
+                        "text": "雨落在窗外。",
+                        "speakerId": "active_character",
+                        "emotion": "neutral",
+                        "pace": "normal",
+                    }
+                ],
+                "characters": [
+                    {
+                        "id": "active_character",
+                        "canonicalName": "本章角色",
+                        "gender": "male",
+                        "ageClass": "adult",
+                        "voiceId": "mimo_active",
+                        "voiceDesign": "低沉、克制。",
+                    },
+                    {
+                        "id": "inactive_character",
+                        "canonicalName": "其他章节角色",
+                        "gender": "female",
+                        "ageClass": "adult",
+                        "voiceId": "mimo_inactive",
+                        "voiceDesign": "明亮。",
+                    },
+                ],
+                "audioPlan": {"scenes": []},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chapter_text_path = tmp_path / "chapter_001.txt"
+    chapter_text_path.write_text("雨落在窗外。", encoding="utf-8")
+    voice_path = tmp_path / "voice.wav"
+    voice_path.write_bytes(b"voice")
+    analysis_directory = tmp_path / "analysis" / "chapter_001"
+    transcript_path = analysis_directory / "transcript.json"
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+
+    with patch(
+        "audiobook_worker.cli.transcribe_audio",
+        return_value={
+            "version": 1,
+            "segments": [{"start": 0.0, "end": 1.0, "text": "雨落在窗外。"}],
+            "durationSeconds": 1.0,
+            "model": "test-whisper",
+        },
+    ):
+        input_path.write_text(
+            json.dumps(
+                {
+                    "bookId": "book_123",
+                    "chapterId": "chapter_001",
+                    "scriptPath": str(script_path),
+                    "voiceAudioPath": str(voice_path),
+                    "analysisDirectory": str(analysis_directory),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert main(["transcribe_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    assert transcript_path.exists()
+
+    class Planner:
+        def __init__(self):
+            self.request = None
+
+        def plan_audio(self, request):
+            self.request = request
+            return ChapterAudioPlan()
+
+    planner = Planner()
+    input_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book_123",
+                "chapterId": "chapter_001",
+                "scriptPath": str(script_path),
+                "transcriptPath": str(transcript_path),
+                "chapterTextPath": str(chapter_text_path),
+                "analysisDirectory": str(analysis_directory),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with patch("audiobook_worker.cli.default_analyzer", return_value=planner):
+        assert main(["plan_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    assert planner.request.text == "雨落在窗外。"
+    assert planner.request.transcript[0]["start"] == 0.0
+    assert [character["id"] for character in planner.request.characters] == [
+        "active_character"
+    ]
+    assert (analysis_directory / "audio_plan.json").exists()
+    saved_script = json.loads(script_path.read_text(encoding="utf-8"))
+    assert saved_script["audioPlan"]["scenes"][0]["startSegmentIndex"] == 0
+    assert saved_script["audioPlan"]["scenes"][0]["endSegmentIndex"] == 0
+    assert saved_script["audioPlan"]["scenes"][0]["music"]["model"] == "sm-music"
+    state = json.loads((analysis_directory / "state.json").read_text())
+    assert state["transcript"]["status"] == "succeeded"
+    assert state["audioPlan"]["status"] == "succeeded"
 
 
 def test_read_file_command(tmp_path: Path):

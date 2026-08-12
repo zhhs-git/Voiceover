@@ -1,9 +1,13 @@
 import { create } from "zustand";
 import type {
   AnalysisState,
+  AudioAsset,
+  ChapterWorkflowStatus,
   PipelineStage,
   ProgressDetail,
 } from "../types";
+import type { BatchGenerationResponse } from "../lib/batchGeneration";
+import type { WorkflowKind } from "../lib/workflowStatus";
 
 export type DetailTab = "preview" | "analyze" | "review" | "generate";
 
@@ -17,6 +21,15 @@ type AnalysisUpdate =
 type PathsUpdate =
   | Record<string, string>
   | ((prev: Record<string, string>) => Record<string, string>);
+
+type AudioAssetsUpdate =
+  | Record<string, AudioAsset[]>
+  | ((prev: Record<string, AudioAsset[]>) => Record<string, AudioAsset[]>);
+
+type BatchGenerationUpdate =
+  | BatchGenerationResponse
+  | null
+  | ((prev: BatchGenerationResponse | null) => BatchGenerationResponse | null);
 
 type DetailsUpdate =
   | ProgressDetail[]
@@ -33,6 +46,9 @@ function resetValues(bookId: string | null) {
     bookId,
     analysis: null,
     chapterAudioPaths: {},
+    chapterMixedAudioPaths: {},
+    audioAssets: {},
+    generationBatch: null,
     stage: "idle" as PipelineStage,
     error: null,
     progress: 0,
@@ -40,6 +56,7 @@ function resetValues(bookId: string | null) {
     analyzeProgress: "",
     chapterStatuses: {},
     progressDetail: [],
+    workflows: { analysis: {}, generation: {} },
     selectedChapters: new Set<string>(),
     tab: "preview" as DetailTab,
   };
@@ -49,6 +66,10 @@ interface PipelineState {
   bookId: string | null;
   analysis: AnalysisState | null;
   chapterAudioPaths: Record<string, string>;
+  chapterMixedAudioPaths: Record<string, string>;
+  audioAssets: Record<string, AudioAsset[]>;
+  /** Durable backend queue status for the most recent generation batch. */
+  generationBatch: BatchGenerationResponse | null;
   stage: PipelineStage;
   error: string | null;
   progress: number;
@@ -56,12 +77,19 @@ interface PipelineState {
   analyzeProgress: string;
   chapterStatuses: Record<string, string>;
   progressDetail: ProgressDetail[];
+  workflows: {
+    analysis: Record<string, ChapterWorkflowStatus>;
+    generation: Record<string, ChapterWorkflowStatus>;
+  };
   selectedChapters: Set<string>;
   tab: DetailTab;
 
   activateBook: (bookId: string) => void;
   setAnalysis: (analysis: AnalysisUpdate, owner?: BookOwner) => void;
   setChapterAudioPaths: (paths: PathsUpdate, owner?: BookOwner) => void;
+  setChapterMixedAudioPaths: (paths: PathsUpdate, owner?: BookOwner) => void;
+  setAudioAssets: (assets: AudioAssetsUpdate, owner?: BookOwner) => void;
+  setGenerationBatch: (batch: BatchGenerationUpdate, owner?: BookOwner) => void;
   setStage: (stage: PipelineStage, owner?: BookOwner) => void;
   setError: (error: string | null, owner?: BookOwner) => void;
   setProgress: (progress: number, owner?: BookOwner) => void;
@@ -72,6 +100,17 @@ interface PipelineState {
     owner?: BookOwner,
   ) => void;
   setProgressDetail: (details: DetailsUpdate, owner?: BookOwner) => void;
+  setWorkflowStatus: (
+    kind: WorkflowKind,
+    chapterId: string,
+    status: ChapterWorkflowStatus,
+    owner?: BookOwner,
+  ) => void;
+  setWorkflowStatuses: (
+    kind: WorkflowKind,
+    statuses: Record<string, ChapterWorkflowStatus>,
+    owner?: BookOwner,
+  ) => void;
   setSelectedChapters: (chapters: ChaptersUpdate, owner?: BookOwner) => void;
   setTab: (tab: DetailTab, owner?: BookOwner) => void;
   resetPipeline: (bookId?: string | null) => void;
@@ -104,6 +143,32 @@ export const usePipelineStore = create<PipelineState>((set) => ({
             : paths,
       };
     }),
+  setChapterMixedAudioPaths: (paths, owner) =>
+    set((state) => {
+      if (!canUpdate(state.bookId, owner)) return {};
+      return {
+        chapterMixedAudioPaths:
+          typeof paths === "function"
+            ? paths(state.chapterMixedAudioPaths)
+            : paths,
+      };
+    }),
+  setAudioAssets: (assets, owner) =>
+    set((state) => {
+      if (!canUpdate(state.bookId, owner)) return {};
+      return {
+        audioAssets:
+          typeof assets === "function" ? assets(state.audioAssets) : assets,
+      };
+    }),
+  setGenerationBatch: (batch, owner) =>
+    set((state) => {
+      if (!canUpdate(state.bookId, owner)) return {};
+      return {
+        generationBatch:
+          typeof batch === "function" ? batch(state.generationBatch) : batch,
+      };
+    }),
 
   setStage: (stage, owner) =>
     set((state) => (canUpdate(state.bookId, owner) ? { stage } : {})),
@@ -131,6 +196,29 @@ export const usePipelineStore = create<PipelineState>((set) => ({
           typeof details === "function"
             ? details(state.progressDetail)
             : details,
+      };
+    }),
+  setWorkflowStatus: (kind, chapterId, status, owner) =>
+    set((state) => {
+      if (!canUpdate(state.bookId, owner)) return {};
+      return {
+        workflows: {
+          ...state.workflows,
+          [kind]: {
+            ...state.workflows[kind],
+            [chapterId]: status,
+          },
+        },
+      };
+    }),
+  setWorkflowStatuses: (kind, statuses, owner) =>
+    set((state) => {
+      if (!canUpdate(state.bookId, owner)) return {};
+      return {
+        workflows: {
+          ...state.workflows,
+          [kind]: statuses,
+        },
       };
     }),
   setSelectedChapters: (chapters, owner) =>

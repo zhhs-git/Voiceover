@@ -101,6 +101,18 @@ uv sync
 cd ../..
 ```
 
+### Whisper 转录依赖（背景音/音效分析所需）
+
+点击“分析背景音/音效”后，程序会在原章节配音完成的基础上使用本地 Whisper 生成带时间戳的转录，再由音频规划 LLM 安排背景音乐和音效。没有 Whisper 不影响书籍导入、章节分析和原章节配音，但不能执行这一阶段。
+
+项目的 Python 依赖已声明 `mlx-whisper`；Apple Silicon 主机按上面的 `uv sync` 安装即可。默认模型是 `mlx-community/whisper-large-v3-turbo`。如果主机已经在其它 Python 环境安装了 `mlx-whisper`，程序会自动尝试复用；也可以显式指定解释器：
+
+```bash
+export AUDIOBOOK_WHISPER_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python"
+```
+
+模型如果已在 Hugging Face 本地缓存，程序会直接使用本地快照；没有缓存时，首次转录需要下载模型。Worker 请求也可以用 `whisperModel` 和 `whisperPython` 覆盖默认值。
+
 ### 生产模式：局域网使用
 
 ```bash
@@ -165,6 +177,9 @@ export AUDIOBOOK_LLM_MODEL="deepseek/deepseek-v4-flash"
 
 实际默认模型取自模型配置中的 `default` 项，网页界面不会硬编码默认模型。
 如果找不到可用的模型配置，处理程序会使用确定性的 mock 分析器，便于测试流水线。
+
+为兼容不同的 OpenAI 兼容网关，分析请求默认不发送 `response_format`，而是由提示词和本地 JSON 解析器约束结构化输出。只有确认某个网关支持 JSON mode 时，才在提供方或模型条目中设置
+`"supportsResponseFormat": true`。
 
 不要把 API Key 写入仓库。建议在模型配置中使用环境变量引用，而不是直接写入密钥：
 

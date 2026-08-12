@@ -19,12 +19,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import parse_qs, unquote, urlparse
+
+from audiobook_worker.script_builder import normalize_narrator_voice_id
 
 
 MAX_UPLOAD_BYTES = int(os.environ.get("AUDIOBOOK_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
@@ -73,6 +77,36 @@ GENERIC_CHARACTER_KEYS = {
 }
 
 
+@dataclass
+class StableAudioJob:
+    job_id: str
+    request: dict[str, object]
+    warnings: list[str] = field(default_factory=list)
+    generation_thread: threading.Thread | None = field(default=None, repr=False)
+    status: str = "queued"
+    artifacts: list[dict[str, object]] = field(default_factory=list)
+    error: dict[str, object] | None = None
+    cancel_requested: bool = False
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+class BatchGenerationStageError(RuntimeError):
+    """A recoverable per-chapter failure in a server-side generation batch."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+@dataclass
+class BatchGenerationJob:
+    """In-memory handle for a durable SQLite-backed generation batch."""
+
+    batch_id: str
+    thread: threading.Thread | None = field(default=None, repr=False)
+
+
 def is_generic_character_key(value: object) -> bool:
     return character_name_key(value) in GENERIC_CHARACTER_KEYS
 
@@ -109,7 +143,33 @@ class ServerState:
         self.db.row_factory = sqlite3.Row
         self.db_lock = threading.RLock()
         self.worker_lock = threading.RLock()
+        self.stable_audio_generation_lock = threading.Lock()
+        self.stable_audio_jobs: dict[str, StableAudioJob] = {}
+        self.batch_generation_lock = threading.RLock()
+        # A single book may have a long batch, and users may open another
+        # book in a second browser tab. Serialize the full pipeline globally:
+        # MiMo, Whisper, the LLM and MLX all compete for the same local box.
+        self.batch_generation_execution_lock = threading.Lock()
+        self.batch_generation_jobs: dict[str, BatchGenerationJob] = {}
+        self.web_port = int(os.environ.get("AUDIOBOOK_WEB_PORT", "8000"))
         self.initialize_database()
+        self.resume_batch_generation_jobs()
+
+    def close(self) -> None:
+        """Close the persistent state without cancelling durable batch jobs."""
+        # The normal process lifecycle waits for worker threads before this
+        # method is reached. Do not close an SQLite connection that a still
+        # running resumed batch could write to during an embedded/test shutdown.
+        with self.batch_generation_lock:
+            if any(
+                job.thread is not None and job.thread.is_alive()
+                for job in self.batch_generation_jobs.values()
+            ):
+                return
+        self.db.close()
+
+    def attach_web_port(self, port: int) -> None:
+        self.web_port = port
 
     def initialize_database(self) -> None:
         with self.db_lock:
@@ -118,7 +178,8 @@ class ServerState:
                 CREATE TABLE IF NOT EXISTS books (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, source_path TEXT NOT NULL,
                     source_language TEXT NOT NULL, output_language TEXT NOT NULL, work_dir TEXT NOT NULL,
-                    imported_at TEXT, updated_at TEXT
+                    imported_at TEXT, updated_at TEXT,
+                    narrator_voice_id TEXT NOT NULL DEFAULT 'narrator_female'
                 );
                 CREATE TABLE IF NOT EXISTS chapters (
                     id TEXT NOT NULL, book_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -144,11 +205,48 @@ class ServerState:
                 CREATE INDEX IF NOT EXISTS idx_character_aliases_lookup
                     ON character_aliases(book_id, alias_key);
                 CREATE INDEX IF NOT EXISTS idx_chapters_book_id ON chapters(book_id);
+                CREATE TABLE IF NOT EXISTS generation_batches (
+                    id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    force INTEGER NOT NULL DEFAULT 0,
+                    cache_segments INTEGER NOT NULL DEFAULT 1,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    current_chapter_id TEXT,
+                    current_stage TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS generation_batch_chapters (
+                    batch_id TEXT NOT NULL,
+                    chapter_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    current_stage TEXT,
+                    error TEXT,
+                    voice_audio_path TEXT,
+                    mixed_audio_path TEXT,
+                    audio_assets_json TEXT,
+                    started_at REAL,
+                    completed_at REAL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (batch_id, chapter_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_generation_batches_book_status
+                    ON generation_batches(book_id, status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_generation_batch_chapters_batch_position
+                    ON generation_batch_chapters(batch_id, position);
                 """
             )
             self._ensure_columns(
                 "books",
-                {"imported_at": "TEXT", "updated_at": "TEXT"},
+                {
+                    "imported_at": "TEXT",
+                    "updated_at": "TEXT",
+                    "narrator_voice_id": "TEXT NOT NULL DEFAULT 'narrator_female'",
+                },
             )
             self._ensure_columns(
                 "characters",
@@ -187,13 +285,33 @@ class ServerState:
             raise ValueError("invalid book id")
         return self.books_directory / book_id
 
+    def _managed_upload_path(self, source_path: object) -> Path | None:
+        """Return an upload path owned by this app, never an external source.
+
+        Older and desktop-imported records may point at a user's original
+        file (for example on the Desktop). Deleting a book must not remove
+        that file. Only files inside this app's uploads directory are safe to
+        clean up automatically.
+        """
+
+        candidate = Path(str(source_path or "")).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.data_directory / candidate
+        candidate = candidate.resolve()
+        uploads_directory = self.uploads_directory.resolve()
+        try:
+            candidate.relative_to(uploads_directory)
+        except ValueError:
+            return None
+        return candidate
+
     def row_to_dict(self, row: sqlite3.Row) -> dict[str, object]:
         return dict(row)
 
     def list_books(self) -> list[dict[str, object]]:
         with self.db_lock:
             rows = self.db.execute(
-                "SELECT id, title, source_path, work_dir, imported_at "
+                "SELECT id, title, source_path, work_dir, imported_at, narrator_voice_id "
                 "FROM books ORDER BY imported_at DESC"
             ).fetchall()
         return [
@@ -203,6 +321,7 @@ class ServerState:
                 "sourcePath": row["source_path"],
                 "workDir": row["work_dir"],
                 "importedAt": row["imported_at"],
+                "narratorVoiceId": row["narrator_voice_id"] or "narrator_female",
             }
             for row in rows
         ]
@@ -210,7 +329,7 @@ class ServerState:
     def get_book(self, source_path: str) -> dict[str, object] | None:
         with self.db_lock:
             row = self.db.execute(
-                "SELECT id, title, source_path, work_dir, imported_at FROM books WHERE source_path = ?",
+                "SELECT id, title, source_path, work_dir, imported_at, narrator_voice_id FROM books WHERE source_path = ?",
                 (source_path,),
             ).fetchone()
         if row is None:
@@ -221,6 +340,7 @@ class ServerState:
             "sourcePath": row["source_path"],
             "workDir": row["work_dir"],
             "importedAt": row["imported_at"],
+            "narratorVoiceId": row["narrator_voice_id"] or "narrator_female",
         }
 
     def create_book(self, record: dict[str, object]) -> None:
@@ -234,19 +354,78 @@ class ServerState:
             )
             self.db.commit()
 
-    def delete_book(self, book_id: str) -> None:
+    def set_narrator_voice(self, book_id: str, narrator_voice_id: object) -> None:
+        raw_voice_id = str(narrator_voice_id or "").strip()
+        if raw_voice_id not in {
+            "narrator_default",
+            "narrator_female",
+            "narrator_male",
+        }:
+            raise ValueError("invalid narrator voice id")
+        selected = normalize_narrator_voice_id(raw_voice_id)
         with self.db_lock:
-            row = self.db.execute("SELECT work_dir FROM books WHERE id = ?", (book_id,)).fetchone()
+            row = self.db.execute(
+                "SELECT work_dir FROM books WHERE id = ?", (book_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"book not found: {book_id}")
+            self.db.execute(
+                "UPDATE books SET narrator_voice_id = ?, updated_at = ? WHERE id = ?",
+                (
+                    selected,
+                    __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                    book_id,
+                ),
+            )
+            self.db.commit()
+        audio_directory = self.path_in_data(Path(row["work_dir"]) / "audio")
+        if audio_directory.is_dir():
+            for path in audio_directory.glob("*.wav"):
+                path.unlink(missing_ok=True)
+
+    def delete_book(self, book_id: str) -> None:
+        # A deleted book must not keep a queued worker alive or be recreated by
+        # a restart-resumed batch.
+        now = time.time()
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT work_dir, source_path FROM books WHERE id = ?", (book_id,)
+            ).fetchone()
             if row is None:
                 return
             work_dir = self.path_in_data(row["work_dir"])
+            source_path = row["source_path"]
+            upload_path = self._managed_upload_path(source_path)
+            remaining_upload_references = False
+            if upload_path is not None:
+                remaining_rows = self.db.execute(
+                    "SELECT source_path FROM books WHERE id != ?", (book_id,)
+                ).fetchall()
+                remaining_upload_references = any(
+                    self._managed_upload_path(item["source_path"]) == upload_path
+                    for item in remaining_rows
+                )
             with self.db:
+                self.db.execute(
+                    "UPDATE generation_batches SET cancel_requested = 1, status = 'cancelled', "
+                    "completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE book_id = ? "
+                    "AND status IN ('queued', 'running')",
+                    (now, now, book_id),
+                )
+                self.db.execute(
+                    "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                    "completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE batch_id IN "
+                    "(SELECT id FROM generation_batches WHERE book_id = ?) AND status IN ('queued', 'running')",
+                    (now, now, book_id),
+                )
                 self.db.execute("DELETE FROM characters WHERE book_id = ?", (book_id,))
                 self.db.execute("DELETE FROM character_aliases WHERE book_id = ?", (book_id,))
                 self.db.execute("DELETE FROM chapters WHERE book_id = ?", (book_id,))
                 self.db.execute("DELETE FROM books WHERE id = ?", (book_id,))
         if work_dir.exists():
             shutil.rmtree(work_dir)
+        if upload_path is not None and not remaining_upload_references:
+            upload_path.unlink(missing_ok=True)
 
     def upsert_chapter(self, record: dict[str, object]) -> None:
         with self.db_lock:
@@ -445,8 +624,9 @@ class ServerState:
             return {"status": "succeeded", "warnings": [], "artifacts": []}
 
         allowed = {
-            "extract_book", "analyze_chapter", "synthesize_segment_audio", "synthesize_chapter_audio",
-            "assemble_chapter_audio", "apply_corrections", "refresh_voice_assignments", "check_rights",
+            "extract_book", "analyze_chapter", "transcribe_chapter_audio", "plan_chapter_audio", "synthesize_segment_audio", "generate_audio_assets",
+            "synthesize_chapter_audio",
+            "assemble_chapter_audio", "mix_chapter_audio", "apply_corrections", "refresh_voice_assignments", "check_rights",
             "list_voices", "convert_to_mp3",
         }
         if command not in allowed:
@@ -479,6 +659,738 @@ class ServerState:
                 message = completed.stderr.strip() or f"worker exited with code {completed.returncode}"
                 return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "worker_exit_failed", "message": message}}
 
+    # ------------------------------------------------------------------
+    # Durable full-chapter generation batches
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _batch_artifacts(value: object) -> list[dict[str, object]]:
+        if not isinstance(value, str) or not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+    def _batch_payload(self, batch_id: str) -> dict[str, object] | None:
+        """Read one batch and its ordered chapter rows as a browser payload."""
+
+        with self.db_lock:
+            batch = self.db.execute(
+                "SELECT * FROM generation_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                return None
+            rows = self.db.execute(
+                """SELECT bc.*, COALESCE(c.title, bc.chapter_id) AS chapter_title
+                   FROM generation_batch_chapters AS bc
+                   LEFT JOIN chapters AS c
+                     ON c.book_id = ? AND c.id = bc.chapter_id
+                   WHERE bc.batch_id = ?
+                   ORDER BY bc.position ASC""",
+                (batch["book_id"], batch_id),
+            ).fetchall()
+
+        chapters: list[dict[str, object]] = []
+        succeeded_count = failed_count = cancelled_count = 0
+        for row in rows:
+            status = str(row["status"])
+            if status == "succeeded":
+                succeeded_count += 1
+            elif status == "failed":
+                failed_count += 1
+            elif status == "cancelled":
+                cancelled_count += 1
+            chapters.append(
+                {
+                    "chapterId": row["chapter_id"],
+                    "title": row["chapter_title"],
+                    "position": row["position"],
+                    "status": status,
+                    "currentStage": row["current_stage"],
+                    "error": row["error"],
+                    "voiceAudioPath": row["voice_audio_path"],
+                    "mixedAudioPath": row["mixed_audio_path"],
+                    # These are Stable Audio worker artifacts, rather than a
+                    # duplicate manifest format. The browser normalizes them
+                    # with the existing audioAssetsFromArtifacts helper.
+                    "audioAssets": self._batch_artifacts(row["audio_assets_json"]),
+                    "startedAt": row["started_at"],
+                    "completedAt": row["completed_at"],
+                }
+            )
+        return {
+            "batchId": batch["id"],
+            "bookId": batch["book_id"],
+            "status": batch["status"],
+            "force": bool(batch["force"]),
+            "cacheSegments": bool(batch["cache_segments"]),
+            "cancelRequested": bool(batch["cancel_requested"]),
+            "currentChapterId": batch["current_chapter_id"],
+            "currentStage": batch["current_stage"],
+            "error": batch["error"],
+            "createdAt": batch["created_at"],
+            "updatedAt": batch["updated_at"],
+            "completedAt": batch["completed_at"],
+            "totalCount": len(chapters),
+            "succeededCount": succeeded_count,
+            "failedCount": failed_count,
+            "cancelledCount": cancelled_count,
+            "completedCount": succeeded_count + failed_count + cancelled_count,
+            "chapters": chapters,
+        }
+
+    def _batch_is_cancel_requested(self, batch_id: str) -> bool:
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT cancel_requested FROM generation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        return row is None or bool(row["cancel_requested"])
+
+    def _launch_batch_generation_locked(self, batch_id: str) -> None:
+        existing = self.batch_generation_jobs.get(batch_id)
+        if existing is not None and existing.thread is not None and existing.thread.is_alive():
+            return
+        job = BatchGenerationJob(batch_id=batch_id)
+        worker = threading.Thread(
+            target=self._run_batch_generation,
+            args=(batch_id,),
+            daemon=True,
+            name=f"audiobook-batch-{batch_id[:8]}",
+        )
+        job.thread = worker
+        self.batch_generation_jobs[batch_id] = job
+        worker.start()
+
+    def resume_batch_generation_jobs(self) -> None:
+        """Resume unfinished batches after a web-service restart.
+
+        A process restart terminates a currently running worker subprocess.
+        Its chapter is therefore reset to queued and safely restarted from the
+        first cache-aware stage. Completed chapter outputs are left untouched.
+        """
+
+        now = time.time()
+        with self.db_lock:
+            active_rows = self.db.execute(
+                "SELECT id, cancel_requested FROM generation_batches "
+                "WHERE status IN ('queued', 'running')"
+            ).fetchall()
+            for row in active_rows:
+                batch_id = str(row["id"])
+                if row["cancel_requested"]:
+                    self.db.execute(
+                        "UPDATE generation_batches SET status = 'cancelled', current_chapter_id = NULL, "
+                        "current_stage = NULL, completed_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, batch_id),
+                    )
+                    self.db.execute(
+                        "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                        "completed_at = COALESCE(completed_at, ?), updated_at = ? "
+                        "WHERE batch_id = ? AND status IN ('queued', 'running')",
+                        (now, now, batch_id),
+                    )
+                    continue
+                self.db.execute(
+                    "UPDATE generation_batches SET status = 'queued', current_chapter_id = NULL, "
+                    "current_stage = NULL, updated_at = ? WHERE id = ?",
+                    (now, batch_id),
+                )
+                self.db.execute(
+                    "UPDATE generation_batch_chapters SET status = 'queued', current_stage = NULL, "
+                    "started_at = NULL, updated_at = ? WHERE batch_id = ? AND status = 'running'",
+                    (now, batch_id),
+                )
+            self.db.commit()
+
+        with self.batch_generation_lock:
+            for row in active_rows:
+                if not row["cancel_requested"]:
+                    self._launch_batch_generation_locked(str(row["id"]))
+
+    def start_batch_generation(self, request: dict[str, object]) -> dict[str, object]:
+        book_id = str(request.get("bookId") or "")
+        if not SAFE_ID_PATTERN.fullmatch(book_id):
+            raise ValueError("invalid book id")
+        raw_ids = request.get("chapterIds")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("chapterIds must be a non-empty array")
+        chapter_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for raw_id in raw_ids:
+            chapter_id = str(raw_id or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", chapter_id):
+                raise ValueError(f"invalid chapter id: {chapter_id}")
+            if chapter_id not in seen_ids:
+                chapter_ids.append(chapter_id)
+                seen_ids.add(chapter_id)
+
+        force = request.get("force") is True
+        cache_segments = request.get("cacheSegments") is not False
+        now = time.time()
+        with self.db_lock:
+            book = self.db.execute(
+                "SELECT id FROM books WHERE id = ?", (book_id,)
+            ).fetchone()
+            if book is None:
+                raise ValueError(f"book not found: {book_id}")
+            existing = self.db.execute(
+                "SELECT id FROM generation_batches WHERE book_id = ? "
+                "AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+                (book_id,),
+            ).fetchone()
+            if existing is not None:
+                payload = self._batch_payload(str(existing["id"]))
+                if payload is None:
+                    raise RuntimeError("active batch disappeared")
+                payload["reused"] = True
+                return payload
+
+            available = {
+                str(row["id"])
+                for row in self.db.execute(
+                    "SELECT id FROM chapters WHERE book_id = ?", (book_id,)
+                ).fetchall()
+            }
+            missing = [chapter_id for chapter_id in chapter_ids if chapter_id not in available]
+            if missing:
+                raise ValueError(f"chapter not found: {', '.join(missing)}")
+
+            batch_id = uuid.uuid4().hex
+            self.db.execute(
+                "INSERT INTO generation_batches "
+                "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
+                "VALUES (?, ?, 'queued', ?, ?, 0, ?, ?)",
+                (batch_id, book_id, int(force), int(cache_segments), now, now),
+            )
+            self.db.executemany(
+                "INSERT INTO generation_batch_chapters "
+                "(batch_id, chapter_id, position, status, updated_at) VALUES (?, ?, ?, 'queued', ?)",
+                [
+                    (batch_id, chapter_id, position, now)
+                    for position, chapter_id in enumerate(chapter_ids)
+                ],
+            )
+            self.db.commit()
+
+        with self.batch_generation_lock:
+            self._launch_batch_generation_locked(batch_id)
+        payload = self._batch_payload(batch_id)
+        if payload is None:
+            raise RuntimeError("unable to create generation batch")
+        return payload
+
+    def active_batch_generation(self, book_id: str) -> dict[str, object] | None:
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT id FROM generation_batches WHERE book_id = ? "
+                "AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+                (book_id,),
+            ).fetchone()
+        return self._batch_payload(str(row["id"])) if row is not None else None
+
+    def batch_generation_status(self, batch_id: str) -> dict[str, object]:
+        payload = self._batch_payload(batch_id)
+        if payload is None:
+            return {
+                "status": "failed",
+                "error": {
+                    "code": "batch_not_found",
+                    "message": f"Unknown generation batch: {batch_id}",
+                },
+                "chapters": [],
+            }
+        return payload
+
+    def cancel_batch_generation(self, batch_id: str) -> dict[str, object]:
+        now = time.time()
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT status FROM generation_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                return {
+                    "status": "failed",
+                    "error": {
+                        "code": "batch_not_found",
+                        "message": f"Unknown generation batch: {batch_id}",
+                    },
+                    "chapters": [],
+                }
+            if row["status"] in {"succeeded", "completed_with_errors", "cancelled"}:
+                payload = self._batch_payload(batch_id)
+                return payload if payload is not None else {"status": "cancelled", "chapters": []}
+            self.db.execute(
+                "UPDATE generation_batches SET cancel_requested = 1, updated_at = ? WHERE id = ?",
+                (now, batch_id),
+            )
+            self.db.commit()
+        return self.batch_generation_status(batch_id)
+
+    def _set_batch_chapter_stage(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        stage: str,
+    ) -> None:
+        now = time.time()
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE generation_batches SET status = 'running', current_chapter_id = ?, "
+                "current_stage = ?, updated_at = ? WHERE id = ?",
+                (chapter_id, stage, now, batch_id),
+            )
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET status = 'running', current_stage = ?, "
+                "started_at = COALESCE(started_at, ?), updated_at = ? "
+                "WHERE batch_id = ? AND chapter_id = ?",
+                (stage, now, now, batch_id, chapter_id),
+            )
+            self.db.commit()
+
+    @staticmethod
+    def _worker_failure_message(result: dict[str, object], fallback: str) -> str:
+        error = result.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message
+        if isinstance(error, str) and error.strip():
+            return error
+        return fallback
+
+    def _run_batch_stage(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        stage: str,
+        command: str,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        if self._batch_is_cancel_requested(batch_id):
+            raise InterruptedError("batch generation was cancelled")
+        self._set_batch_chapter_stage(batch_id, chapter_id, stage)
+        if command == "generate_audio_assets":
+            # Keep MLX Stable Audio single-file even if a legacy single-asset
+            # request happens alongside a durable batch.
+            with self.stable_audio_generation_lock:
+                result = self.run_worker(command, request)
+        else:
+            result = self.run_worker(command, request)
+        if result.get("status") != "succeeded":
+            raise BatchGenerationStageError(
+                stage,
+                self._worker_failure_message(result, f"{command} failed"),
+            )
+        # Cancellation is intentionally checked only at stage boundaries. A
+        # subprocess already in an inference call is allowed to return, so
+        # completed WAVs and manifests are never truncated or half-written.
+        if self._batch_is_cancel_requested(batch_id):
+            raise InterruptedError("batch generation was cancelled")
+        return result
+
+    def _batch_chapter_inputs(
+        self,
+        batch_id: str,
+        chapter_id: str,
+    ) -> dict[str, object]:
+        with self.db_lock:
+            row = self.db.execute(
+                """SELECT b.work_dir, b.narrator_voice_id, c.script_path
+                   FROM generation_batches AS gb
+                   JOIN books AS b ON b.id = gb.book_id
+                   JOIN chapters AS c ON c.book_id = gb.book_id AND c.id = ?
+                   WHERE gb.id = ?""",
+                (chapter_id, batch_id),
+            ).fetchone()
+            batch = self.db.execute(
+                "SELECT book_id, force, cache_segments FROM generation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if row is None or batch is None:
+            raise BatchGenerationStageError("voice", "The queued chapter or book no longer exists.")
+        script_text = row["script_path"]
+        if not isinstance(script_text, str) or not script_text:
+            raise BatchGenerationStageError("voice", "This chapter has not been analyzed yet; no script is available.")
+        script_path = self.path_in_data(script_text)
+        if not script_path.is_file():
+            raise BatchGenerationStageError("voice", f"Chapter script is missing: {script_path}")
+        work_dir = self.path_in_data(str(row["work_dir"]))
+        context: dict[str, object] = {
+            "bookId": str(batch["book_id"]),
+            "chapterId": chapter_id,
+            "scriptPath": str(script_path),
+            "segmentAudioDirectory": str(work_dir / "segments" / chapter_id),
+            "voiceAudioPath": str(work_dir / "audio" / f"{chapter_id}.wav"),
+            "analysisDirectory": str(work_dir / "analysis" / chapter_id),
+            "audioAssetsDirectory": str(work_dir / "audio-assets" / chapter_id),
+            "mixedAudioPath": str(work_dir / "audio" / f"{chapter_id}_mixed.wav"),
+            "chapterTextPath": str(self.chapter_text_path(str(batch["book_id"]), chapter_id)),
+            "narratorVoiceId": row["narrator_voice_id"] or "narrator_female",
+            "force": bool(batch["force"]),
+            "cacheSegments": bool(batch["cache_segments"]),
+            "voiceProfileDirectory": str(work_dir / "voice-profiles"),
+        }
+        return context
+
+    def _execute_batch_chapter(self, batch_id: str, chapter_id: str) -> dict[str, object]:
+        context = self._batch_chapter_inputs(batch_id, chapter_id)
+        force = bool(context["force"])
+        cache_segments = bool(context["cacheSegments"]) and not force
+        common_tts: dict[str, object] = {
+            "bookId": context["bookId"],
+            "chapterId": chapter_id,
+            "scriptPath": context["scriptPath"],
+            "backend": "mimo",
+            "modelId": "mimo-v2.5-tts-voiceclone",
+            "mergeSegments": True,
+            "narratorVoiceId": context["narratorVoiceId"],
+        }
+        self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "voice",
+            "synthesize_chapter_audio",
+            {
+                **common_tts,
+                "outputDirectory": context["segmentAudioDirectory"],
+                "voiceProfileDirectory": context["voiceProfileDirectory"],
+                "cacheSegments": cache_segments,
+                "mixedOutputPath": context["mixedAudioPath"],
+            },
+        )
+        self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "voice",
+            "assemble_chapter_audio",
+            {
+                **common_tts,
+                "segmentAudioDirectory": context["segmentAudioDirectory"],
+                "outputPath": context["voiceAudioPath"],
+            },
+        )
+        self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "transcript",
+            "transcribe_chapter_audio",
+            {
+                "bookId": context["bookId"],
+                "chapterId": chapter_id,
+                "scriptPath": context["scriptPath"],
+                "voiceAudioPath": context["voiceAudioPath"],
+                "analysisDirectory": context["analysisDirectory"],
+            },
+        )
+        self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "audio_plan",
+            "plan_chapter_audio",
+            {
+                "bookId": context["bookId"],
+                "chapterId": chapter_id,
+                "scriptPath": context["scriptPath"],
+                "transcriptPath": str(Path(str(context["analysisDirectory"])) / "transcript.json"),
+                "chapterTextPath": context["chapterTextPath"],
+                "analysisDirectory": context["analysisDirectory"],
+            },
+        )
+        assets_result = self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "stable_audio",
+            "generate_audio_assets",
+            {
+                "bookId": context["bookId"],
+                "chapterId": chapter_id,
+                "scriptPath": context["scriptPath"],
+                "outputDirectory": context["audioAssetsDirectory"],
+                "mixedOutputPath": context["mixedAudioPath"],
+                "force": force,
+            },
+        )
+        self._run_batch_stage(
+            batch_id,
+            chapter_id,
+            "mix",
+            "mix_chapter_audio",
+            {
+                "bookId": context["bookId"],
+                "chapterId": chapter_id,
+                "scriptPath": context["scriptPath"],
+                "segmentAudioDirectory": context["segmentAudioDirectory"],
+                "voiceAudioPath": context["voiceAudioPath"],
+                "audioAssetsDirectory": context["audioAssetsDirectory"],
+                "outputPath": context["mixedAudioPath"],
+                "mergeSegments": True,
+                "narratorVoiceId": context["narratorVoiceId"],
+            },
+        )
+        return {
+            "voiceAudioPath": context["voiceAudioPath"],
+            "mixedAudioPath": context["mixedAudioPath"],
+            "audioAssets": assets_result.get("artifacts", []),
+        }
+
+    def _finish_cancelled_batch(self, batch_id: str) -> None:
+        now = time.time()
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                "completed_at = COALESCE(completed_at, ?), updated_at = ? "
+                "WHERE batch_id = ? AND status IN ('queued', 'running')",
+                (now, now, batch_id),
+            )
+            self.db.execute(
+                "UPDATE generation_batches SET status = 'cancelled', current_chapter_id = NULL, "
+                "current_stage = NULL, completed_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, batch_id),
+            )
+            self.db.commit()
+
+    def _finish_batch_if_done(self, batch_id: str) -> bool:
+        now = time.time()
+        with self.db_lock:
+            batch = self.db.execute(
+                "SELECT cancel_requested FROM generation_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                return True
+            if batch["cancel_requested"]:
+                return False
+            pending = self.db.execute(
+                "SELECT COUNT(*) AS count FROM generation_batch_chapters "
+                "WHERE batch_id = ? AND status = 'queued'",
+                (batch_id,),
+            ).fetchone()
+            if pending is not None and int(pending["count"]) > 0:
+                return False
+            failed = self.db.execute(
+                "SELECT COUNT(*) AS count FROM generation_batch_chapters "
+                "WHERE batch_id = ? AND status = 'failed'",
+                (batch_id,),
+            ).fetchone()
+            status = "completed_with_errors" if failed is not None and int(failed["count"]) else "succeeded"
+            self.db.execute(
+                "UPDATE generation_batches SET status = ?, current_chapter_id = NULL, current_stage = NULL, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
+                (status, now, now, batch_id),
+            )
+            self.db.commit()
+        return True
+
+    def _next_queued_batch_chapter(self, batch_id: str) -> str | None:
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT chapter_id FROM generation_batch_chapters WHERE batch_id = ? "
+                "AND status = 'queued' ORDER BY position ASC LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+        return str(row["chapter_id"]) if row is not None else None
+
+    def _mark_batch_chapter_failed(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        stage: str,
+        message: str,
+    ) -> None:
+        now = time.time()
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET status = 'failed', current_stage = ?, error = ?, "
+                "completed_at = ?, updated_at = ? WHERE batch_id = ? AND chapter_id = ?",
+                (stage, message, now, now, batch_id, chapter_id),
+            )
+            self.db.execute(
+                "UPDATE generation_batches SET current_chapter_id = NULL, current_stage = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (now, batch_id),
+            )
+            self.db.commit()
+
+    def _mark_batch_chapter_succeeded(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        result: dict[str, object],
+    ) -> None:
+        now = time.time()
+        artifacts = result.get("audioAssets")
+        serialized_assets = json.dumps(
+            artifacts if isinstance(artifacts, list) else [], ensure_ascii=False
+        )
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET status = 'succeeded', current_stage = NULL, error = NULL, "
+                "voice_audio_path = ?, mixed_audio_path = ?, audio_assets_json = ?, completed_at = ?, "
+                "updated_at = ? WHERE batch_id = ? AND chapter_id = ?",
+                (
+                    str(result.get("voiceAudioPath") or ""),
+                    str(result.get("mixedAudioPath") or ""),
+                    serialized_assets,
+                    now,
+                    now,
+                    batch_id,
+                    chapter_id,
+                ),
+            )
+            self.db.execute(
+                "UPDATE generation_batches SET current_chapter_id = NULL, current_stage = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (now, batch_id),
+            )
+            self.db.commit()
+
+    def _run_batch_generation(self, batch_id: str) -> None:
+        """Run full chapters in one server-side queue, continuing after errors."""
+
+        try:
+            with self.batch_generation_execution_lock:
+                while True:
+                    if self._batch_is_cancel_requested(batch_id):
+                        self._finish_cancelled_batch(batch_id)
+                        return
+                    chapter_id = self._next_queued_batch_chapter(batch_id)
+                    if chapter_id is None:
+                        self._finish_batch_if_done(batch_id)
+                        return
+                    try:
+                        result = self._execute_batch_chapter(batch_id, chapter_id)
+                    except InterruptedError:
+                        self._finish_cancelled_batch(batch_id)
+                        return
+                    except BatchGenerationStageError as error:
+                        self._mark_batch_chapter_failed(
+                            batch_id, chapter_id, error.stage, str(error)
+                        )
+                        continue
+                    except Exception as error:  # pragma: no cover - defensive server boundary
+                        self._mark_batch_chapter_failed(
+                            batch_id, chapter_id, "unknown", str(error)
+                        )
+                        continue
+                    if self._batch_is_cancel_requested(batch_id):
+                        self._finish_cancelled_batch(batch_id)
+                        return
+                    self._mark_batch_chapter_succeeded(batch_id, chapter_id, result)
+        finally:
+            with self.batch_generation_lock:
+                job = self.batch_generation_jobs.get(batch_id)
+                if job is not None and job.thread is threading.current_thread():
+                    self.batch_generation_jobs.pop(batch_id, None)
+
+    # ------------------------------------------------------------------
+    # Compatibility API for an older single-chapter asset button.
+    # It now uses the local CLI only; it never opens Gradio, runs quality
+    # detection, creates handoffs, or waits for a browser callback.
+    # ------------------------------------------------------------------
+
+    def _stable_audio_job_payload_locked(self, job: StableAudioJob) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "status": job.status,
+            "jobId": job.job_id,
+            "warnings": list(job.warnings),
+            "artifacts": list(job.artifacts),
+            "pendingCount": 0 if job.status != "running" else 1,
+            "next": None,
+        }
+        if job.error is not None:
+            payload["error"] = job.error
+        return payload
+
+    def _run_legacy_stable_audio_job(self, job_id: str) -> None:
+        try:
+            with self.batch_generation_lock:
+                job = self.stable_audio_jobs.get(job_id)
+                if job is None or job.cancel_requested:
+                    return
+                job.status = "running"
+                job.updated_at = time.time()
+            request = dict(job.request)
+            with self.stable_audio_generation_lock:
+                result = self.run_worker("generate_audio_assets", request)
+            with self.batch_generation_lock:
+                job = self.stable_audio_jobs.get(job_id)
+                if job is None:
+                    return
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                elif result.get("status") == "succeeded":
+                    job.status = "succeeded"
+                    artifacts = result.get("artifacts")
+                    job.artifacts = [item for item in artifacts if isinstance(item, dict)] if isinstance(artifacts, list) else []
+                    warnings = result.get("warnings")
+                    job.warnings = [item for item in warnings if isinstance(item, str)] if isinstance(warnings, list) else []
+                else:
+                    job.status = "failed"
+                    job.error = {
+                        "code": "stable_audio_generation_failed",
+                        "message": self._worker_failure_message(result, "Stable Audio generation failed."),
+                    }
+                job.updated_at = time.time()
+        finally:
+            with self.batch_generation_lock:
+                job = self.stable_audio_jobs.get(job_id)
+                if job is not None and job.generation_thread is threading.current_thread():
+                    job.generation_thread = None
+
+    def start_stable_audio_assets(self, request: dict[str, object]) -> dict[str, object]:
+        required = ("bookId", "chapterId", "scriptPath", "outputDirectory")
+        if any(not str(request.get(key) or "") for key in required):
+            return {
+                "status": "failed",
+                "warnings": [],
+                "artifacts": [],
+                "error": {"code": "invalid_audio_request", "message": "bookId, chapterId, scriptPath and outputDirectory are required"},
+            }
+        self.path_in_data(str(request["scriptPath"]))
+        self.path_in_data(str(request["outputDirectory"]))
+        job = StableAudioJob(job_id=uuid.uuid4().hex, request=dict(request))
+        with self.batch_generation_lock:
+            self.stable_audio_jobs[job.job_id] = job
+            worker = threading.Thread(
+                target=self._run_legacy_stable_audio_job,
+                args=(job.job_id,),
+                daemon=True,
+                name=f"stable-audio-local-{job.job_id[:8]}",
+            )
+            job.generation_thread = worker
+            worker.start()
+            return self._stable_audio_job_payload_locked(job)
+
+    def stable_audio_job_status(self, job_id: str) -> dict[str, object]:
+        with self.batch_generation_lock:
+            job = self.stable_audio_jobs.get(job_id)
+            if job is None:
+                return {
+                    "status": "failed",
+                    "warnings": [],
+                    "artifacts": [],
+                    "error": {"code": "stable_audio_job_not_found", "message": f"Unknown Stable Audio job: {job_id}"},
+                }
+            return self._stable_audio_job_payload_locked(job)
+
+    def cancel_stable_audio_job(self, job_id: str) -> dict[str, object]:
+        with self.batch_generation_lock:
+            job = self.stable_audio_jobs.get(job_id)
+            if job is None:
+                return {"status": "succeeded", "warnings": [], "artifacts": [], "next": None}
+            job.cancel_requested = True
+            if job.status == "queued":
+                job.status = "cancelled"
+            job.updated_at = time.time()
+            return self._stable_audio_job_payload_locked(job)
+
+    def receive_stable_audio_callback(self, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "error": "Stable Audio browser handoffs are no longer supported; generation runs in the local backend queue.",
+        }
+
     def validate_request_paths(self, value: object, key: str = "") -> None:
         if isinstance(value, dict):
             for child_key, child_value in value.items():
@@ -504,7 +1416,13 @@ class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
 
-    def send_json(self, payload: object, status: int = HTTPStatus.OK) -> None:
+    def send_json(
+        self,
+        payload: object,
+        status: int = HTTPStatus.OK,
+        *,
+        send_body: bool = True,
+    ) -> None:
         body = json_bytes(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -512,7 +1430,8 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
 
     def send_error_json(self, message: str, status: int = HTTPStatus.BAD_REQUEST) -> None:
         self.send_json({"error": message}, status)
@@ -533,6 +1452,56 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-File-Name")
         self.end_headers()
+
+    def do_HEAD(self) -> None:
+        """Return metadata for browser media probes without sending a body."""
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/health":
+                self.send_json({"ok": True}, send_body=False)
+                return
+            if path == "/api/files":
+                query = parse_qs(parsed.query)
+                self.serve_file(
+                    self.state.path_in_data(query.get("path", [""])[0]),
+                    send_body=False,
+                )
+                return
+            if path.startswith("/api/audio/"):
+                parts = path.split("/")
+                if len(parts) != 5:
+                    raise ValueError("invalid audio path")
+                book_id, chapter_id = unquote(parts[3]), unquote(parts[4])
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", chapter_id):
+                    raise ValueError("invalid chapter id")
+                self.serve_file(
+                    self.state.work_directory(book_id) / "audio" / f"{chapter_id}.wav",
+                    send_body=False,
+                )
+                return
+            parts = path.split("/")
+            if (
+                len(parts) == 7
+                and parts[1] == "api"
+                and parts[2] == "books"
+                and parts[4] == "chapters"
+                and parts[6] == "text"
+            ):
+                book_id, chapter_id = unquote(parts[3]), unquote(parts[5])
+                self.serve_file(
+                    self.state.chapter_text_path(book_id, chapter_id),
+                    send_body=False,
+                )
+                return
+            self.serve_frontend(path, send_body=False)
+        except FileNotFoundError:
+            self.send_error_json("file not found", HTTPStatus.NOT_FOUND)
+        except (ValueError, KeyError, json.JSONDecodeError) as error:
+            self.send_error_json(str(error), HTTPStatus.BAD_REQUEST)
+        except Exception as error:  # pragma: no cover - safety net for HEAD requests
+            self.send_error_json(str(error), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -689,6 +1658,7 @@ class WebHandler(BaseHTTPRequestHandler):
             })
         metadata = dict(metadata)
         metadata.update({"bookId": book_id, "workDir": str(work_dir), "sourcePath": str(upload_path)})
+        metadata["narratorVoiceId"] = "narrator_female"
         (work_dir / "book-extraction.json").write_text(
             json.dumps(
                 {
@@ -696,6 +1666,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     "bookId": book_id,
                     "workDir": str(work_dir),
                     "chapters": metadata.get("chapters", []),
+                    "narratorVoiceId": "narrator_female",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -809,6 +1780,20 @@ class WebHandler(BaseHTTPRequestHandler):
             input_json = args.get("inputJson", "{}")
             request = json.loads(str(input_json))
             return json.dumps(self.state.run_worker(str(args.get("command", "")), request), ensure_ascii=False)
+        if command == "batch_generation_start":
+            return self.state.start_batch_generation(args)
+        if command == "batch_generation_status":
+            return self.state.batch_generation_status(str(args.get("batchId") or ""))
+        if command == "batch_generation_active":
+            return self.state.active_batch_generation(str(args.get("bookId") or ""))
+        if command == "batch_generation_cancel":
+            return self.state.cancel_batch_generation(str(args.get("batchId") or ""))
+        if command == "stable_audio_start":
+            return self.state.start_stable_audio_assets(args)
+        if command == "stable_audio_status":
+            return self.state.stable_audio_job_status(str(args.get("jobId") or ""))
+        if command == "stable_audio_cancel":
+            return self.state.cancel_stable_audio_job(str(args.get("jobId") or ""))
         if command == "file_exists":
             paths = args.get("paths", [])
             if not isinstance(paths, list):
@@ -829,6 +1814,11 @@ class WebHandler(BaseHTTPRequestHandler):
         if command == "db_create_book":
             self.state.create_book(args)
             return None
+        if command == "db_set_narrator_voice":
+            self.state.set_narrator_voice(
+                str(args["bookId"]), args.get("narratorVoiceId")
+            )
+            return None
         if command == "db_delete_book":
             self.state.delete_book(str(args["bookId"]))
             return None
@@ -847,19 +1837,40 @@ class WebHandler(BaseHTTPRequestHandler):
             return self.state.characters(str(args["bookId"]))
         raise ValueError(f"unknown invoke command: {command}")
 
-    def serve_file(self, path: Path) -> None:
+    def serve_file(self, path: Path, *, send_body: bool = True) -> None:
         path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
         total = path.stat().st_size
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if path.suffix.lower() == ".wav":
+            content_type = "audio/wav"
         range_header = self.headers.get("Range")
         start, end = 0, total - 1
         status = HTTPStatus.OK
         if range_header and range_header.startswith("bytes="):
-            start_text, _, end_text = range_header[6:].partition("-")
-            start = int(start_text or 0)
-            end = int(end_text) if end_text else total - 1
+            range_spec = range_header[6:].strip()
+            if "," in range_spec or "-" not in range_spec:
+                self._send_range_not_satisfiable(total, send_body=send_body)
+                return
+            start_text, end_text = range_spec.split("-", 1)
+            try:
+                if start_text:
+                    start = int(start_text)
+                    end = int(end_text) if end_text else total - 1
+                else:
+                    suffix_length = int(end_text)
+                    if suffix_length <= 0:
+                        self._send_range_not_satisfiable(total, send_body=send_body)
+                        return
+                    start = max(0, total - suffix_length)
+                    end = total - 1
+            except ValueError:
+                self._send_range_not_satisfiable(total, send_body=send_body)
+                return
+            if start < 0 or start >= total or end < start:
+                self._send_range_not_satisfiable(total, send_body=send_body)
+                return
             end = min(end, total - 1)
             status = HTTPStatus.PARTIAL_CONTENT
         length = max(0, end - start + 1)
@@ -871,6 +1882,8 @@ class WebHandler(BaseHTTPRequestHandler):
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.end_headers()
+        if not send_body:
+            return
         with path.open("rb") as source:
             source.seek(start)
             remaining = length
@@ -881,7 +1894,14 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
-    def serve_frontend(self, path: str) -> None:
+    def _send_range_not_satisfiable(self, total: int, *, send_body: bool) -> None:
+        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        self.send_header("Content-Range", f"bytes */{total}")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def serve_frontend(self, path: str, *, send_body: bool = True) -> None:
         if self.state.frontend_directory is None:
             self.send_error_json("frontend is not configured", HTTPStatus.NOT_FOUND)
             return
@@ -891,7 +1911,7 @@ class WebHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid frontend path")
         if not candidate.is_file():
             candidate = self.state.frontend_directory / "index.html"
-        self.serve_file(candidate)
+        self.serve_file(candidate, send_body=send_body)
 
 
 class AudiobookHTTPServer(ThreadingHTTPServer):
@@ -900,6 +1920,7 @@ class AudiobookHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], state: ServerState):
         self.state = state
         super().__init__(address, WebHandler)
+        state.attach_web_port(self.server_address[1])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -919,7 +1940,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         server.server_close()
-        state.db.close()
+        state.close()
     return 0
 
 

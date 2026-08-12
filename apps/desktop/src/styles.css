@@ -1763,6 +1763,12 @@ aside.chapter-list h3 {
   accent-color: var(--accent);
 }
 
+.select-all-count {
+  margin-left: auto;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 aside.chapter-list .chapter-item {
   display: flex;
   align-items: center;
@@ -1803,6 +1809,12 @@ aside.chapter-list .chapter-title {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+/* Generation output panels must grow with their content instead of being
+   compressed by the scroll container while a new asset is being generated. */
+.detail-content > .tab-panel {
+  flex: 0 0 auto;
 }
 
 /* Tabs */
@@ -2095,21 +2107,206 @@ aside.chapter-list .chapter-title {
   flex-shrink: 0;
 }
 
+/* Stable Audio music and sound-effect preview list. */
+.generated-audio-assets {
+  margin-top: 4px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-subtle, var(--surface));
+}
+
+.generated-audio-assets-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.generated-audio-assets-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.generated-audio-assets-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.generated-audio-chapter + .generated-audio-chapter {
+  margin-top: 18px;
+}
+
+.generated-audio-chapter h4 {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.generated-audio-group + .generated-audio-group {
+  margin-top: 10px;
+}
+
+.generated-audio-group-title {
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.generated-audio-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.generated-audio-row:last-child {
+  border-bottom: 0;
+}
+
+.generated-audio-info {
+  display: flex;
+  flex: 0 0 190px;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.generated-audio-info strong {
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.generated-audio-info span,
+.generated-audio-info small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.generated-audio-row audio {
+  height: 32px;
+  min-width: 220px;
+  flex: 1;
+}
+
+.generated-audio-row .btn-secondary {
+  width: auto;
+  padding: 5px 10px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* Keep all chapter, music, and SFX audio elements mounted while another tab
+   is active. display:none hides the controls without unmounting media, so
+   playback continues across tab switches. */
+.audio-playback-persistence {
+  flex: 0 0 auto;
+}
+
+.audio-playback-persistence.is-visible.has-listenable-audio {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 20px 20px;
+}
+
+.audio-playback-persistence.is-hidden {
+  display: none;
+}
+
+.listen-chapter-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(8px);
+}
+
+.listen-chapter-toolbar > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.listen-chapter-toolbar strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.listen-chapter-toolbar > div > span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.listen-chapter-toolbar label {
+  flex: 0 0 min(280px, 42%);
+}
+
+.listen-chapter-toolbar select {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--r-sm);
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.listen-chapter-toolbar select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.listen-chapter-toolbar select:disabled {
+  cursor: default;
+  opacity: 0.8;
+}
+
+.audio-playback-persistence .generated-audio-assets {
+  margin-top: 0;
+}
+
 /* Keep chapter audio elements mounted while other tabs are active. */
 .chapter-audio-persistence.is-hidden {
+  display: none;
+}
+
+.audio-playback-persistence .chapter-audio-persistence {
+  min-height: 0;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-surface);
+}
+
+.sr-only {
   position: absolute;
-  left: -10000px;
   width: 1px;
   height: 1px;
-  min-height: 0;
-  margin: 0;
   padding: 0;
+  margin: -1px;
   overflow: hidden;
-  clip: rect(0 0 0 0);
-  clip-path: inset(50%);
+  clip: rect(0, 0, 0, 0);
   white-space: nowrap;
-  opacity: 0;
-  pointer-events: none;
+  border: 0;
 }
 
 /* Review table selects */
@@ -2125,6 +2322,24 @@ aside.chapter-list .chapter-title {
 }
 
 .character-table select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.character-table textarea {
+  width: min(360px, 32vw);
+  min-width: 220px;
+  resize: vertical;
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  border: 1px solid var(--border-emphasis);
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.character-table textarea:focus {
   outline: none;
   border-color: var(--accent);
 }
@@ -2217,6 +2432,286 @@ aside.chapter-list .chapter-title {
   padding: 2px 0;
 }
 
+.workflow-card {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.workflow-card-compact {
+  margin-top: 0;
+  padding: 10px;
+}
+
+.workflow-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.workflow-card-title,
+.workflow-card-detail,
+.workflow-step-name,
+.workflow-step-status,
+.workflow-step-detail,
+.workflow-step-error,
+.workflow-error {
+  display: block;
+  margin: 0;
+}
+
+.workflow-chapter-summary {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.workflow-summary-title {
+  margin: 0 0 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.workflow-summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 12px;
+}
+
+.workflow-summary-status {
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.batch-generation-status {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface, rgba(255, 255, 255, 0.02));
+}
+
+.batch-generation-status-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.batch-generation-status-header h3,
+.batch-generation-status-header p {
+  margin: 0;
+}
+
+.batch-generation-status-header h3 {
+  font-size: 13px;
+}
+
+.batch-generation-status-header p {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.batch-generation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.batch-generation-chapter-list {
+  max-height: min(42vh, 430px);
+  margin-top: 9px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+}
+
+.batch-generation-chapter {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto minmax(0, 1.4fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 31px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  font-size: 12px;
+}
+
+.batch-generation-position,
+.batch-generation-chapter-status {
+  color: var(--text-muted);
+}
+
+.batch-generation-title,
+.batch-generation-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-generation-detail {
+  color: var(--text-secondary);
+}
+
+.batch-chapter-running .batch-generation-chapter-status,
+.batch-status-running {
+  color: var(--accent);
+}
+
+.batch-chapter-succeeded .batch-generation-chapter-status,
+.batch-status-succeeded {
+  color: var(--success, #3ca370);
+}
+
+.batch-chapter-failed .batch-generation-chapter-status,
+.batch-status-completed_with_errors,
+.batch-status-failed {
+  color: var(--danger, #d86464);
+}
+
+.batch-chapter-cancelled .batch-generation-chapter-status,
+.batch-status-cancelled {
+  color: var(--text-muted);
+}
+
+@media (max-width: 640px) {
+  .batch-generation-chapter {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    padding: 5px 0;
+  }
+
+  .batch-generation-detail {
+    grid-column: 2 / -1;
+    white-space: normal;
+  }
+}
+
+.workflow-card-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workflow-card-detail,
+.workflow-step-detail {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.workflow-overall,
+.workflow-step-status {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.workflow-overall {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-alt, rgba(127, 127, 127, .12));
+}
+
+.workflow-running,
+.workflow-step-current .workflow-step-status {
+  color: var(--accent);
+}
+
+.workflow-succeeded {
+  color: var(--success);
+}
+
+.workflow-failed,
+.workflow-step-error {
+  color: var(--danger);
+}
+
+.workflow-needs_review {
+  color: var(--warning, #b7791f);
+}
+
+.workflow-steps {
+  display: grid;
+  gap: 6px;
+}
+
+.workflow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+
+.workflow-step-current {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.workflow-step-marker {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.workflow-step-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  flex: 1;
+  gap: 2px 10px;
+  min-width: 0;
+}
+
+.workflow-step-name {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.workflow-step-detail,
+.workflow-step-error {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+}
+
+.workflow-step-running .workflow-step-marker {
+  color: var(--accent);
+  animation: workflow-pulse 1.2s ease-in-out infinite;
+}
+
+.workflow-step-succeeded .workflow-step-marker {
+  color: var(--success);
+}
+
+.workflow-step-failed .workflow-step-marker {
+  color: var(--danger);
+}
+
+.workflow-step-needs_review .workflow-step-marker {
+  color: var(--warning, #b7791f);
+}
+
+.workflow-error {
+  margin-top: 10px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@keyframes workflow-pulse {
+  50% { opacity: .45; }
+}
+
 /* ─── Responsive ──────────────────────────────── */
 @media (max-width: 860px) {
   .app-shell {
@@ -2294,6 +2789,44 @@ aside.chapter-list .chapter-title {
 
   .chapter-preview-content {
     padding: 14px 0 0;
+  }
+
+  .audio-playback-persistence.is-visible.has-listenable-audio {
+    padding: 0 12px 16px;
+  }
+
+  .listen-chapter-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .listen-chapter-toolbar label {
+    flex-basis: auto;
+  }
+
+  .audio-row,
+  .generated-audio-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .audio-row span,
+  .generated-audio-info {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .audio-row audio,
+  .generated-audio-row audio {
+    flex: 1 1 100%;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .audio-row .btn-secondary,
+  .generated-audio-row .btn-secondary {
+    flex: 1 1 auto;
   }
 
   .library-grid {

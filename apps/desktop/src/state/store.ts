@@ -21,6 +21,12 @@ export function createAudiobookStore() {
     async getBook(sourcePath: string): Promise<LibraryBook | null> {
       return await invoke("db_get_book", { sourcePath }) as any;
     },
+    async setNarratorVoice(
+      bookId: string,
+      narratorVoiceId: "narrator_female" | "narrator_male" | "narrator_default",
+    ): Promise<void> {
+      await invoke("db_set_narrator_voice", { bookId, narratorVoiceId });
+    },
     async upsertCharacter(record: {
       id: string; bookId: string; canonicalName: string;
       gender?: string | null; ageClass?: string | null;
@@ -28,6 +34,7 @@ export function createAudiobookStore() {
       voiceId?: string | null; voiceSource?: "auto" | "manual" | null;
       voiceAssignmentVersion?: number | null; voiceProfile?: string | null;
       fallbackVoiceId?: string | null;
+      voiceDesign?: string | null;
       voiceDescription?: string | null;
       confidence?: number; aliases?: string;
     }) {
@@ -42,6 +49,7 @@ export function createAudiobookStore() {
         voiceAssignmentVersion: record.voiceAssignmentVersion ?? null,
         voiceProfile: record.voiceProfile ?? null,
         fallbackVoiceId: record.fallbackVoiceId ?? null,
+        voiceDesign: record.voiceDesign ?? null,
         voiceDescription: record.voiceDescription ?? null,
         confidence: record.confidence ?? 0.0,
         aliases: record.aliases ?? "[]",

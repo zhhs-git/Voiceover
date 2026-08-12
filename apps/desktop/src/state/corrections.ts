@@ -15,10 +15,16 @@ export interface VoiceOverride {
   voiceId: string;
 }
 
+export interface VoiceDesignOverride {
+  characterId: string;
+  voiceDesign: string;
+}
+
 export interface CorrectionSet {
   aliasMerges: AliasMerge[];
   genderOverrides: GenderOverride[];
   voiceOverrides: VoiceOverride[];
+  voiceDesignOverrides: VoiceDesignOverride[];
 }
 
 export interface CorrectionState extends CorrectionSet {
@@ -31,6 +37,7 @@ interface CorrectionActions {
   addMerge: (merge: AliasMerge) => void;
   setGender: (characterId: string, gender: string) => void;
   setVoice: (characterId: string, voiceId: string) => void;
+  setVoiceDesign: (characterId: string, voiceDesign: string) => void;
   markSaved: (affectedChapters: string[]) => void;
   reset: () => void;
 }
@@ -42,6 +49,7 @@ function makeStore() {
     aliasMerges: [],
     genderOverrides: [],
     voiceOverrides: [],
+    voiceDesignOverrides: [],
     dirty: false,
     savedCorrections: null,
     affectedChapters: [],
@@ -77,6 +85,17 @@ function makeStore() {
         dirty: true,
       })),
 
+    setVoiceDesign: (characterId, voiceDesign) =>
+      set((s) => ({
+        voiceDesignOverrides: [
+          ...s.voiceDesignOverrides.filter(
+            (o) => o.characterId !== characterId,
+          ),
+          { characterId, voiceDesign },
+        ],
+        dirty: true,
+      })),
+
     markSaved: (affectedChapters) =>
       set((s) => ({
         dirty: false,
@@ -84,6 +103,7 @@ function makeStore() {
           aliasMerges: s.aliasMerges,
           genderOverrides: s.genderOverrides,
           voiceOverrides: s.voiceOverrides,
+          voiceDesignOverrides: s.voiceDesignOverrides,
         },
         affectedChapters,
       })),
@@ -93,6 +113,7 @@ function makeStore() {
         aliasMerges: [],
         genderOverrides: [],
         voiceOverrides: [],
+        voiceDesignOverrides: [],
         dirty: false,
         savedCorrections: null,
         affectedChapters: [],
@@ -110,6 +131,7 @@ export function createCorrectionsStore() {
         addMerge: _am,
         setGender: _sg,
         setVoice: _sv,
+        setVoiceDesign: _svd,
         markSaved: _ms,
         reset: _r,
         ...state
@@ -129,6 +151,9 @@ export function createCorrectionsStore() {
 
     setVoice: (characterId: string, voiceId: string) =>
       useStore.getState().setVoice(characterId, voiceId),
+
+    setVoiceDesign: (characterId: string, voiceDesign: string) =>
+      useStore.getState().setVoiceDesign(characterId, voiceDesign),
 
     markSaved: (affectedChapters: string[]) =>
       useStore.getState().markSaved(affectedChapters),

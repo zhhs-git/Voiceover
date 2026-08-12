@@ -1,6 +1,10 @@
 export const VOICE_PREVIEW_BACKEND = "mimo";
-export const VOICE_PREVIEW_MODEL_ID = "mimo-v2.5-tts-voicedesign";
+export const VOICE_PREVIEW_MODEL_ID = "mimo-v2.5-tts-voiceclone";
 export const VOICE_PREVIEW_TEXT = "你好，这是一段音色预览。";
+
+function isNarratorVoice(voiceId: string): boolean {
+  return ["narrator_default", "narrator_female", "narrator_male"].includes(voiceId);
+}
 
 interface VoicePreviewOptions {
   voiceDescription?: string;
@@ -16,7 +20,7 @@ export function buildVoicePreviewScript(
   const segment = {
     id: segmentId,
     text: VOICE_PREVIEW_TEXT,
-    speakerId: voiceId === "narrator_default" ? "narrator" : "preview",
+    speakerId: isNarratorVoice(voiceId) ? "narrator" : "preview",
     voiceId,
     emotion: "neutral",
     intensity: 0.2,
@@ -39,12 +43,15 @@ export function buildVoicePreviewRequest(
   scriptPath: string,
   outputDirectory: string,
   segmentId: string,
+  voiceProfileDirectory?: string,
 ) {
-  return {
+  const request = {
     scriptPath,
     segmentId,
     outputDirectory,
     backend: VOICE_PREVIEW_BACKEND,
     modelId: VOICE_PREVIEW_MODEL_ID,
+    ...(voiceProfileDirectory ? { voiceProfileDirectory } : {}),
   };
+  return request;
 }

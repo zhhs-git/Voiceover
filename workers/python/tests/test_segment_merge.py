@@ -17,6 +17,30 @@ def test_merges_adjacent_segments_with_same_voice_emotion_and_pace():
     assert merged[1]["id"] == "seg_0003"
 
 
+def test_protected_audio_anchor_is_not_merged_with_adjacent_segments():
+    segments = [
+        {"id": "seg_0001", "text": "门外有人", "voiceId": "a", "emotion": "neutral", "pace": "normal"},
+        {"id": "seg_0002", "text": "吱呀", "voiceId": "a", "emotion": "neutral", "pace": "normal"},
+        {"id": "seg_0003", "text": "门被推开", "voiceId": "a", "emotion": "neutral", "pace": "normal"},
+    ]
+
+    merged = merge_tts_segments(
+        segments,
+        protected_source_segment_ids={"seg_0002"},
+    )
+
+    assert [segment["id"] for segment in merged] == [
+        "seg_0001",
+        "seg_0002",
+        "seg_0003",
+    ]
+    assert [segment["sourceSegmentIds"] for segment in merged] == [
+        ["seg_0001"],
+        ["seg_0002"],
+        ["seg_0003"],
+    ]
+
+
 def test_does_not_merge_when_word_limit_would_be_exceeded():
     segments = [
         {"id": "seg_0001", "text": "one two three", "voiceId": "a", "emotion": "neutral", "pace": "normal"},
@@ -101,3 +125,29 @@ def test_does_not_merge_when_local_fallback_voices_differ():
     merged = merge_tts_segments(segments, max_characters=40)
 
     assert [segment["id"] for segment in merged] == ["seg_0001", "seg_0002"]
+
+
+def test_scene_boundaries_do_not_block_compatible_tts_merge():
+    segments = [
+        {
+            "id": "seg_0001",
+            "text": "他还在等待。",
+            "voiceId": "narrator_default",
+            "emotion": "neutral",
+            "pace": "normal",
+            "sceneId": "scene_1",
+        },
+        {
+            "id": "seg_0002",
+            "text": "门突然响了。",
+            "voiceId": "narrator_default",
+            "emotion": "neutral",
+            "pace": "normal",
+            "sceneId": "scene_2",
+        },
+    ]
+
+    merged = merge_tts_segments(segments, max_characters=100)
+
+    assert [segment["id"] for segment in merged] == ["seg_0001"]
+    assert merged[0]["sourceSegmentIds"] == ["seg_0001", "seg_0002"]

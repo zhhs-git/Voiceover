@@ -12,10 +12,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$PROJECT_DIR"
-"$PROJECT_DIR/workers/python/.venv/bin/python" -m audiobook_worker.web_server \
-  --host "${AUDIOBOOK_WEB_HOST:-0.0.0.0}" \
-  --port "${AUDIOBOOK_WEB_PORT:-8000}" \
-  >"${TMPDIR:-/tmp}/audiobook-generator-web.log" 2>&1 &
+(
+  cd "$PROJECT_DIR/workers/python"
+  exec "$PROJECT_DIR/workers/python/.venv/bin/python" -m audiobook_worker.web_server \
+    --host "${AUDIOBOOK_WEB_HOST:-0.0.0.0}" \
+    --port "${AUDIOBOOK_WEB_PORT:-8000}"
+) >"${TMPDIR:-/tmp}/audiobook-generator-web.log" 2>&1 &
 API_PID=$!
 
 npm run dev --workspace @audiobook-generator/desktop -- --host 0.0.0.0 &

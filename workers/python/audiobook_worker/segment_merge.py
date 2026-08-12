@@ -21,6 +21,7 @@ def merge_tts_segments(
     *,
     max_words: int = DEFAULT_MAX_TTS_WORDS,
     max_characters: int = DEFAULT_MAX_TTS_CHARACTERS,
+    protected_source_segment_ids: set[str] | None = None,
 ) -> list[dict]:
     expanded = split_tts_segments(
         segments,
@@ -43,10 +44,15 @@ def merge_tts_segments(
 
         previous = merged[-1]
         combined_text = _join_text(previous.get("text", ""), current.get("text", ""))
-        if _can_merge(previous, current) and _within_tts_limits(
-            combined_text,
-            max_words=max_words,
-            max_characters=max_characters,
+        if (
+            not _contains_protected_source(previous, protected_source_segment_ids)
+            and not _contains_protected_source(current, protected_source_segment_ids)
+            and _can_merge(previous, current)
+            and _within_tts_limits(
+                combined_text,
+                max_words=max_words,
+                max_characters=max_characters,
+            )
         ):
             previous["text"] = combined_text
             previous["sourceSegmentIds"].extend(current["sourceSegmentIds"])
@@ -178,6 +184,20 @@ def _contains_cjk(text: str) -> bool:
     return bool(CJK_RE.search(text))
 
 
+def _contains_protected_source(
+    segment: dict,
+    protected_source_segment_ids: set[str] | None,
+) -> bool:
+    if not protected_source_segment_ids:
+        return False
+    source_ids = segment.get("sourceSegmentIds") or [segment.get("id")]
+    return bool(
+        {
+            str(source_id) for source_id in source_ids if source_id is not None
+        }.intersection(protected_source_segment_ids)
+    )
+
+
 def _join_text(left: str, right: str) -> str:
     left = str(left)
     right = str(right)
@@ -195,6 +215,8 @@ def _can_merge(left: dict, right: dict) -> bool:
         left.get("voiceId") == right.get("voiceId")
         and left.get("fallbackVoiceId") == right.get("fallbackVoiceId")
         and left.get("voiceDescription") == right.get("voiceDescription")
+        and left.get("voiceDesign") == right.get("voiceDesign")
+        and left.get("voiceDirection") == right.get("voiceDirection")
         and left.get("emotion", "neutral") == right.get("emotion", "neutral")
         and left.get("pace", "normal") == right.get("pace", "normal")
     )

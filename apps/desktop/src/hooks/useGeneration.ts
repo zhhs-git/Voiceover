@@ -1,17 +1,25 @@
-import { useCallback } from "react";
-import { flushSync } from "react-dom";
-import { invoke } from "../lib/platform";
+import { useCallback, useEffect, useRef } from "react";
 
 import type {
   AnalysisState,
+  AudioAsset,
   BookState,
   ChapterMeta,
   PipelineStage,
   ProgressDetail,
   WorkspaceStep,
 } from "../types";
-import { generationProgressDetails } from "../lib/generationProgress";
-import { synthesizeChapter } from "../lib/generation";
+import { audioAssetsFromArtifacts } from "../lib/audioAssets";
+import {
+  batchErrorMessage,
+  cancelBatchGeneration,
+  getActiveBatchGeneration,
+  getBatchGenerationStatus,
+  isActiveBatchGeneration,
+  startBatchGeneration,
+  type BatchGenerationResponse,
+} from "../lib/batchGeneration";
+import { workerCall } from "../lib/workerCall";
 
 interface UseGenerationDeps {
   book: BookState | null;
@@ -21,6 +29,7 @@ interface UseGenerationDeps {
   correctionState: { affectedChapters: string[]; dirty?: boolean };
   setStage: (stage: PipelineStage, owner?: string) => void;
   setError: (error: string | null, owner?: string) => void;
+  setSavedMessage: (message: string | null, owner?: string) => void;
   setAnalyzeProgress: (msg: string, owner?: string) => void;
   setProgressDetail: (details: ProgressDetail[], owner?: string) => void;
   setProgress: (progress: number, owner?: string) => void;
@@ -30,8 +39,39 @@ interface UseGenerationDeps {
       | ((prev: Record<string, string>) => Record<string, string>),
     owner?: string,
   ) => void;
+  setChapterMixedAudioPaths: (
+    paths:
+      | Record<string, string>
+      | ((prev: Record<string, string>) => Record<string, string>),
+    owner?: string,
+  ) => void;
+  setAudioAssets: (
+    assets:
+      | Record<string, AudioAsset[]>
+      | ((prev: Record<string, AudioAsset[]>) => Record<string, AudioAsset[]>),
+    owner?: string,
+  ) => void;
+  setGenerationBatch: (
+    batch:
+      | BatchGenerationResponse
+      | null
+      | ((prev: BatchGenerationResponse | null) => BatchGenerationResponse | null),
+    owner?: string,
+  ) => void;
   setCurrentStep: (step: WorkspaceStep) => void;
   abortRef: React.MutableRefObject<AbortController | null>;
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  voice: "原章节配音",
+  transcript: "Whisper 转录",
+  audio_plan: "背景音/音效规划",
+  stable_audio: "Stable Audio 背景音/音效",
+  mix: "最终混音",
+};
+
+function stageLabel(stage: string | null | undefined): string {
+  return (stage && STAGE_LABELS[stage]) || "准备中";
 }
 
 export function useGeneration(deps: UseGenerationDeps) {
@@ -43,190 +83,300 @@ export function useGeneration(deps: UseGenerationDeps) {
     correctionState,
     setStage,
     setError,
+    setSavedMessage,
     setAnalyzeProgress,
     setProgressDetail,
     setProgress,
     setChapterAudioPaths,
+    setChapterMixedAudioPaths,
+    setAudioAssets,
+    setGenerationBatch,
     setCurrentStep,
-    abortRef,
   } = deps;
+  const activeBatchIdRef = useRef<string | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
+  const requestInFlightRef = useRef(false);
+  const activeBookIdRef = useRef<string | null>(null);
 
-  const generateChapters = useCallback(
-    async (chaptersToGenerate: ChapterMeta[], cacheSegments = true) => {
-      if (!book || !analysis) return;
-      const controller = new AbortController();
-      abortRef.current = controller;
-      setStage("generating", book.bookId);
-      setError(null, book.bookId);
-      setAnalyzeProgress("", book.bookId);
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current !== null) {
+      window.clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
 
-      setProgressDetail([
-        { label: "后端", value: "MiMo V2.5 TTS 音色设计" },
-        { label: "章节", value: String(chaptersToGenerate.length) },
-      ], book.bookId);
+  const publishBatch = useCallback((response: BatchGenerationResponse, owner: string) => {
+    setGenerationBatch(response, owner);
+    const total = response.totalCount ?? response.chapters.length;
+    const completed = response.completedCount ?? response.chapters.filter((chapter) =>
+      ["succeeded", "failed", "cancelled"].includes(chapter.status),
+    ).length;
+    const current = response.chapters.find((chapter) => chapter.status === "running");
+    const title = current?.title || response.chapters.find((chapter) => chapter.chapterId === response.currentChapterId)?.title;
+    const stage = current?.currentStage ?? response.currentStage;
 
-      const startTime = Date.now();
-      let totalSegments = 0;
-      let doneSegments = 0;
-      const newAudioPaths: Record<string, string> = {};
+    setProgress(total > 0 ? Math.round((completed / total) * 100) : 0, owner);
+    setProgressDetail([
+      { label: "执行方式", value: "后端顺序队列（MiMo / Whisper / LLM / Stable Audio）" },
+      { label: "进度", value: `${completed} / ${total} 章` },
+      { label: "当前章节", value: title || "等待队列" },
+      { label: "当前阶段", value: stageLabel(stage) },
+    ], owner);
 
-      try {
-        for (let ci = 0; ci < chaptersToGenerate.length; ci++) {
-          if (controller.signal.aborted) break;
-          const chapter = chaptersToGenerate[ci];
-          const scriptPath = analysis.scriptPaths[chapter.id];
-          if (!scriptPath) continue;
-
-          const segDir = `${book.workDir}/segments/${chapter.id}`;
-          const assembledPath = `${book.workDir}/audio/${chapter.id}.wav`;
-
-          const scriptRaw = await invoke<string>("run_worker", {
-            command: "_read_file",
-            inputJson: JSON.stringify({ path: scriptPath }),
-          }).catch(() => "{}");
-
-          const script = JSON.parse(scriptRaw) as {
-            segments?: Array<{
-              id: string;
-              voiceId?: string;
-              emotion?: string;
-            }>;
-          };
-          const segments = script.segments ?? [];
-
-          setAnalyzeProgress(
-            `正在合成第 ${ci + 1} 章（共 ${chaptersToGenerate.length} 章，${segments.length} 个片段）…`,
-            book.bookId,
-          );
-          totalSegments += segments.length;
-
-          const setGenerationProgress = () => {
-            setProgress(
-              40 +
-                Math.round((doneSegments / Math.max(totalSegments, 1)) * 50),
-              book.bookId,
-            );
-            setProgressDetail(
-              generationProgressDetails({
-                now: Date.now(),
-                startTime,
-                doneSegments,
-                totalSegments,
-                chapterIndex: ci + 1,
-                chapterCount: chaptersToGenerate.length,
-                segmentCount: segments.length,
-              }),
-              book.bookId,
-            );
-          };
-
-          flushSync(() => {
-            setGenerationProgress();
-          });
-
-          const progressTimer = window.setInterval(setGenerationProgress, 2000);
-          let result: Record<string, unknown>;
-          try {
-            result = await synthesizeChapter({
-              scriptPath,
-              segmentAudioDirectory: segDir,
-              outputPath: assembledPath,
-              cacheSegments,
-            });
-          } finally {
-            window.clearInterval(progressTimer);
-          }
-
-          if (result.status !== "succeeded") {
-            const workerError = result.error as { message?: unknown } | undefined;
-            const message =
-              typeof workerError?.message === "string"
-                ? workerError.message
-                : `章节《${chapter.title}》音频生成失败。`;
-            throw new Error(message);
-          }
-          doneSegments += segments.length;
-          newAudioPaths[chapter.id] = assembledPath;
-        }
-
-        setChapterAudioPaths((prev) => ({ ...prev, ...newAudioPaths }), book.bookId);
-        const wasStopped = controller.signal.aborted;
-        setProgress(
-          wasStopped
-            ? 40 +
-                Math.round((doneSegments / Math.max(totalSegments, 1)) * 50)
-            : 100,
-          book.bookId,
-        );
-        setAnalyzeProgress(
-          wasStopped
-            ? "生成已停止，已有部分音频可用。"
-            : "音频生成完成。",
-          book.bookId,
-        );
-        const generatedCount = Object.keys(newAudioPaths).length;
-        setStage(generatedCount > 0 || !wasStopped ? "done" : "idle", book.bookId);
-        if (abortRef.current === controller) abortRef.current = null;
-        if (generatedCount > 0) setCurrentStep("done");
-      } catch (err) {
-        if (Object.keys(newAudioPaths).length > 0) {
-          setChapterAudioPaths((prev) => ({ ...prev, ...newAudioPaths }), book.bookId);
-        }
-        if (!controller.signal.aborted) {
-          setError(`音频生成失败：${String(err)}`, book.bookId);
-          setAnalyzeProgress("音频生成失败。", book.bookId);
-          setStage("error", book.bookId);
-          if (abortRef.current === controller) abortRef.current = null;
-        } else {
-          setAnalyzeProgress("生成已停止。", book.bookId);
-          setStage("idle", book.bookId);
-          if (abortRef.current === controller) abortRef.current = null;
-        }
+    setChapterAudioPaths((previous) => {
+      const next = { ...previous };
+      for (const chapter of response.chapters) {
+        if (chapter.voiceAudioPath) next[chapter.chapterId] = chapter.voiceAudioPath;
       }
-    },
-    [
-      book,
-      analysis,
-      abortRef,
-      setAnalyzeProgress,
-      setChapterAudioPaths,
-      setCurrentStep,
-      setError,
-      setProgress,
-      setProgressDetail,
-      setStage,
-    ],
-  );
+      return next;
+    }, owner);
+    setChapterMixedAudioPaths((previous) => {
+      const next = { ...previous };
+      for (const chapter of response.chapters) {
+        if (chapter.mixedAudioPath) next[chapter.chapterId] = chapter.mixedAudioPath;
+      }
+      return next;
+    }, owner);
+    setAudioAssets((previous) => {
+      const next = { ...previous };
+      for (const chapter of response.chapters) {
+        if (!chapter.audioAssets) continue;
+        next[chapter.chapterId] = audioAssetsFromArtifacts(chapter.audioAssets).map((asset) => ({
+          ...asset,
+          refreshKey: `${response.updatedAt ?? Date.now()}-${asset.kind}-${asset.assetId}`,
+        }));
+      }
+      return next;
+    }, owner);
+
+    if (isActiveBatchGeneration(response.status)) {
+      setStage("generating", owner);
+      setAnalyzeProgress(
+        title ? `正在处理《${title}》：${stageLabel(stage)}…` : "批量生成任务已在后端排队。",
+        owner,
+      );
+      return;
+    }
+
+    // A completed-with-errors batch may have produced usable audio for some
+    // chapters, but it must not look like a clean 100% success in the UI.
+    setProgress(
+      total > 0 ? Math.round((completed / total) * 100) : 100,
+      owner,
+    );
+    setProgressDetail([], owner);
+    if (response.status === "succeeded") {
+      setAnalyzeProgress(`批量生成完成：${response.succeededCount ?? total} 章已完成。`, owner);
+      setSavedMessage("原章节配音、背景音/音效和最终混音已全部生成。", owner);
+      setStage("done", owner);
+      setCurrentStep("done");
+    } else if (response.status === "completed_with_errors") {
+      const failures = response.chapters
+        .filter((chapter) => chapter.status === "failed")
+        .slice(0, 2)
+        .map((chapter) => `《${chapter.title}》：${chapter.error || "失败"}`)
+        .join("；");
+      setAnalyzeProgress(
+        `批量生成完成：${response.succeededCount ?? 0} 章成功，${response.failedCount ?? 0} 章失败。`,
+        owner,
+      );
+      setError(failures || "部分章节生成失败。", owner);
+      setStage("done", owner);
+    } else if (response.status === "cancelled") {
+      setAnalyzeProgress(`任务已停止，已完成 ${response.succeededCount ?? 0} 章。`, owner);
+      setStage("idle", owner);
+    } else {
+      setError(batchErrorMessage(response), owner);
+      setAnalyzeProgress("批量生成失败。", owner);
+      setStage("error", owner);
+    }
+  }, [
+    setAnalyzeProgress,
+    setAudioAssets,
+    setChapterAudioPaths,
+    setChapterMixedAudioPaths,
+    setCurrentStep,
+    setError,
+    setGenerationBatch,
+    setProgress,
+    setProgressDetail,
+    setSavedMessage,
+    setStage,
+  ]);
+
+  const pollBatch = useCallback(async (batchId: string, owner: string) => {
+    if (requestInFlightRef.current) return;
+    requestInFlightRef.current = true;
+    try {
+      const response = await getBatchGenerationStatus(batchId);
+      if (activeBookIdRef.current !== owner) return;
+      publishBatch(response, owner);
+      if (isActiveBatchGeneration(response.status)) {
+        pollTimerRef.current = window.setTimeout(() => {
+          void pollBatch(batchId, owner);
+        }, 1200);
+      } else {
+        activeBatchIdRef.current = null;
+        stopPolling();
+      }
+    } catch (error) {
+      if (activeBookIdRef.current === owner) {
+        setError(`无法读取批量生成进度：${String(error)}`, owner);
+        setStage("error", owner);
+      }
+      activeBatchIdRef.current = null;
+      stopPolling();
+    } finally {
+      requestInFlightRef.current = false;
+    }
+  }, [publishBatch, setError, setStage, stopPolling]);
+
+  const beginBatch = useCallback(async (chapterIds: string[], options: { force?: boolean; cacheSegments?: boolean } = {}) => {
+    if (!book || !analysis || chapterIds.length === 0) {
+      if (book) setError("请选择至少一个已分析章节。", book.bookId);
+      return;
+    }
+    const validIds = chapterIds.filter((chapterId) => Boolean(analysis.scriptPaths[chapterId]));
+    if (validIds.length === 0) {
+      setError("所选章节尚未完成文本分析，无法开始全流程生成。", book.bookId);
+      return;
+    }
+    stopPolling();
+    setError(null, book.bookId);
+    setSavedMessage(null, book.bookId);
+    setStage("generating", book.bookId);
+    setProgress(0, book.bookId);
+    setAnalyzeProgress("正在提交后端批量生成队列…", book.bookId);
+    try {
+      const response = await startBatchGeneration({
+        bookId: book.bookId,
+        chapterIds: validIds,
+        force: options.force === true,
+        cacheSegments: options.cacheSegments !== false,
+      });
+      if (!response.batchId) throw new Error(batchErrorMessage(response));
+      activeBatchIdRef.current = response.batchId;
+      activeBookIdRef.current = book.bookId;
+      publishBatch(response, book.bookId);
+      if (isActiveBatchGeneration(response.status)) void pollBatch(response.batchId, book.bookId);
+    } catch (error) {
+      setError(`无法启动批量生成：${String(error)}`, book.bookId);
+      setAnalyzeProgress("批量生成未启动。", book.bookId);
+      setStage("error", book.bookId);
+    }
+  }, [
+    analysis,
+    book,
+    pollBatch,
+    publishBatch,
+    setAnalyzeProgress,
+    setError,
+    setProgress,
+    setSavedMessage,
+    setStage,
+    stopPolling,
+  ]);
+
+  useEffect(() => {
+    activeBookIdRef.current = book?.bookId ?? null;
+    if (!book) return;
+    let cancelled = false;
+    void getActiveBatchGeneration(book.bookId)
+      .then((response) => {
+        if (cancelled || !response || !response.batchId || !isActiveBatchGeneration(response.status)) return;
+        activeBatchIdRef.current = response.batchId;
+        publishBatch(response, book.bookId);
+        void pollBatch(response.batchId, book.bookId);
+      })
+      .catch(() => {
+        // Opening a book must remain possible if an older backend is offline.
+      });
+    return () => {
+      cancelled = true;
+      stopPolling();
+    };
+  }, [book?.bookId, pollBatch, publishBatch, stopPolling]);
 
   const handleGenerate = useCallback(async () => {
     if (!book || !analysis) return;
-    const chaptersToGenerate = (
-      correctionState.affectedChapters.length > 0
-        ? book.chapters.filter((c) =>
-            correctionState.affectedChapters.includes(c.id),
-          )
-        : book.chapters
-    ).filter(
-      (c) => selectedChapters.has(c.id) && analysis.scriptPaths[c.id],
-    );
+    // A Set keeps checkbox insertion order, which can differ from the book's
+    // chapter order when people select chapters out of order. The backend queue
+    // must always follow the book timeline.
+    const selected = book.chapters
+      .map((chapter) => chapter.id)
+      .filter((chapterId) => selectedChapters.has(chapterId) && analysis.scriptPaths[chapterId]);
+    const chapterIds = correctionState.affectedChapters.length > 0
+      ? selected.filter((chapterId) => correctionState.affectedChapters.includes(chapterId))
+      : selected;
+    await beginBatch(chapterIds);
+  }, [analysis, beginBatch, book, correctionState.affectedChapters, selectedChapters]);
 
-    await generateChapters(chaptersToGenerate);
-  }, [book, analysis, correctionState.affectedChapters, selectedChapters, generateChapters]);
+  const handleStopGeneration = useCallback(async () => {
+    const batchId = activeBatchIdRef.current;
+    if (!book || !batchId) return;
+    try {
+      const response = await cancelBatchGeneration(batchId);
+      publishBatch(response, book.bookId);
+      setAnalyzeProgress("已请求停止；正在完成当前 worker 阶段后停止后续章节。", book.bookId);
+    } catch (error) {
+      setError(`停止批量生成失败：${String(error)}`, book.bookId);
+    }
+  }, [book, publishBatch, setAnalyzeProgress, setError]);
 
-  const handleRegenerateChapter = useCallback(
-    async (chapter: ChapterMeta) => {
-      await generateChapters([chapter], false);
-    },
-    [generateChapters],
-  );
+  const handleRegenerateChapter = useCallback(async (chapter: ChapterMeta) => {
+    await beginBatch([chapter.id], { force: true, cacheSegments: false });
+  }, [beginBatch]);
 
   const handleRegenerateAll = useCallback(async () => {
     if (!book) return;
-    const generatedChapters = book.chapters.filter(
-      (c) => chapterAudioPaths[c.id],
-    );
-    await generateChapters(generatedChapters, false);
-  }, [book, chapterAudioPaths, generateChapters]);
+    const chapterIds = book.chapters
+      .filter((chapter) => chapterAudioPaths[chapter.id])
+      .map((chapter) => chapter.id);
+    await beginBatch(chapterIds, { force: true, cacheSegments: false });
+  }, [beginBatch, book, chapterAudioPaths]);
 
-  return { handleGenerate, handleRegenerateChapter, handleRegenerateAll };
+  const handleRegenerateAudioAsset = useCallback(async (asset: AudioAsset, chapter: ChapterMeta) => {
+    if (!book || !analysis?.scriptPaths[chapter.id]) return;
+    setStage("generating", book.bookId);
+    setError(null, book.bookId);
+    setAnalyzeProgress(`正在本地重新生成 ${asset.kind === "music" ? "背景音乐" : "音效"} ${asset.assetId}…`, book.bookId);
+    try {
+      const result = await workerCall("generate_audio_assets", {
+        bookId: book.bookId,
+        chapterId: chapter.id,
+        scriptPath: analysis.scriptPaths[chapter.id],
+        outputDirectory: `${book.workDir}/audio-assets/${chapter.id}`,
+        mixedOutputPath: `${book.workDir}/audio/${chapter.id}_mixed.wav`,
+        force: true,
+        assetId: asset.assetId,
+        assetKind: asset.kind,
+      });
+      if (result.status !== "succeeded") {
+        throw new Error((result.error as { message?: string })?.message || "背景音/音效生成失败。");
+      }
+      const assets = audioAssetsFromArtifacts(result.artifacts).map((item) => ({
+        ...item,
+        refreshKey: `${Date.now()}-${item.kind}-${item.assetId}`,
+      }));
+      setAudioAssets((previous) => ({ ...previous, [chapter.id]: assets }), book.bookId);
+      setChapterMixedAudioPaths((previous) => {
+        const next = { ...previous };
+        delete next[chapter.id];
+        return next;
+      }, book.bookId);
+      setSavedMessage("背景音/音效已重新生成；可选择该章节重新执行全流程生成最终混音。", book.bookId);
+      setStage("idle", book.bookId);
+    } catch (error) {
+      setError(`背景音/音效生成失败：${String(error)}`, book.bookId);
+      setStage("error", book.bookId);
+    }
+  }, [analysis, book, setAnalyzeProgress, setAudioAssets, setChapterMixedAudioPaths, setError, setSavedMessage, setStage]);
+
+  return {
+    handleGenerate,
+    handleStopGeneration,
+    handleRegenerateAudioAsset,
+    handleRegenerateChapter,
+    handleRegenerateAll,
+  };
 }
