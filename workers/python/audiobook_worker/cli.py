@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import wave
@@ -42,6 +43,8 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     ParlerTTSBackend,
+    is_retryable_mimo_error,
+    mimo_tts_concurrency,
     voice_options,
 )
 from audiobook_worker.transcription import (
@@ -982,6 +985,58 @@ def _tts_segments_for_request(
     )
 
 
+def _segment_artifact_payload(
+    segment: dict[str, Any],
+    artifact: Any,
+    *,
+    output_directory: Path,
+    signature: str,
+    backend_name: str,
+    model_id: str | None,
+    cache_segments: bool,
+    device: str | None,
+) -> dict[str, Any]:
+    """Validate and serialize one TTS result without changing timeline order."""
+    expected_audio_path = output_directory / f"{segment['id']}.wav"
+    try:
+        artifact_path = Path(artifact.path)
+    except (TypeError, ValueError) as error:
+        expected_audio_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"TTS returned an invalid audio path for segment {segment['id']}: {error}"
+        ) from error
+    if artifact_path.resolve() != expected_audio_path.resolve() or not _is_readable_wav(
+        expected_audio_path
+    ):
+        expected_audio_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"TTS did not create a readable WAV for segment {segment['id']}."
+        )
+
+    source_segment_ids = segment.get("sourceSegmentIds", [segment["id"]])
+    if cache_segments:
+        _write_segment_cache_metadata(
+            artifact.path,
+            signature=signature,
+            duration_seconds=artifact.duration_seconds,
+            backend_name=backend_name,
+            model_id=model_id,
+            device=device,
+            source_segment_ids=source_segment_ids,
+        )
+    return {
+        "kind": artifact.kind,
+        "path": str(artifact.path),
+        "metadata": {
+            "segmentId": segment["id"],
+            "durationSeconds": artifact.duration_seconds,
+            "device": device,
+            "sourceSegmentIds": source_segment_ids,
+            "cacheHit": False,
+        },
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="audiobook-worker",
@@ -1826,9 +1881,10 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                 backend = MockTTSBackend()
         return backend
 
-    artifacts = []
+    artifacts_by_index: dict[int, dict[str, Any]] = {}
+    pending_segments: list[tuple[int, dict[str, Any], str]] = []
     expected_audio_paths = {output_directory / f"{segment['id']}.wav" for segment in segments}
-    for segment in segments:
+    for index, segment in enumerate(segments):
         expected_audio_path = output_directory / f"{segment['id']}.wav"
         signature = _segment_cache_signature(
             segment,
@@ -1844,81 +1900,138 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                 signature,
             )
             if cached_artifact is not None:
-                artifacts.append(cached_artifact)
+                artifacts_by_index[index] = cached_artifact
                 continue
 
         # A failed retry must not leave an older artifact at the same path for
         # a later assembly step to mistake for the newly requested audio.
         expected_audio_path.unlink(missing_ok=True)
         _segment_cache_metadata_path(expected_audio_path).unlink(missing_ok=True)
-        try:
-            active_backend = get_backend()
-            artifact = active_backend.synthesize_segment(segment, output_directory)
-        except Exception as error:
+        pending_segments.append((index, segment, signature))
+
+    active_backend = None
+    if pending_segments:
+        active_backend = get_backend()
+        prepare_voice_profiles = getattr(active_backend, "prepare_voice_profiles", None)
+        if backend_name == "mimo" and callable(prepare_voice_profiles):
+            profile_directory = request.get("voiceProfileDirectory")
+            try:
+                prepare_voice_profiles(
+                    [segment for _, segment, _ in pending_segments],
+                    (
+                        profile_directory
+                        if isinstance(profile_directory, str)
+                        else output_directory / ".voice-profiles"
+                    ),
+                )
+            except Exception as error:
+                failed_segment = pending_segments[0][1]
+                finish_voice("failed", str(error))
+                return _response(
+                    "failed",
+                    error={
+                        "code": "tts_synthesis_failed",
+                        "message": str(error),
+                        "details": {"segmentId": failed_segment["id"]},
+                    },
+                )
+
+        def synthesize_pending(
+            item: tuple[int, dict[str, Any], str],
+        ) -> tuple[int, Any]:
+            index, segment, _ = item
+            return index, active_backend.synthesize_segment(segment, output_directory)
+
+        # Local backends retain their sequential execution. MiMo requests are
+        # network-bound and each has its own output file, so they can safely
+        # overlap after the reference profiles have been prepared above.
+        concurrent_mimo = backend_name == "mimo" and callable(prepare_voice_profiles)
+        concurrency = mimo_tts_concurrency() if concurrent_mimo else 1
+        results: dict[int, Any] = {}
+        failures: dict[int, Exception] = {}
+        if concurrency > 1 and len(pending_segments) > 1:
+            with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="mimo-tts") as executor:
+                futures = {
+                    executor.submit(synthesize_pending, item): item[0]
+                    for item in pending_segments
+                }
+                for future, index in ((future, futures[future]) for future in futures):
+                    try:
+                        result_index, artifact = future.result()
+                        results[result_index] = artifact
+                    except Exception as error:  # collected for safe serial fallback
+                        failures[index] = error
+        else:
+            for item in pending_segments:
+                index = item[0]
+                try:
+                    result_index, artifact = synthesize_pending(item)
+                    results[result_index] = artifact
+                except Exception as error:
+                    failures[index] = error
+                    break
+
+        # A transient *concurrent MiMo* failure gets exactly one serial
+        # fallback. Completed futures are intentionally not retried or
+        # overwritten. Known permanent MiMo 4xx failures (for example bad
+        # credentials) are deliberately not sent again. Local backends retain
+        # their previous fail-fast path.
+        if concurrent_mimo and concurrency > 1:
+            for index, segment, _ in pending_segments:
+                if index not in failures:
+                    continue
+                if not is_retryable_mimo_error(failures[index]):
+                    continue
+                expected_audio_path = output_directory / f"{segment['id']}.wav"
+                expected_audio_path.unlink(missing_ok=True)
+                _segment_cache_metadata_path(expected_audio_path).unlink(missing_ok=True)
+                try:
+                    _, artifact = synthesize_pending((index, segment, ""))
+                    results[index] = artifact
+                    del failures[index]
+                except Exception as error:
+                    failures[index] = error
+
+        if failures:
+            failed_index = min(failures)
+            failed_segment = segments[failed_index]
+            expected_audio_path = output_directory / f"{failed_segment['id']}.wav"
             expected_audio_path.unlink(missing_ok=True)
-            finish_voice("failed", str(error))
+            finish_voice("failed", str(failures[failed_index]))
             return _response(
                 "failed",
                 error={
                     "code": "tts_synthesis_failed",
-                    "message": str(error),
-                    "details": {"segmentId": segment["id"]},
-                },
-            )
-
-        try:
-            artifact_path = Path(artifact.path)
-        except (TypeError, ValueError) as error:
-            expected_audio_path.unlink(missing_ok=True)
-            finish_voice("failed", str(error))
-            return _response(
-                "failed",
-                error={
-                    "code": "invalid_segment_audio",
-                    "message": f"TTS returned an invalid audio path for segment {segment['id']}: {error}",
-                    "details": {"segmentId": segment["id"]},
-                },
-            )
-        if artifact_path.resolve() != expected_audio_path.resolve() or not _is_readable_wav(
-            expected_audio_path
-        ):
-            expected_audio_path.unlink(missing_ok=True)
-            finish_voice(
-                "failed",
-                f"TTS did not create a readable WAV for segment {segment['id']}.",
-            )
-            return _response(
-                "failed",
-                error={
-                    "code": "invalid_segment_audio",
-                    "message": f"TTS did not create a readable WAV for segment {segment['id']}.",
-                    "details": {"segmentId": segment["id"]},
+                    "message": str(failures[failed_index]),
+                    "details": {"segmentId": failed_segment["id"]},
                 },
             )
 
         device = getattr(active_backend, "_device", None)
-        source_segment_ids = segment.get("sourceSegmentIds", [segment["id"]])
-        if cache_segments:
-            _write_segment_cache_metadata(
-                artifact.path,
-                signature=signature,
-                duration_seconds=artifact.duration_seconds,
-                backend_name=backend_name,
-                model_id=model_id,
-                device=device,
-                source_segment_ids=source_segment_ids,
-            )
-        artifacts.append({
-            "kind": artifact.kind,
-            "path": str(artifact.path),
-            "metadata": {
-                "segmentId": segment["id"],
-                "durationSeconds": artifact.duration_seconds,
-                "device": device,
-                "sourceSegmentIds": source_segment_ids,
-                "cacheHit": False,
-            },
-        })
+        for index, segment, signature in pending_segments:
+            try:
+                artifacts_by_index[index] = _segment_artifact_payload(
+                    segment,
+                    results[index],
+                    output_directory=output_directory,
+                    signature=signature,
+                    backend_name=backend_name,
+                    model_id=model_id,
+                    cache_segments=cache_segments,
+                    device=device,
+                )
+            except ValueError as error:
+                finish_voice("failed", str(error))
+                return _response(
+                    "failed",
+                    error={
+                        "code": "invalid_segment_audio",
+                        "message": str(error),
+                        "details": {"segmentId": segment["id"]},
+                    },
+                )
+
+    artifacts = [artifacts_by_index[index] for index in range(len(segments)) if index in artifacts_by_index]
 
     missing_audio = [
         segment["id"]

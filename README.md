@@ -216,6 +216,22 @@ export AUDIOBOOK_TTS_DEVICE="auto"  # auto、mps、cuda 或 cpu
 当前浏览器生成流程使用 MiMo，因此浏览器生成音频需要配置 `MIMO_API_KEY`。
 设备变量只适用于基于 PyTorch 的本地 TTS 后端。
 
+### MiMo 批量配音并发
+
+网页端批量生成保留逐句的情绪、语速和动态演绎指导，但默认会并发两个 MiMo
+片段请求以缩短等待时间。每个角色的 voice-clone 参考音频始终先串行建立或复用，
+不会在并发过程中改变角色的固定音色。
+
+```bash
+export AUDIOBOOK_MIMO_CONCURRENCY="2"          # 1–4，默认 2；设为 1 可回退为串行
+export AUDIOBOOK_MIMO_MAX_ATTEMPTS="3"          # 单个网络请求最多尝试次数，1–5
+export AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS="0.75"  # 重试的指数退避基准秒数
+```
+
+仅 MiMo 云端 TTS 使用此并发设置；Kokoro、Parler、Whisper 和 Stable Audio 仍按原有
+本地资源限制运行。遇到瞬时并发失败时，系统只会单路重试失败片段一次，已成功片段
+不会重复生成。
+
 ## 项目结构
 
 ```text

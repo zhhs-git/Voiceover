@@ -8,6 +8,8 @@ import math
 import os
 import re
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -68,6 +70,61 @@ _MIMO_REFERENCE_TEXT = (
     "不要刻意表演，也不要改变自己的基础音色。"
 )
 _MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
+
+
+class MiMoRequestError(RuntimeError):
+    """A MiMo request failure with an explicit retry policy for callers."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def is_retryable_mimo_error(error: BaseException) -> bool:
+    """Keep permanent provider rejections out of the chapter fallback retry.
+
+    Backends injected by integrations or tests may still raise an ordinary
+    exception. Treat those as retryable once so the chapter-level fallback
+    remains resilient, while known MiMo authentication/request failures stop
+    immediately.
+    """
+    return not isinstance(error, MiMoRequestError) or error.retryable
+
+
+def _bounded_positive_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+    """Parse a runtime integer setting without allowing unsafe values."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _mimo_max_attempts() -> int:
+    return _bounded_positive_int(
+        os.environ.get("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "3"),
+        default=3,
+        minimum=1,
+        maximum=5,
+    )
+
+
+def mimo_tts_concurrency() -> int:
+    """Return the safe per-chapter concurrency limit for cloud MiMo TTS."""
+    return _bounded_positive_int(
+        os.environ.get("AUDIOBOOK_MIMO_CONCURRENCY", "2"),
+        default=2,
+        minimum=1,
+        maximum=4,
+    )
+
+
+def _mimo_retry_backoff_seconds() -> float:
+    try:
+        value = float(os.environ.get("AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS", "0.75"))
+    except (TypeError, ValueError):
+        value = 0.75
+    return max(0.0, min(10.0, value))
 
 _MIMO_VOICE_DESIGNS: dict[str, str] = {
     "narrator_default": "角色：一位专业中文有声书旁白，固定为同一位成年女性。声音洪亮饱满而温暖、柔和、清晰，气息稳定，胸腔共鸣自然，口腔共鸣自然，咬字清楚；保持稳定统一的旁白声线，连贯耐听，不代入任何角色，不使用夸张播音腔。",
@@ -165,6 +222,10 @@ class MiMoTTSBackend:
         )
         self._reference_model_id = reference_model_id
         self._reference_audio_cache: dict[str, str] = {}
+        # Profile creation writes both WAV and JSON sidecar files. Keep the
+        # whole check/create/replace sequence atomic when segment synthesis is
+        # later dispatched across threads.
+        self._voice_profile_lock = threading.RLock()
 
     def synthesize_segment(self, segment: dict, output_directory: Path | str) -> AudioArtifact:
         directory = Path(output_directory)
@@ -184,6 +245,35 @@ class MiMoTTSBackend:
             output_path.unlink(missing_ok=True)
             raise RuntimeError("MiMo returned an unreadable WAV audio file.") from error
         return AudioArtifact("segment_audio", output_path, duration)
+
+    def prepare_voice_profiles(
+        self,
+        segments: list[dict],
+        profile_directory: Path | str | None = None,
+    ) -> None:
+        """Create/read all required clone profiles before TTS threads start.
+
+        Reference generation is intentionally serialized. Besides avoiding
+        duplicate provider requests, this prevents two threads from replacing
+        the same WAV/metadata pair while the other thread is reading it.
+        """
+        if self._model_id != _MIMO_VOICE_CLONE_MODEL_ID:
+            return
+        directory = Path(profile_directory) if profile_directory else self._voice_profile_directory
+        if directory is None:
+            directory = Path(".voice-profiles")
+        seen_signatures: set[str] = set()
+        for segment in segments:
+            voice_id, _, description = self._voice_context(segment)
+            signature = _voice_profile_signature(
+                voice_id=voice_id,
+                description=description,
+                reference_model_id=self._reference_model_id,
+            )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            self._ensure_voice_sample(segment, directory)
 
     def _voice_context(self, segment: dict) -> tuple[str, bool, str]:
         voice_id = segment.get("voiceId", "narrator_default")
@@ -263,110 +353,133 @@ class MiMoTTSBackend:
         }
 
     def _ensure_voice_sample(self, segment: dict, profile_directory: Path) -> str:
-        voice_id, is_narrator, description = self._voice_context(segment)
-        profile_directory.mkdir(parents=True, exist_ok=True)
-        profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
-        metadata_path = profile_path.with_suffix(".json")
-        signature = _voice_profile_signature(
-            voice_id=voice_id,
-            description=description,
-            reference_model_id=self._reference_model_id,
-        )
+        with self._voice_profile_lock:
+            voice_id, is_narrator, description = self._voice_context(segment)
+            profile_directory.mkdir(parents=True, exist_ok=True)
+            profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
+            metadata_path = profile_path.with_suffix(".json")
+            signature = _voice_profile_signature(
+                voice_id=voice_id,
+                description=description,
+                reference_model_id=self._reference_model_id,
+            )
 
-        cached = self._reference_audio_cache.get(signature)
-        if cached and _is_readable_wav(profile_path):
-            return cached
+            cached = self._reference_audio_cache.get(signature)
+            if cached and _is_readable_wav(profile_path):
+                return cached
 
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            metadata = {}
-        if (
-            metadata.get("signature") == signature
-            and metadata.get("version") == _MIMO_VOICE_PROFILE_VERSION
-            and _is_readable_wav(profile_path)
-        ):
-            data_uri = _audio_data_uri(profile_path.read_bytes())
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+            if (
+                metadata.get("signature") == signature
+                and metadata.get("version") == _MIMO_VOICE_PROFILE_VERSION
+                and _is_readable_wav(profile_path)
+            ):
+                data_uri = _audio_data_uri(profile_path.read_bytes())
+                self._reference_audio_cache[signature] = data_uri
+                return data_uri
+
+            # This request deliberately excludes the current segment's scene,
+            # emotion, and pace. It creates the stable identity anchor reused by
+            # every chapter and every subsequent segment for this voice.
+            fixed_design = description
+            if not fixed_design.startswith(("角色：", "角色:")):
+                fixed_design = f"角色：{fixed_design}"
+            reference_request = {
+                "model": self._reference_model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{fixed_design}\n\n"
+                            "指导：生成一段自然、稳定、克制的基础音色参考样本。"
+                            "只建立固定的性别、年龄、音高、音色、共鸣、气息和咬字基线；"
+                            "不要加入临时场景、明显情绪、角色模仿、夸张表演或后期效果。"
+                        ),
+                    },
+                    {"role": "assistant", "content": _MIMO_REFERENCE_TEXT},
+                ],
+                "audio": {"format": "wav", "optimize_text_preview": False},
+            }
+            encoded_reference = self._request_audio(reference_request)
+            reference_bytes = _decode_mimo_wav(encoded_reference, "MiMo voice design")
+            # Validate before replacing an existing profile so a failed refresh
+            # never destroys the last known-good identity anchor.
+            temporary_path = profile_path.with_name(f".{profile_path.name}.tmp")
+            try:
+                temporary_path.write_bytes(reference_bytes)
+                if not _is_readable_wav(temporary_path):
+                    raise RuntimeError("MiMo voice design returned an unreadable reference WAV.")
+                temporary_path.replace(profile_path)
+                metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "version": _MIMO_VOICE_PROFILE_VERSION,
+                            "signature": signature,
+                            "voiceId": voice_id,
+                            "voiceDesign": description,
+                            "referenceModel": self._reference_model_id,
+                            "referenceText": _MIMO_REFERENCE_TEXT,
+                            "isNarrator": is_narrator,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+            data_uri = _audio_data_uri(reference_bytes)
             self._reference_audio_cache[signature] = data_uri
             return data_uri
 
-        # This request deliberately excludes the current segment's scene,
-        # emotion, and pace. It creates the stable identity anchor reused by
-        # every chapter and every subsequent segment for this voice.
-        fixed_design = description
-        if not fixed_design.startswith(("角色：", "角色:")):
-            fixed_design = f"角色：{fixed_design}"
-        reference_request = {
-            "model": self._reference_model_id,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"{fixed_design}\n\n"
-                        "指导：生成一段自然、稳定、克制的基础音色参考样本。"
-                        "只建立固定的性别、年龄、音高、音色、共鸣、气息和咬字基线；"
-                        "不要加入临时场景、明显情绪、角色模仿、夸张表演或后期效果。"
-                    ),
-                },
-                {"role": "assistant", "content": _MIMO_REFERENCE_TEXT},
-            ],
-            "audio": {"format": "wav", "optimize_text_preview": False},
-        }
-        encoded_reference = self._request_audio(reference_request)
-        reference_bytes = _decode_mimo_wav(encoded_reference, "MiMo voice design")
-        # Validate before replacing an existing profile so a failed refresh
-        # never destroys the last known-good identity anchor.
-        temporary_path = profile_path.with_name(f".{profile_path.name}.tmp")
-        try:
-            temporary_path.write_bytes(reference_bytes)
-            if not _is_readable_wav(temporary_path):
-                raise RuntimeError("MiMo voice design returned an unreadable reference WAV.")
-            temporary_path.replace(profile_path)
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "version": _MIMO_VOICE_PROFILE_VERSION,
-                        "signature": signature,
-                        "voiceId": voice_id,
-                        "voiceDesign": description,
-                        "referenceModel": self._reference_model_id,
-                        "referenceText": _MIMO_REFERENCE_TEXT,
-                        "isNarrator": is_narrator,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        finally:
-            temporary_path.unlink(missing_ok=True)
-
-        data_uri = _audio_data_uri(reference_bytes)
-        self._reference_audio_cache[signature] = data_uri
-        return data_uri
-
     def _request_audio_from_api(self, payload: dict) -> str:
-        request = urllib.request.Request(
-            _MIMO_ENDPOINT,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "api-key": self._api_key,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:500]
-            raise RuntimeError(f"MiMo API request failed with HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, TimeoutError) as error:
-            raise RuntimeError(f"MiMo API request failed: {error}") from error
-        try:
-            return result["choices"][0]["message"]["audio"]["data"]
-        except (KeyError, IndexError, TypeError) as error:
-            raise RuntimeError("MiMo response did not contain choices[0].message.audio.data.") from error
+        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        max_attempts = _mimo_max_attempts()
+        backoff_seconds = _mimo_retry_backoff_seconds()
+        last_error: MiMoRequestError | None = None
+        for attempt in range(1, max_attempts + 1):
+            request = urllib.request.Request(
+                _MIMO_ENDPOINT,
+                data=encoded_payload,
+                headers={
+                    "api-key": self._api_key,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                try:
+                    return result["choices"][0]["message"]["audio"]["data"]
+                except (KeyError, IndexError, TypeError) as error:
+                    raise RuntimeError(
+                        "MiMo response did not contain choices[0].message.audio.data."
+                    ) from error
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                last_error = MiMoRequestError(
+                    f"MiMo API request failed with HTTP {error.code}: {detail}",
+                    retryable=error.code in {408, 425, 429} or error.code >= 500,
+                )
+                if not last_error.retryable or attempt >= max_attempts:
+                    raise last_error from error
+            except (urllib.error.URLError, TimeoutError) as error:
+                last_error = MiMoRequestError(
+                    f"MiMo API request failed: {error}", retryable=True
+                )
+                if attempt >= max_attempts:
+                    raise last_error from error
+
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            if delay > 0:
+                time.sleep(delay)
+
+        raise last_error or RuntimeError("MiMo API request failed.")
 
 
 def _safe_voice_profile_name(voice_id: str) -> str:

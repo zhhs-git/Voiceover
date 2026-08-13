@@ -42,6 +42,15 @@ function chapterDetail(chapter: BatchGenerationChapter): string {
   return chapter.status === "running" && stage ? `正在${stage}` : "";
 }
 
+function chapterTimingTitle(chapter: BatchGenerationChapter): string | undefined {
+  const timings = chapter.stageTimings;
+  if (!timings || Object.keys(timings).length === 0) return undefined;
+  return Object.entries(timings)
+    .filter(([, seconds]) => typeof seconds === "number" && Number.isFinite(seconds))
+    .map(([stage, seconds]) => `${stageLabel(stage) ?? stage}：${formatBatchElapsed(seconds)}`)
+    .join("；");
+}
+
 function isActiveBatch(status: BatchGenerationStatus): boolean {
   return status === "queued" || status === "running";
 }
@@ -125,6 +134,10 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
       <div className="batch-generation-chapter-list" role="list">
         {batch.chapters.map((chapter) => {
           const detail = chapterDetail(chapter);
+          const duration = typeof chapter.durationSeconds === "number" && Number.isFinite(chapter.durationSeconds)
+            ? formatBatchElapsed(chapter.durationSeconds)
+            : null;
+          const timingTitle = chapterTimingTitle(chapter);
           return (
             <div className={`batch-generation-chapter batch-chapter-${chapter.status}`} key={chapter.chapterId} role="listitem">
               <span className="batch-generation-position">{chapter.position + 1}</span>
@@ -132,6 +145,11 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
               <span className={`batch-generation-chapter-status batch-chapter-${chapter.status}`}>
                 {CHAPTER_STATUS_LABELS[chapter.status]}
               </span>
+              {duration && (
+                <span className="batch-generation-duration" title={timingTitle}>
+                  耗时 {duration}
+                </span>
+              )}
               {detail && <span className="batch-generation-detail" title={detail}>{detail}</span>}
             </div>
           );

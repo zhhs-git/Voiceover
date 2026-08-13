@@ -27,6 +27,8 @@ export interface BatchGenerationChapter {
   audioAssets?: Array<Record<string, unknown>>;
   startedAt?: number | null;
   completedAt?: number | null;
+  durationSeconds?: number | null;
+  stageTimings?: Record<string, number>;
 }
 
 export interface BatchGenerationResponse {

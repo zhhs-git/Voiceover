@@ -307,6 +307,54 @@ def test_batch_generation_runs_chapters_in_order_and_persists_outputs(
     state.close()
 
 
+def test_batch_generation_persists_stage_and_chapter_durations(tmp_path: Path, monkeypatch):
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001",))
+
+    def fake_worker(command: str, request: dict[str, object]):
+        time.sleep(0.002)
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    started = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001"]}
+    )
+    finished = _wait_for_batch(
+        state, str(started["batchId"]), lambda response: response["status"] == "succeeded"
+    )
+
+    chapter = finished["chapters"][0]
+    assert isinstance(chapter["durationSeconds"], float)
+    assert chapter["durationSeconds"] > 0
+    assert set(chapter["stageTimings"]) == {
+        "voice", "transcript", "audio_plan", "stable_audio", "mix"
+    }
+    # Voice has synthesis plus assembly, so it must accumulate both commands.
+    assert chapter["stageTimings"]["voice"] >= 0.004
+    state.close()
+
+
+def test_batch_generation_upgrades_legacy_database_with_timing_columns(tmp_path: Path):
+    database_path = tmp_path / "audiobook.db"
+    connection = __import__("sqlite3").connect(database_path)
+    connection.execute(
+        "CREATE TABLE generation_batch_chapters ("
+        "batch_id TEXT, chapter_id TEXT, position INTEGER, status TEXT, current_stage TEXT, "
+        "error TEXT, voice_audio_path TEXT, mixed_audio_path TEXT, audio_assets_json TEXT, "
+        "started_at REAL, completed_at REAL, updated_at REAL, PRIMARY KEY (batch_id, chapter_id))"
+    )
+    connection.commit()
+    connection.close()
+
+    state = ServerState(tmp_path)
+    columns = {
+        row[1]
+        for row in state.db.execute("PRAGMA table_info(generation_batch_chapters)").fetchall()
+    }
+    assert {"duration_seconds", "stage_timings_json"} <= columns
+    state.close()
+
+
 def test_batch_generation_continues_after_one_chapter_failure(tmp_path: Path, monkeypatch):
     state = ServerState(tmp_path)
     _seed_batch_book(state, ("chapter_001", "chapter_002"))

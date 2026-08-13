@@ -99,4 +99,27 @@ describe("BatchGenerationStatusList", () => {
     expect(screen.getByText("已完成（有失败）")).toBeInTheDocument();
     expect(screen.getByText("LLM 请求超时")).toBeInTheDocument();
   });
+
+  it("shows persisted chapter duration and exposes per-stage timing details", () => {
+    render(
+      <BatchGenerationStatusList
+        batch={{
+          status: "succeeded",
+          chapters: [{
+            chapterId: "chapter_001",
+            title: "第一章",
+            position: 0,
+            status: "succeeded",
+            durationSeconds: 75,
+            stageTimings: { voice: 25, transcript: 10, audio_plan: 40 },
+          }],
+        }}
+      />,
+    );
+
+    const duration = screen.getByText("耗时 1 分 15 秒");
+    expect(duration).toBeInTheDocument();
+    expect(duration).toHaveAttribute("title", expect.stringContaining("原章节配音：25 秒"));
+    expect(duration).toHaveAttribute("title", expect.stringContaining("背景音/音效规划：40 秒"));
+  });
 });

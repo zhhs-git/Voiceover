@@ -129,7 +129,7 @@ export function useGeneration(deps: UseGenerationDeps) {
 
     setProgress(total > 0 ? Math.round((completed / total) * 100) : 0, owner);
     setProgressDetail([
-      { label: "执行方式", value: "后端顺序队列（MiMo / Whisper / LLM / Stable Audio）" },
+      { label: "执行方式", value: "章节顺序队列（MiMo 片段受控并发 / Whisper / LLM / Stable Audio）" },
       { label: "进度", value: `${completed} / ${total} 章` },
       { label: "当前章节", value: title || "等待队列" },
       { label: "当前阶段", value: stageLabel(stage) },

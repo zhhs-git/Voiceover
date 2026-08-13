@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mimetypes
 import os
 import re
@@ -107,8 +108,35 @@ class BatchGenerationJob:
     thread: threading.Thread | None = field(default=None, repr=False)
 
 
+_BATCH_GENERATION_STAGES = frozenset(
+    {"voice", "transcript", "audio_plan", "stable_audio", "mix"}
+)
+
+
 def is_generic_character_key(value: object) -> bool:
     return character_name_key(value) in GENERIC_CHARACTER_KEYS
+
+
+def _batch_stage_timings(value: object) -> dict[str, float]:
+    """Read persisted batch timings defensively, preserving only known stages."""
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    timings: dict[str, float] = {}
+    for stage, raw_seconds in parsed.items():
+        if stage not in _BATCH_GENERATION_STAGES or isinstance(raw_seconds, bool):
+            continue
+        if not isinstance(raw_seconds, (int, float)):
+            continue
+        seconds = float(raw_seconds)
+        if math.isfinite(seconds) and seconds >= 0:
+            timings[stage] = round(seconds, 3)
+    return timings
 
 
 def character_aliases(value: object) -> list[str]:
@@ -231,6 +259,8 @@ class ServerState:
                     audio_assets_json TEXT,
                     started_at REAL,
                     completed_at REAL,
+                    duration_seconds REAL,
+                    stage_timings_json TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (batch_id, chapter_id)
                 );
@@ -258,6 +288,13 @@ class ServerState:
                     "voice_profile": "TEXT",
                     "fallback_voice_id": "TEXT",
                     "voice_description": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                "generation_batch_chapters",
+                {
+                    "duration_seconds": "REAL",
+                    "stage_timings_json": "TEXT",
                 },
             )
             self.db.commit()
@@ -718,6 +755,8 @@ class ServerState:
                     "audioAssets": self._batch_artifacts(row["audio_assets_json"]),
                     "startedAt": row["started_at"],
                     "completedAt": row["completed_at"],
+                    "durationSeconds": row["duration_seconds"],
+                    "stageTimings": _batch_stage_timings(row["stage_timings_json"]),
                 }
             )
         return {
@@ -800,7 +839,8 @@ class ServerState:
                 )
                 self.db.execute(
                     "UPDATE generation_batch_chapters SET status = 'queued', current_stage = NULL, "
-                    "started_at = NULL, updated_at = ? WHERE batch_id = ? AND status = 'running'",
+                    "started_at = NULL, duration_seconds = NULL, stage_timings_json = NULL, "
+                    "updated_at = ? WHERE batch_id = ? AND status = 'running'",
                     (now, batch_id),
                 )
             self.db.commit()
@@ -950,6 +990,87 @@ class ServerState:
             )
             self.db.commit()
 
+    def _record_batch_stage_timing(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        stage: str,
+        elapsed_seconds: float,
+    ) -> None:
+        """Accumulate command time under one user-visible pipeline stage."""
+        if stage not in _BATCH_GENERATION_STAGES:
+            return
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT stage_timings_json FROM generation_batch_chapters "
+                "WHERE batch_id = ? AND chapter_id = ?",
+                (batch_id, chapter_id),
+            ).fetchone()
+            if row is None:
+                return
+            timings = _batch_stage_timings(row["stage_timings_json"])
+            timings[stage] = round(timings.get(stage, 0.0) + max(0.0, elapsed_seconds), 3)
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET stage_timings_json = ?, updated_at = ? "
+                "WHERE batch_id = ? AND chapter_id = ?",
+                (json.dumps(timings, ensure_ascii=False, sort_keys=True), time.time(), batch_id, chapter_id),
+            )
+            self.db.commit()
+
+    def _complete_batch_chapter_timing(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        completed_at: float,
+    ) -> None:
+        """Persist elapsed wall time for both successful and failed chapters."""
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT started_at FROM generation_batch_chapters "
+                "WHERE batch_id = ? AND chapter_id = ?",
+                (batch_id, chapter_id),
+            ).fetchone()
+            if row is None:
+                return
+            started_at = row["started_at"]
+            duration = (
+                round(max(0.0, completed_at - float(started_at)), 3)
+                if isinstance(started_at, (int, float))
+                else None
+            )
+            self.db.execute(
+                "UPDATE generation_batch_chapters SET duration_seconds = ? "
+                "WHERE batch_id = ? AND chapter_id = ?",
+                (duration, batch_id, chapter_id),
+            )
+            self.db.commit()
+
+    def _record_batch_chapter_error_timing(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        completed_at: float,
+    ) -> None:
+        """Store duration for a failed chapter without reopening a transaction."""
+        row = self.db.execute(
+            "SELECT started_at FROM generation_batch_chapters "
+            "WHERE batch_id = ? AND chapter_id = ?",
+            (batch_id, chapter_id),
+        ).fetchone()
+        if row is None:
+            return
+        started_at = row["started_at"]
+        duration = (
+            round(max(0.0, completed_at - float(started_at)), 3)
+            if isinstance(started_at, (int, float))
+            else None
+        )
+        self.db.execute(
+            "UPDATE generation_batch_chapters SET duration_seconds = ? "
+            "WHERE batch_id = ? AND chapter_id = ?",
+            (duration, batch_id, chapter_id),
+        )
+
     @staticmethod
     def _worker_failure_message(result: dict[str, object], fallback: str) -> str:
         error = result.get("error")
@@ -972,13 +1093,22 @@ class ServerState:
         if self._batch_is_cancel_requested(batch_id):
             raise InterruptedError("batch generation was cancelled")
         self._set_batch_chapter_stage(batch_id, chapter_id, stage)
-        if command == "generate_audio_assets":
-            # Keep MLX Stable Audio single-file even if a legacy single-asset
-            # request happens alongside a durable batch.
-            with self.stable_audio_generation_lock:
+        started_at = time.monotonic()
+        try:
+            if command == "generate_audio_assets":
+                # Keep MLX Stable Audio single-file even if a legacy single-asset
+                # request happens alongside a durable batch.
+                with self.stable_audio_generation_lock:
+                    result = self.run_worker(command, request)
+            else:
                 result = self.run_worker(command, request)
-        else:
-            result = self.run_worker(command, request)
+        finally:
+            self._record_batch_stage_timing(
+                batch_id,
+                chapter_id,
+                stage,
+                time.monotonic() - started_at,
+            )
         if result.get("status") != "succeeded":
             raise BatchGenerationStageError(
                 stage,
@@ -1141,9 +1271,11 @@ class ServerState:
         with self.db_lock:
             self.db.execute(
                 "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
-                "completed_at = COALESCE(completed_at, ?), updated_at = ? "
+                "completed_at = COALESCE(completed_at, ?), "
+                "duration_seconds = CASE WHEN started_at IS NULL THEN duration_seconds "
+                "ELSE ROUND(MAX(0.0, ? - started_at), 3) END, updated_at = ? "
                 "WHERE batch_id = ? AND status IN ('queued', 'running')",
-                (now, now, batch_id),
+                (now, now, now, batch_id),
             )
             self.db.execute(
                 "UPDATE generation_batches SET status = 'cancelled', current_chapter_id = NULL, "
@@ -1201,6 +1333,7 @@ class ServerState:
     ) -> None:
         now = time.time()
         with self.db_lock:
+            self._record_batch_chapter_error_timing(batch_id, chapter_id, now)
             self.db.execute(
                 "UPDATE generation_batch_chapters SET status = 'failed', current_stage = ?, error = ?, "
                 "completed_at = ?, updated_at = ? WHERE batch_id = ? AND chapter_id = ?",
@@ -1245,6 +1378,7 @@ class ServerState:
                 (now, batch_id),
             )
             self.db.commit()
+        self._complete_batch_chapter_timing(batch_id, chapter_id, now)
 
     def _run_batch_generation(self, batch_id: str) -> None:
         """Run full chapters in one server-side queue, continuing after errors."""

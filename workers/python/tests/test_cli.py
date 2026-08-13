@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -423,6 +425,264 @@ def test_synthesize_chapter_audio_reuses_cached_segments_without_loading_backend
     assert second_result["artifacts"][0]["metadata"]["cacheHit"] is True
     assert second_result["artifacts"][0]["metadata"]["sourceSegmentIds"] == ["seg_0001"]
     assert cached_wav.stat().st_mtime_ns == original_mtime
+
+
+def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_concurrently_in_timeline_order(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "第一句。", "voiceId": "narrator_female"},
+            {"id": "seg_0002", "text": "第二句。", "voiceId": "narrator_female"},
+            {"id": "seg_0003", "text": "第三句。", "voiceId": "male_adult_01"},
+        ],
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    audio_dir = tmp_path / "audio"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "mimo",
+                "modelId": "mimo-v2.5-tts-voiceclone",
+                "mergeSegments": False,
+                "cacheSegments": False,
+                "voiceProfileDirectory": str(tmp_path / "voice-profiles"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    prepared = threading.Event()
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class FakeMiMoBackend:
+        def prepare_voice_profiles(self, segments, profile_directory):
+            assert [segment["id"] for segment in segments] == [
+                "seg_0001", "seg_0002", "seg_0003"
+            ]
+            prepared.set()
+
+        def synthesize_segment(self, segment, output_directory):
+            nonlocal active, max_active
+            assert prepared.is_set()
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+                output_path = Path(output_directory) / f"{segment['id']}.wav"
+                with wave.open(str(output_path), "wb") as wav_file:
+                    wav_file.setparams((1, 2, 24_000, 240, "NONE", "not compressed"))
+                    wav_file.writeframes(b"\x00\x00" * 240)
+                return AudioArtifact("segment_audio", output_path, 0.01)
+            finally:
+                with lock:
+                    active -= 1
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert max_active == 2
+    assert [artifact["metadata"]["segmentId"] for artifact in result["artifacts"]] == [
+        "seg_0001", "seg_0002", "seg_0003"
+    ]
+
+
+def test_mimo_chapter_synthesis_retries_only_failed_concurrent_segment_serially(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "第一句。", "voiceId": "narrator_female"},
+            {"id": "seg_0002", "text": "第二句。", "voiceId": "narrator_female"},
+        ],
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    audio_dir = tmp_path / "audio"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "mimo",
+                "mergeSegments": False,
+                "cacheSegments": False,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    calls: list[str] = []
+
+    class FakeMiMoBackend:
+        def prepare_voice_profiles(self, segments, profile_directory):
+            return None
+
+        def synthesize_segment(self, segment, output_directory):
+            calls.append(segment["id"])
+            if segment["id"] == "seg_0002" and calls.count("seg_0002") == 1:
+                raise RuntimeError("transient test failure")
+            segment_path = Path(output_directory) / f"{segment['id']}.wav"
+            with wave.open(str(segment_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 24_000, 240, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x00" * 240)
+            return AudioArtifact("segment_audio", segment_path, 0.01)
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert calls.count("seg_0001") == 1
+    assert calls.count("seg_0002") == 2
+
+
+def test_mimo_chapter_synthesis_does_not_write_timeline_when_serial_fallback_still_fails(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "第一句。", "voiceId": "narrator_female"},
+            {"id": "seg_0002", "text": "第二句。", "voiceId": "narrator_female"},
+        ],
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    audio_dir = tmp_path / "audio"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "mimo",
+                "mergeSegments": False,
+                "cacheSegments": False,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    calls: list[str] = []
+
+    class FakeMiMoBackend:
+        def prepare_voice_profiles(self, segments, profile_directory):
+            return None
+
+        def synthesize_segment(self, segment, output_directory):
+            calls.append(segment["id"])
+            if segment["id"] == "seg_0002":
+                raise RuntimeError("persistent test failure")
+            segment_path = Path(output_directory) / f"{segment['id']}.wav"
+            with wave.open(str(segment_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 24_000, 240, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x00" * 240)
+            return AudioArtifact("segment_audio", segment_path, 0.01)
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 1
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"] == {"segmentId": "seg_0002"}
+    assert calls.count("seg_0001") == 1
+    assert calls.count("seg_0002") == 2
+    assert not (audio_dir / "timeline.json").exists()
+
+
+def test_mimo_chapter_synthesis_does_not_retry_a_permanent_mimo_request_error(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact, MiMoRequestError
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {"id": "seg_0001", "text": "第一句。", "voiceId": "narrator_female"},
+            {"id": "seg_0002", "text": "第二句。", "voiceId": "narrator_female"},
+        ],
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    audio_dir = tmp_path / "audio"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "mimo",
+                "mergeSegments": False,
+                "cacheSegments": False,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    calls: list[str] = []
+
+    class FakeMiMoBackend:
+        def prepare_voice_profiles(self, segments, profile_directory):
+            return None
+
+        def synthesize_segment(self, segment, output_directory):
+            calls.append(segment["id"])
+            if segment["id"] == "seg_0002":
+                raise MiMoRequestError("MiMo API request failed with HTTP 401", retryable=False)
+            segment_path = Path(output_directory) / f"{segment['id']}.wav"
+            with wave.open(str(segment_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 24_000, 240, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x00" * 240)
+            return AudioArtifact("segment_audio", segment_path, 0.01)
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 1
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"] == {"segmentId": "seg_0002"}
+    assert calls.count("seg_0001") == 1
+    assert calls.count("seg_0002") == 1
+    assert not (audio_dir / "timeline.json").exists()
 
 
 def test_segment_cache_signature_changes_with_character_voice_description():

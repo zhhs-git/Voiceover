@@ -1,5 +1,6 @@
 import base64
 import io
+import urllib.error
 import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,9 +11,12 @@ from audiobook_worker.tts import (
     KokoroTTSBackend,
     MiMoTTSBackend,
     MockTTSBackend,
+    MiMoRequestError,
     _MIMO_VOICE_CLONE_MODEL_ID,
     _MIMO_VOICE_DESIGN_MODEL_ID,
+    _mimo_max_attempts,
     _kokoro_voice_for,
+    mimo_tts_concurrency,
     _select_torch_device,
     voice_options,
     voice_registry,
@@ -278,6 +282,113 @@ def test_mimo_backend_requires_api_key(monkeypatch: pytest.MonkeyPatch):
 
     with pytest.raises(RuntimeError, match="MIMO_API_KEY"):
         MiMoTTSBackend(api_key=None, key_loader=lambda: None)
+
+
+def test_mimo_runtime_limits_default_and_clamp_unsafe_values(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("AUDIOBOOK_MIMO_CONCURRENCY", raising=False)
+    monkeypatch.delenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", raising=False)
+    assert mimo_tts_concurrency() == 2
+    assert _mimo_max_attempts() == 3
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "99")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "0")
+    assert mimo_tts_concurrency() == 4
+    assert _mimo_max_attempts() == 1
+
+
+def test_mimo_prepares_each_missing_profile_once_before_parallel_synthesis(tmp_path: Path):
+    encoded = base64.b64encode(_wav_bytes()).decode("ascii")
+    client = MagicMock(side_effect=[encoded, encoded])
+    backend = MiMoTTSBackend(
+        api_key="test-key",
+        model_id=_MIMO_VOICE_CLONE_MODEL_ID,
+        request_audio=client,
+        voice_profile_directory=tmp_path / "voice-profiles",
+    )
+    segments = [
+        {
+            "id": "seg_0001",
+            "text": "第一句。",
+            "speakerId": "narrator",
+            "voiceId": "narrator_female",
+        },
+        {
+            "id": "seg_0002",
+            "text": "第二句。",
+            "speakerId": "narrator",
+            "voiceId": "narrator_female",
+        },
+        {
+            "id": "seg_0003",
+            "text": "第三句。",
+            "voiceId": "male_adult_01",
+        },
+    ]
+
+    backend.prepare_voice_profiles(segments)
+
+    # Two different voices produce two design requests; duplicate narrator
+    # segments never trigger another profile build.
+    assert client.call_count == 2
+    assert (tmp_path / "voice-profiles" / "narrator_female.wav").is_file()
+    assert (tmp_path / "voice-profiles" / "male_adult_01.wav").is_file()
+
+
+def test_mimo_network_request_retries_transient_errors_with_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[object, int]] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"audio":{"data":"encoded"}}}]}'
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        if len(calls) < 3:
+            raise urllib.error.URLError("temporary network failure")
+        return FakeResponse()
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
+    backend = MiMoTTSBackend(api_key="test-key")
+
+    assert backend._request_audio_from_api({"model": "test"}) == "encoded"
+    assert len(calls) == 3
+    assert all(timeout == 180 for _, timeout in calls)
+
+
+def test_mimo_network_request_does_not_retry_non_retryable_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b"invalid API key"),
+        )
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "3")
+    monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
+    backend = MiMoTTSBackend(api_key="test-key")
+
+    with pytest.raises(MiMoRequestError, match="HTTP 401") as error:
+        backend._request_audio_from_api({"model": "test"})
+    assert calls == 1
+    assert error.value.retryable is False
 
 
 def test_select_torch_device_prefers_mps_when_available():

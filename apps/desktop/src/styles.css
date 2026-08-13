@@ -2534,7 +2534,7 @@ aside.chapter-list .chapter-title {
 
 .batch-generation-chapter {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) auto minmax(0, 1.4fr);
+  grid-template-columns: 32px minmax(0, 1fr) auto auto minmax(0, 1.4fr);
   gap: 8px;
   align-items: center;
   min-height: 31px;
@@ -2543,8 +2543,14 @@ aside.chapter-list .chapter-title {
 }
 
 .batch-generation-position,
-.batch-generation-chapter-status {
+.batch-generation-chapter-status,
+.batch-generation-duration {
   color: var(--text-muted);
+}
+
+.batch-generation-duration {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .batch-generation-title,
@@ -2585,8 +2591,16 @@ aside.chapter-list .chapter-title {
     padding: 5px 0;
   }
 
+  .batch-generation-duration,
   .batch-generation-detail {
     grid-column: 2 / -1;
+  }
+
+  .batch-generation-duration {
+    justify-self: start;
+  }
+
+  .batch-generation-detail {
     white-space: normal;
   }
 }
