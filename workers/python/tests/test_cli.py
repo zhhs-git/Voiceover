@@ -427,7 +427,7 @@ def test_synthesize_chapter_audio_reuses_cached_segments_without_loading_backend
     assert cached_wav.stat().st_mtime_ns == original_mtime
 
 
-def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_concurrently_in_timeline_order(
+def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_serially_in_timeline_order(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -466,6 +466,7 @@ def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_concurrentl
     prepared = threading.Event()
     active = 0
     max_active = 0
+    calls: list[str] = []
     lock = threading.Lock()
 
     class FakeMiMoBackend:
@@ -481,6 +482,7 @@ def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_concurrentl
             with lock:
                 active += 1
                 max_active = max(max_active, active)
+                calls.append(segment["id"])
             try:
                 time.sleep(0.02)
                 output_path = Path(output_directory) / f"{segment['id']}.wav"
@@ -492,19 +494,20 @@ def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_concurrentl
                 with lock:
                     active -= 1
 
-    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "99")
     with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
         assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
 
     result = json.loads(output_path.read_text(encoding="utf-8"))
     assert result["status"] == "succeeded"
-    assert max_active == 2
+    assert max_active == 1
+    assert calls == ["seg_0001", "seg_0002", "seg_0003"]
     assert [artifact["metadata"]["segmentId"] for artifact in result["artifacts"]] == [
         "seg_0001", "seg_0002", "seg_0003"
     ]
 
 
-def test_mimo_chapter_synthesis_retries_only_failed_concurrent_segment_serially(
+def test_mimo_chapter_synthesis_leaves_request_retries_to_the_tts_backend(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -555,15 +558,16 @@ def test_mimo_chapter_synthesis_retries_only_failed_concurrent_segment_serially(
 
     monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "2")
     with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
-        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 1
 
     result = json.loads(output_path.read_text(encoding="utf-8"))
-    assert result["status"] == "succeeded"
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"] == {"segmentId": "seg_0002"}
     assert calls.count("seg_0001") == 1
-    assert calls.count("seg_0002") == 2
+    assert calls.count("seg_0002") == 1
 
 
-def test_mimo_chapter_synthesis_does_not_write_timeline_when_serial_fallback_still_fails(
+def test_mimo_chapter_synthesis_does_not_write_timeline_when_a_serial_segment_fails(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -620,7 +624,7 @@ def test_mimo_chapter_synthesis_does_not_write_timeline_when_serial_fallback_sti
     assert result["error"]["code"] == "tts_synthesis_failed"
     assert result["error"]["details"] == {"segmentId": "seg_0002"}
     assert calls.count("seg_0001") == 1
-    assert calls.count("seg_0002") == 2
+    assert calls.count("seg_0002") == 1
     assert not (audio_dir / "timeline.json").exists()
 
 

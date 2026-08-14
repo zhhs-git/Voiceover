@@ -5,6 +5,12 @@ import type {
   BatchGenerationResponse,
   BatchGenerationStatus,
 } from "../lib/batchGeneration";
+import {
+  batchChapterDisplayStage,
+  isBatchChapterMiMoInProgress,
+  isBatchChapterStageInProgress,
+  isBatchChapterWaitingForMiMo,
+} from "../lib/batchGeneration";
 
 const BATCH_STATUS_LABELS: Record<BatchGenerationStatus, string> = {
   queued: "等待后台队列",
@@ -36,10 +42,27 @@ function stageLabel(stage: string | null | undefined): string | null {
   return STAGE_LABELS[stage] ?? stage;
 }
 
-function chapterDetail(chapter: BatchGenerationChapter): string {
+function chapterStatusLabel(chapter: BatchGenerationChapter): string {
+  if (isBatchChapterWaitingForMiMo(chapter)) return "等待 MiMo";
+  if (isBatchChapterMiMoInProgress(chapter)) return "MiMo 配音中";
+  return CHAPTER_STATUS_LABELS[chapter.status];
+}
+
+function chapterDetail(
+  chapter: BatchGenerationChapter,
+  mimoCooldownSeconds: number | null | undefined,
+): string {
   if (chapter.status === "failed") return chapter.error || "生成失败";
-  const stage = stageLabel(chapter.currentStage);
-  return chapter.status === "running" && stage ? `正在${stage}` : "";
+  if (isBatchChapterWaitingForMiMo(chapter)) {
+    if (typeof mimoCooldownSeconds === "number" && Number.isFinite(mimoCooldownSeconds) && mimoCooldownSeconds > 0) {
+      return `MiMo 限流冷却中，约${formatBatchElapsed(Math.ceil(mimoCooldownSeconds))}后继续`;
+    }
+    return "等待 MiMo 串行配音";
+  }
+  if (isBatchChapterMiMoInProgress(chapter)) return "正在原章节配音（MiMo 串行）";
+  const stage = stageLabel(batchChapterDisplayStage(chapter));
+  if (isBatchChapterStageInProgress(chapter) && stage) return `正在${stage}`;
+  return chapter.stageState === "ready" && stage ? `等待${stage}` : "";
 }
 
 function chapterTimingTitle(chapter: BatchGenerationChapter): string | undefined {
@@ -133,7 +156,7 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
       </div>
       <div className="batch-generation-chapter-list" role="list">
         {batch.chapters.map((chapter) => {
-          const detail = chapterDetail(chapter);
+          const detail = chapterDetail(chapter, batch.mimoCooldownSeconds);
           const duration = typeof chapter.durationSeconds === "number" && Number.isFinite(chapter.durationSeconds)
             ? formatBatchElapsed(chapter.durationSeconds)
             : null;
@@ -143,7 +166,7 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
               <span className="batch-generation-position">{chapter.position + 1}</span>
               <span className="batch-generation-title">{chapter.title}</span>
               <span className={`batch-generation-chapter-status batch-chapter-${chapter.status}`}>
-                {CHAPTER_STATUS_LABELS[chapter.status]}
+                {chapterStatusLabel(chapter)}
               </span>
               {duration && (
                 <span className="batch-generation-duration" title={timingTitle}>

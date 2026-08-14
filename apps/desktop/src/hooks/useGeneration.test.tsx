@@ -11,10 +11,31 @@ const batchGeneration = vi.hoisted(() => ({
 }));
 
 vi.mock("../lib/batchGeneration", () => ({
+  batchChapterDisplayStage: (chapter: { currentStage?: string | null; nextStage?: string | null }) => {
+    if (chapter.currentStage) return chapter.currentStage;
+    return chapter.nextStage === "voice_synthesize" || chapter.nextStage === "voice_assemble"
+      ? "voice"
+      : chapter.nextStage ?? null;
+  },
   batchErrorMessage: () => "批量生成失败。",
   cancelBatchGeneration: batchGeneration.cancelBatchGeneration,
   getActiveBatchGeneration: batchGeneration.getActiveBatchGeneration,
   getBatchGenerationStatus: batchGeneration.getBatchGenerationStatus,
+  isBatchChapterStageInProgress: (chapter: {
+    status: string;
+    currentStage?: string | null;
+    stageState?: string | null;
+  }) => chapter.stageState === "running"
+    || (chapter.stageState == null && chapter.status === "running" && Boolean(chapter.currentStage)),
+  isBatchChapterWaitingForMiMo: (chapter: {
+    status: string;
+    nextStage?: string | null;
+    stageState?: string | null;
+  }) => chapter.status !== "succeeded"
+    && chapter.status !== "failed"
+    && chapter.status !== "cancelled"
+    && chapter.nextStage === "voice_synthesize"
+    && chapter.stageState === "ready",
   isActiveBatchGeneration: (status: string) => status === "queued" || status === "running",
   startBatchGeneration: batchGeneration.startBatchGeneration,
 }));

@@ -155,8 +155,8 @@ ln -s "$(git rev-parse --show-toplevel)/scripts/Audiobook-Generator.command" "$H
 
 - 如果 OpenAI 兼容 LLM 的 `baseUrl` 指向远程服务，章节正文和分析提示词可能会
   发送到该服务
-- 当前网页生成流程默认使用 Xiaomi MiMo V2.5 voice-design TTS，会向 MiMo
-  服务发送语音合成请求
+- 当前网页生成流程默认使用 Xiaomi MiMo V2.5 voice-clone TTS；首次为角色或
+  旁白建立稳定参考音色时会使用 voice-design 模型，后续片段复用该参考样本
 - Python 处理程序仍保留 Kokoro 和 Parler 后端，用于本地或其他工作流；当前浏览器
   生成辅助函数明确调用 MiMo
 
@@ -216,21 +216,40 @@ export AUDIOBOOK_TTS_DEVICE="auto"  # auto、mps、cuda 或 cpu
 当前浏览器生成流程使用 MiMo，因此浏览器生成音频需要配置 `MIMO_API_KEY`。
 设备变量只适用于基于 PyTorch 的本地 TTS 后端。
 
-### MiMo 批量配音并发
+### 批量生成安全并发
 
-网页端批量生成保留逐句的情绪、语速和动态演绎指导，但默认会并发两个 MiMo
-片段请求以缩短等待时间。每个角色的 voice-clone 参考音频始终先串行建立或复用，
-不会在并发过程中改变角色的固定音色。
+批量任务不是“一个 worker 从头跑完整章”。它会把每章持久化为六个可恢复检查点：
+`voice_synthesize → voice_assemble → transcript → audio_plan → stable_audio → mix`。
+当一章完成 MiMo 片段配音后，会立即释放该 worker，让下一章进入 MiMo；已完成配音的
+章节则可与后续章节并行做转录、音频规划、Stable Audio 和混音。
+
+MiMo 是不可提高的**全服务单请求通道**：参考音色、章节片段、直接单段试听和每次重试
+都共用同一条通道。实际 HTTP 请求按最多 `80 RPM`（相邻启动至少 `0.75` 秒）节拍发出，
+低于官方 `100 RPM` 限额；遇到 HTTP 429 会读取 `Retry-After`，并对整个队列共享冷却。
+因此旧的 `AUDIOBOOK_MIMO_TOTAL_CONCURRENCY` 和 `AUDIOBOOK_MIMO_CONCURRENCY` 仍可被读取
+以兼容旧启动配置，但无论设置为多少，实际值始终为 `1`。
+
+本机最多运行 4 个批量 worker 子进程。当有 MiMo 配音等待或运行时，最多只允许 3 个
+非 MiMo 阶段运行，以保证下一章不会被后续阶段饿死。LLM 最多 2 个、Whisper 与
+Stable Audio 共用 MLX 最多 1 个、原章节组装/最终混音/MP3 最多 2 个；资源等待不会占用
+批量 worker。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时创建时损坏或漂移。
 
 ```bash
-export AUDIOBOOK_MIMO_CONCURRENCY="2"          # 1–4，默认 2；设为 1 可回退为串行
+export AUDIOBOOK_BATCH_WORKER_CONCURRENCY="4"  # 1–4，默认 4：批量阶段 worker 上限
+export AUDIOBOOK_MIMO_TOTAL_CONCURRENCY="1"    # 兼容字段；实际始终强制为 1
+export AUDIOBOOK_MIMO_CONCURRENCY="1"          # 兼容字段；实际始终强制为 1
+export AUDIOBOOK_MIMO_RPM="80"                  # 1–80，默认 80：MiMo 全局请求启动预算
+export AUDIOBOOK_LLM_WORKER_CONCURRENCY="2"    # 1–2，默认 2：分析/音频规划 LLM
+export AUDIOBOOK_MLX_WORKER_CONCURRENCY="1"    # 固定上限 1：Whisper 与 Stable Audio
+export AUDIOBOOK_MIX_WORKER_CONCURRENCY="2"    # 1–2，默认 2：最终混音、转 MP3
 export AUDIOBOOK_MIMO_MAX_ATTEMPTS="3"          # 单个网络请求最多尝试次数，1–5
 export AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS="0.75"  # 重试的指数退避基准秒数
 ```
 
-仅 MiMo 云端 TTS 使用此并发设置；Kokoro、Parler、Whisper 和 Stable Audio 仍按原有
-本地资源限制运行。遇到瞬时并发失败时，系统只会单路重试失败片段一次，已成功片段
-不会重复生成。
+这些变量只能降低相应的安全上限；MiMo 并发不能被环境变量提高。MiMo 的瞬时网络、
+408、425、429 和服务端错误会在同一条单请求通道内有限重试，已成功片段不会重复生成。
+批量队列会逐章显示“等待 MiMo 串行配音”“MiMo 配音中”或具体的后续阶段；429 冷却时会
+显示剩余等待时间。
 
 ## 项目结构
 

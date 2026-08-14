@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import base64
+import datetime
+import fcntl
 import hashlib
 import io
 import json
 import math
 import os
+import random
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import wave
+from contextlib import contextmanager
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from audiobook_worker.script_builder import (
@@ -70,6 +76,8 @@ _MIMO_REFERENCE_TEXT = (
     "不要刻意表演，也不要改变自己的基础音色。"
 )
 _MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
+_MIMO_SAFE_RPM = 80
+_MIMO_RATE_STATE_ENV = "AUDIOBOOK_MIMO_RATE_STATE_PATH"
 
 
 class MiMoRequestError(RuntimeError):
@@ -78,17 +86,6 @@ class MiMoRequestError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
-
-
-def is_retryable_mimo_error(error: BaseException) -> bool:
-    """Keep permanent provider rejections out of the chapter fallback retry.
-
-    Backends injected by integrations or tests may still raise an ordinary
-    exception. Treat those as retryable once so the chapter-level fallback
-    remains resilient, while known MiMo authentication/request failures stop
-    immediately.
-    """
-    return not isinstance(error, MiMoRequestError) or error.retryable
 
 
 def _bounded_positive_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
@@ -110,12 +107,17 @@ def _mimo_max_attempts() -> int:
 
 
 def mimo_tts_concurrency() -> int:
-    """Return the safe per-chapter concurrency limit for cloud MiMo TTS."""
+    """MiMo cloud synthesis is intentionally serial for the whole service."""
+    return 1
+
+
+def mimo_tts_rpm() -> int:
+    """Return the conservative global request-start budget for MiMo TTS."""
     return _bounded_positive_int(
-        os.environ.get("AUDIOBOOK_MIMO_CONCURRENCY", "2"),
-        default=2,
+        os.environ.get("AUDIOBOOK_MIMO_RPM", str(_MIMO_SAFE_RPM)),
+        default=_MIMO_SAFE_RPM,
         minimum=1,
-        maximum=4,
+        maximum=_MIMO_SAFE_RPM,
     )
 
 
@@ -125,6 +127,120 @@ def _mimo_retry_backoff_seconds() -> float:
     except (TypeError, ValueError):
         value = 0.75
     return max(0.0, min(10.0, value))
+
+
+def _mimo_rate_state_path() -> Path:
+    """Locate the state file shared by all MiMo worker child processes."""
+    configured = os.environ.get(_MIMO_RATE_STATE_ENV, "").strip()
+    if configured:
+        return Path(configured)
+    return Path(tempfile.gettempdir()) / "audiobook-generator-mimo-rate.json"
+
+
+def _read_mimo_rate_state(state_file) -> dict[str, float]:
+    state_file.seek(0)
+    try:
+        raw = json.loads(state_file.read() or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    if not isinstance(raw, dict):
+        return {}
+    state: dict[str, float] = {}
+    for key in ("lastStartMonotonic", "cooldownUntilMonotonic"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            state[key] = float(value)
+    return state
+
+
+def _write_mimo_rate_state(state_file, state: dict[str, float]) -> None:
+    state_file.seek(0)
+    state_file.truncate()
+    json.dump(state, state_file, separators=(",", ":"), sort_keys=True)
+    state_file.flush()
+    os.fsync(state_file.fileno())
+
+
+class _MiMoRequestRateGate:
+    """Cross-process serial gate and no-burst rate governor for real requests."""
+
+    def __init__(self, state_file) -> None:
+        self._state_file = state_file
+        self._state = _read_mimo_rate_state(state_file)
+
+    def wait_for_turn(self) -> None:
+        now = time.monotonic()
+        last_start = self._state.get("lastStartMonotonic", 0.0)
+        cooldown_until = self._state.get("cooldownUntilMonotonic", 0.0)
+        # A persisted monotonic timestamp from a previous host boot is not
+        # comparable with this process. Treat an implausibly distant value as
+        # stale rather than blocking the service indefinitely.
+        if last_start > now + 300:
+            last_start = 0.0
+        if cooldown_until > now + 300:
+            cooldown_until = 0.0
+        interval = 60.0 / mimo_tts_rpm()
+        start_at = max(last_start + interval, cooldown_until)
+        if start_at > now:
+            time.sleep(start_at - now)
+        self._state["lastStartMonotonic"] = time.monotonic()
+        _write_mimo_rate_state(self._state_file, self._state)
+
+    def set_cooldown(self, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds <= 0:
+            return
+        deadline = time.monotonic() + seconds
+        self._state["cooldownUntilMonotonic"] = max(
+            self._state.get("cooldownUntilMonotonic", 0.0),
+            deadline,
+        )
+        _write_mimo_rate_state(self._state_file, self._state)
+
+
+@contextmanager
+def _mimo_request_rate_gate():
+    """Hold the only MiMo HTTP lane for one logical request/retry sequence."""
+    state_path = _mimo_rate_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_path.open("a+", encoding="utf-8") as state_file:
+        fcntl.flock(state_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield _MiMoRequestRateGate(state_file)
+        finally:
+            fcntl.flock(state_file.fileno(), fcntl.LOCK_UN)
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    """Read a standard Retry-After seconds value or HTTP-date."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, when.timestamp() - time.time())
+
+
+def _mimo_retry_delay_seconds(
+    attempt: int,
+    *,
+    retry_after: float | None = None,
+    rate_limited: bool = False,
+) -> float:
+    """Produce bounded, jittered retry delay and honor provider cooldowns."""
+    exponential = _mimo_retry_backoff_seconds() * (2 ** max(0, attempt - 1))
+    if rate_limited:
+        exponential = max(5.0, exponential)
+    base = max(exponential, retry_after or 0.0)
+    if base <= 0:
+        return 0.0
+    return min(300.0, base + random.uniform(0.0, min(1.0, base * 0.1)))
 
 _MIMO_VOICE_DESIGNS: dict[str, str] = {
     "narrator_default": "角色：一位专业中文有声书旁白，固定为同一位成年女性。声音洪亮饱满而温暖、柔和、清晰，气息稳定，胸腔共鸣自然，口腔共鸣自然，咬字清楚；保持稳定统一的旁白声线，连贯耐听，不代入任何角色，不使用夸张播音腔。",
@@ -358,6 +474,7 @@ class MiMoTTSBackend:
             profile_directory.mkdir(parents=True, exist_ok=True)
             profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
             metadata_path = profile_path.with_suffix(".json")
+            lock_path = profile_path.with_suffix(".lock")
             signature = _voice_profile_signature(
                 voice_id=voice_id,
                 description=description,
@@ -367,117 +484,146 @@ class MiMoTTSBackend:
             cached = self._reference_audio_cache.get(signature)
             if cached and _is_readable_wav(profile_path):
                 return cached
+            # The in-process RLock above does not help when four chapter
+            # subprocesses share one book's voice-profiles directory. fcntl
+            # keeps the complete cache-check/design/replace sequence exclusive
+            # across those processes without serialising their ordinary TTS.
+            with lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    try:
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        metadata = {}
+                    if (
+                        metadata.get("signature") == signature
+                        and metadata.get("version") == _MIMO_VOICE_PROFILE_VERSION
+                        and _is_readable_wav(profile_path)
+                    ):
+                        data_uri = _audio_data_uri(profile_path.read_bytes())
+                        self._reference_audio_cache[signature] = data_uri
+                        return data_uri
 
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                metadata = {}
-            if (
-                metadata.get("signature") == signature
-                and metadata.get("version") == _MIMO_VOICE_PROFILE_VERSION
-                and _is_readable_wav(profile_path)
-            ):
-                data_uri = _audio_data_uri(profile_path.read_bytes())
-                self._reference_audio_cache[signature] = data_uri
-                return data_uri
+                    # This request deliberately excludes the current segment's
+                    # scene, emotion, and pace. It creates the stable identity
+                    # anchor reused by every chapter and every later segment.
+                    fixed_design = description
+                    if not fixed_design.startswith(("角色：", "角色:")):
+                        fixed_design = f"角色：{fixed_design}"
+                    reference_request = {
+                        "model": self._reference_model_id,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{fixed_design}\n\n"
+                                    "指导：生成一段自然、稳定、克制的基础音色参考样本。"
+                                    "只建立固定的性别、年龄、音高、音色、共鸣、气息和咬字基线；"
+                                    "不要加入临时场景、明显情绪、角色模仿、夸张表演或后期效果。"
+                                ),
+                            },
+                            {"role": "assistant", "content": _MIMO_REFERENCE_TEXT},
+                        ],
+                        "audio": {"format": "wav", "optimize_text_preview": False},
+                    }
+                    encoded_reference = self._request_audio(reference_request)
+                    reference_bytes = _decode_mimo_wav(encoded_reference, "MiMo voice design")
+                    # Validate before replacing an existing profile so a failed
+                    # refresh never destroys the last known-good identity anchor.
+                    temporary_path = profile_path.with_name(
+                        f".{profile_path.name}.{os.getpid()}.tmp"
+                    )
+                    try:
+                        temporary_path.write_bytes(reference_bytes)
+                        if not _is_readable_wav(temporary_path):
+                            raise RuntimeError(
+                                "MiMo voice design returned an unreadable reference WAV."
+                            )
+                        temporary_path.replace(profile_path)
+                        metadata_path.write_text(
+                            json.dumps(
+                                {
+                                    "version": _MIMO_VOICE_PROFILE_VERSION,
+                                    "signature": signature,
+                                    "voiceId": voice_id,
+                                    "voiceDesign": description,
+                                    "referenceModel": self._reference_model_id,
+                                    "referenceText": _MIMO_REFERENCE_TEXT,
+                                    "isNarrator": is_narrator,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                    finally:
+                        temporary_path.unlink(missing_ok=True)
 
-            # This request deliberately excludes the current segment's scene,
-            # emotion, and pace. It creates the stable identity anchor reused by
-            # every chapter and every subsequent segment for this voice.
-            fixed_design = description
-            if not fixed_design.startswith(("角色：", "角色:")):
-                fixed_design = f"角色：{fixed_design}"
-            reference_request = {
-                "model": self._reference_model_id,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{fixed_design}\n\n"
-                            "指导：生成一段自然、稳定、克制的基础音色参考样本。"
-                            "只建立固定的性别、年龄、音高、音色、共鸣、气息和咬字基线；"
-                            "不要加入临时场景、明显情绪、角色模仿、夸张表演或后期效果。"
-                        ),
-                    },
-                    {"role": "assistant", "content": _MIMO_REFERENCE_TEXT},
-                ],
-                "audio": {"format": "wav", "optimize_text_preview": False},
-            }
-            encoded_reference = self._request_audio(reference_request)
-            reference_bytes = _decode_mimo_wav(encoded_reference, "MiMo voice design")
-            # Validate before replacing an existing profile so a failed refresh
-            # never destroys the last known-good identity anchor.
-            temporary_path = profile_path.with_name(f".{profile_path.name}.tmp")
-            try:
-                temporary_path.write_bytes(reference_bytes)
-                if not _is_readable_wav(temporary_path):
-                    raise RuntimeError("MiMo voice design returned an unreadable reference WAV.")
-                temporary_path.replace(profile_path)
-                metadata_path.write_text(
-                    json.dumps(
-                        {
-                            "version": _MIMO_VOICE_PROFILE_VERSION,
-                            "signature": signature,
-                            "voiceId": voice_id,
-                            "voiceDesign": description,
-                            "referenceModel": self._reference_model_id,
-                            "referenceText": _MIMO_REFERENCE_TEXT,
-                            "isNarrator": is_narrator,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-            finally:
-                temporary_path.unlink(missing_ok=True)
-
-            data_uri = _audio_data_uri(reference_bytes)
-            self._reference_audio_cache[signature] = data_uri
-            return data_uri
+                    data_uri = _audio_data_uri(reference_bytes)
+                    self._reference_audio_cache[signature] = data_uri
+                    return data_uri
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _request_audio_from_api(self, payload: dict) -> str:
         encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         max_attempts = _mimo_max_attempts()
-        backoff_seconds = _mimo_retry_backoff_seconds()
         last_error: MiMoRequestError | None = None
-        for attempt in range(1, max_attempts + 1):
-            request = urllib.request.Request(
-                _MIMO_ENDPOINT,
-                data=encoded_payload,
-                headers={
-                    "api-key": self._api_key,
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=180) as response:
-                    result = json.loads(response.read().decode("utf-8"))
+        # Keep the file lock for the entire retry cycle. This is deliberately
+        # stricter than only serializing individual HTTP attempts: a 429 must
+        # not let another queued audiobook request create a fresh burst while
+        # the provider asked this one to cool down.
+        with _mimo_request_rate_gate() as rate_gate:
+            for attempt in range(1, max_attempts + 1):
+                rate_gate.wait_for_turn()
+                request = urllib.request.Request(
+                    _MIMO_ENDPOINT,
+                    data=encoded_payload,
+                    headers={
+                        "api-key": self._api_key,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                retry_delay = 0.0
                 try:
-                    return result["choices"][0]["message"]["audio"]["data"]
-                except (KeyError, IndexError, TypeError) as error:
-                    raise RuntimeError(
-                        "MiMo response did not contain choices[0].message.audio.data."
-                    ) from error
-            except urllib.error.HTTPError as error:
-                detail = error.read().decode("utf-8", errors="replace")[:500]
-                last_error = MiMoRequestError(
-                    f"MiMo API request failed with HTTP {error.code}: {detail}",
-                    retryable=error.code in {408, 425, 429} or error.code >= 500,
-                )
-                if not last_error.retryable or attempt >= max_attempts:
-                    raise last_error from error
-            except (urllib.error.URLError, TimeoutError) as error:
-                last_error = MiMoRequestError(
-                    f"MiMo API request failed: {error}", retryable=True
-                )
-                if attempt >= max_attempts:
-                    raise last_error from error
+                    with urllib.request.urlopen(request, timeout=180) as response:
+                        result = json.loads(response.read().decode("utf-8"))
+                    try:
+                        return result["choices"][0]["message"]["audio"]["data"]
+                    except (KeyError, IndexError, TypeError) as error:
+                        raise RuntimeError(
+                            "MiMo response did not contain choices[0].message.audio.data."
+                        ) from error
+                except urllib.error.HTTPError as error:
+                    detail = error.read().decode("utf-8", errors="replace")[:500]
+                    retry_after = _retry_after_seconds(
+                        error.headers.get("Retry-After") if error.headers else None
+                    )
+                    rate_limited = error.code == 429
+                    retry_delay = _mimo_retry_delay_seconds(
+                        attempt,
+                        retry_after=retry_after,
+                        rate_limited=rate_limited,
+                    )
+                    if rate_limited:
+                        rate_gate.set_cooldown(retry_delay)
+                    last_error = MiMoRequestError(
+                        f"MiMo API request failed with HTTP {error.code}: {detail}",
+                        retryable=error.code in {408, 425, 429} or error.code >= 500,
+                    )
+                    if not last_error.retryable or attempt >= max_attempts:
+                        raise last_error from error
+                except (urllib.error.URLError, TimeoutError) as error:
+                    last_error = MiMoRequestError(
+                        f"MiMo API request failed: {error}", retryable=True
+                    )
+                    if attempt >= max_attempts:
+                        raise last_error from error
+                    retry_delay = _mimo_retry_delay_seconds(attempt)
 
-            delay = backoff_seconds * (2 ** (attempt - 1))
-            if delay > 0:
-                time.sleep(delay)
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
 
         raise last_error or RuntimeError("MiMo API request failed.")
 

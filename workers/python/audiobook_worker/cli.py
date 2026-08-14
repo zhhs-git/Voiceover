@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import wave
@@ -43,8 +42,6 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     ParlerTTSBackend,
-    is_retryable_mimo_error,
-    mimo_tts_concurrency,
     voice_options,
 )
 from audiobook_worker.transcription import (
@@ -1942,55 +1939,20 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
             index, segment, _ = item
             return index, active_backend.synthesize_segment(segment, output_directory)
 
-        # Local backends retain their sequential execution. MiMo requests are
-        # network-bound and each has its own output file, so they can safely
-        # overlap after the reference profiles have been prepared above.
-        concurrent_mimo = backend_name == "mimo" and callable(prepare_voice_profiles)
-        concurrency = mimo_tts_concurrency() if concurrent_mimo else 1
+        # MiMo applies an account-wide rate/concurrency limit. Process every
+        # segment in source order, even when the worker is invoked directly;
+        # the backend additionally serializes the actual HTTP boundary across
+        # all child processes.
         results: dict[int, Any] = {}
         failures: dict[int, Exception] = {}
-        if concurrency > 1 and len(pending_segments) > 1:
-            with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="mimo-tts") as executor:
-                futures = {
-                    executor.submit(synthesize_pending, item): item[0]
-                    for item in pending_segments
-                }
-                for future, index in ((future, futures[future]) for future in futures):
-                    try:
-                        result_index, artifact = future.result()
-                        results[result_index] = artifact
-                    except Exception as error:  # collected for safe serial fallback
-                        failures[index] = error
-        else:
-            for item in pending_segments:
-                index = item[0]
-                try:
-                    result_index, artifact = synthesize_pending(item)
-                    results[result_index] = artifact
-                except Exception as error:
-                    failures[index] = error
-                    break
-
-        # A transient *concurrent MiMo* failure gets exactly one serial
-        # fallback. Completed futures are intentionally not retried or
-        # overwritten. Known permanent MiMo 4xx failures (for example bad
-        # credentials) are deliberately not sent again. Local backends retain
-        # their previous fail-fast path.
-        if concurrent_mimo and concurrency > 1:
-            for index, segment, _ in pending_segments:
-                if index not in failures:
-                    continue
-                if not is_retryable_mimo_error(failures[index]):
-                    continue
-                expected_audio_path = output_directory / f"{segment['id']}.wav"
-                expected_audio_path.unlink(missing_ok=True)
-                _segment_cache_metadata_path(expected_audio_path).unlink(missing_ok=True)
-                try:
-                    _, artifact = synthesize_pending((index, segment, ""))
-                    results[index] = artifact
-                    del failures[index]
-                except Exception as error:
-                    failures[index] = error
+        for item in pending_segments:
+            index = item[0]
+            try:
+                result_index, artifact = synthesize_pending(item)
+                results[result_index] = artifact
+            except Exception as error:
+                failures[index] = error
+                break
 
         if failures:
             failed_index = min(failures)

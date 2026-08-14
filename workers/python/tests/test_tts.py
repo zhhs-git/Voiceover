@@ -1,5 +1,8 @@
 import base64
 import io
+import json
+import threading
+import time
 import urllib.error
 import wave
 from pathlib import Path
@@ -17,10 +20,12 @@ from audiobook_worker.tts import (
     _mimo_max_attempts,
     _kokoro_voice_for,
     mimo_tts_concurrency,
+    mimo_tts_rpm,
     _select_torch_device,
     voice_options,
     voice_registry,
 )
+from audiobook_worker import tts as tts_module
 
 
 def _wav_bytes(duration_seconds: float = 0.1, sample_rate: int = 24_000) -> bytes:
@@ -286,14 +291,157 @@ def test_mimo_backend_requires_api_key(monkeypatch: pytest.MonkeyPatch):
 
 def test_mimo_runtime_limits_default_and_clamp_unsafe_values(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AUDIOBOOK_MIMO_CONCURRENCY", raising=False)
+    monkeypatch.delenv("AUDIOBOOK_MIMO_RPM", raising=False)
     monkeypatch.delenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", raising=False)
-    assert mimo_tts_concurrency() == 2
+    assert mimo_tts_concurrency() == 1
+    assert mimo_tts_rpm() == 80
     assert _mimo_max_attempts() == 3
 
     monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "99")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RPM", "99")
     monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "0")
-    assert mimo_tts_concurrency() == 4
+    assert mimo_tts_concurrency() == 1
+    assert mimo_tts_rpm() == 80
     assert _mimo_max_attempts() == 1
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RPM", "12")
+    assert mimo_tts_rpm() == 12
+
+
+def test_mimo_rate_gate_paces_request_starts_without_a_burst(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The 80 RPM budget is global and uses a no-burst 0.75 second cadence."""
+
+    rate_state_path = tmp_path / "mimo-rate-state.json"
+    clock = {"seconds": 100.0}
+    sleep_calls: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock["seconds"]
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock["seconds"] += seconds
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(rate_state_path))
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RPM", "80")
+    monkeypatch.setattr(tts_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(tts_module.time, "sleep", fake_sleep)
+
+    starts: list[float] = []
+    for _ in range(81):
+        with tts_module._mimo_request_rate_gate() as rate_gate:
+            rate_gate.wait_for_turn()
+            starts.append(clock["seconds"])
+
+    assert starts[0] == 100.0
+    assert all(later - earlier >= 0.75 for earlier, later in zip(starts, starts[1:]))
+    # A half-open rolling minute beginning with the first request contains
+    # exactly 80 starts; the 81st starts at the next minute boundary.
+    assert sum(start < starts[0] + 60.0 for start in starts) == 80
+    assert starts[80] - starts[0] == pytest.approx(60.0)
+    assert sleep_calls and all(seconds >= 0.75 for seconds in sleep_calls)
+
+
+def test_mimo_rate_gate_cooldown_blocks_the_next_shared_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rate_state_path = tmp_path / "mimo-rate-state.json"
+    clock = {"seconds": 10.0}
+    sleep_calls: list[float] = []
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(rate_state_path))
+    monkeypatch.setattr(tts_module.time, "monotonic", lambda: clock["seconds"])
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock["seconds"] += seconds
+
+    monkeypatch.setattr(tts_module.time, "sleep", fake_sleep)
+
+    with tts_module._mimo_request_rate_gate() as first_gate:
+        first_gate.wait_for_turn()
+        first_gate.set_cooldown(5.0)
+    with tts_module._mimo_request_rate_gate() as second_gate:
+        second_gate.wait_for_turn()
+
+    assert sleep_calls == [5.0]
+    state = json.loads(rate_state_path.read_text(encoding="utf-8"))
+    assert state["lastStartMonotonic"] == pytest.approx(15.0)
+
+
+def test_mimo_http_gate_serializes_requests_from_independent_backends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Only one real HTTP request may cross the shared file-backed gate."""
+
+    rate_state_path = tmp_path / "mimo-rate-state.json"
+    first_started = threading.Event()
+    release_request = threading.Event()
+    active = 0
+    maximum_active = 0
+    started_at: list[float] = []
+    results: list[str] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"audio":{"data":"encoded"}}}]}'
+
+    def fake_urlopen(_request, timeout):
+        nonlocal active, maximum_active
+        assert timeout == 180
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            started_at.append(time.monotonic())
+            first_started.set()
+        try:
+            release_request.wait(timeout=2)
+        finally:
+            with lock:
+                active -= 1
+        return FakeResponse()
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(rate_state_path))
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RPM", "80")
+    monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
+    backends = [MiMoTTSBackend(api_key="test-key") for _ in range(2)]
+
+    def request(backend: MiMoTTSBackend) -> None:
+        try:
+            results.append(backend._request_audio_from_api({"model": "test"}))
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    first = threading.Thread(target=request, args=(backends[0],))
+    second = threading.Thread(target=request, args=(backends[1],))
+    first.start()
+    assert first_started.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    assert maximum_active == 1
+    release_request.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert results == ["encoded", "encoded"]
+    assert maximum_active == 1
+    assert started_at[1] - started_at[0] >= 0.7
 
 
 def test_mimo_prepares_each_missing_profile_once_before_parallel_synthesis(tmp_path: Path):
@@ -334,7 +482,82 @@ def test_mimo_prepares_each_missing_profile_once_before_parallel_synthesis(tmp_p
     assert (tmp_path / "voice-profiles" / "male_adult_01.wav").is_file()
 
 
+def test_mimo_voiceclone_profile_lock_is_shared_by_independent_backends(tmp_path: Path):
+    """Concurrent chapter workers must create one shared reference profile.
+
+    Each backend below models a separate chapter-worker process: it has its
+    own in-memory cache and lock, but shares the book-level profile directory.
+    The profile-specific file lock must prevent two reference-design calls.
+    """
+
+    encoded = base64.b64encode(_wav_bytes()).decode("ascii")
+    requests: list[dict] = []
+    requests_lock = threading.Lock()
+    reference_started = threading.Event()
+    release_reference = threading.Event()
+
+    def request_audio(payload: dict) -> str:
+        with requests_lock:
+            requests.append(payload)
+        if payload["model"] == _MIMO_VOICE_DESIGN_MODEL_ID:
+            reference_started.set()
+            release_reference.wait(timeout=2)
+        return encoded
+
+    profile_directory = tmp_path / "voice-profiles"
+    segment = {
+        "id": "seg_shared_profile",
+        "text": "夜色渐渐沉了下来。",
+        "speakerId": "narrator",
+        "voiceId": "narrator_female",
+    }
+    backends = [
+        MiMoTTSBackend(
+            api_key="test-key",
+            model_id=_MIMO_VOICE_CLONE_MODEL_ID,
+            request_audio=request_audio,
+            voice_profile_directory=profile_directory,
+        )
+        for _ in range(2)
+    ]
+    errors: list[BaseException] = []
+
+    def synthesize(backend: MiMoTTSBackend, output_directory: Path) -> None:
+        try:
+            backend.synthesize_segment(segment, output_directory)
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    first = threading.Thread(target=synthesize, args=(backends[0], tmp_path / "chapter_001"))
+    second = threading.Thread(target=synthesize, args=(backends[1], tmp_path / "chapter_002"))
+    first.start()
+    assert reference_started.wait(timeout=1)
+    second.start()
+    # Give the second backend a chance to reach the same profile lock. It may
+    # not make another reference request until the first atomic replacement is
+    # complete.
+    time.sleep(0.05)
+    with requests_lock:
+        assert sum(
+            request["model"] == _MIMO_VOICE_DESIGN_MODEL_ID for request in requests
+        ) == 1
+    release_reference.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    with requests_lock:
+        assert sum(
+            request["model"] == _MIMO_VOICE_DESIGN_MODEL_ID for request in requests
+        ) == 1
+    assert (profile_directory / "narrator_female.wav").is_file()
+    assert (profile_directory / "narrator_female.json").is_file()
+
+
 def test_mimo_network_request_retries_transient_errors_with_bounded_attempts(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[tuple[object, int]] = []
@@ -357,6 +580,7 @@ def test_mimo_network_request_retries_transient_errors_with_bounded_attempts(
 
     monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "3")
     monkeypatch.setenv("AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(tmp_path / "mimo-rate-state.json"))
     monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
     backend = MiMoTTSBackend(api_key="test-key")
 
@@ -365,7 +589,73 @@ def test_mimo_network_request_retries_transient_errors_with_bounded_attempts(
     assert all(timeout == 180 for _, timeout in calls)
 
 
+def test_mimo_rate_limited_retry_honors_retry_after_and_applies_a_global_cooldown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+    retry_parameters: list[tuple[int, float | None, bool]] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"audio":{"data":"encoded"}}}]}'
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        assert timeout == 180
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                429,
+                "rate limited",
+                {"Retry-After": "7"},
+                io.BytesIO(b"slow down"),
+            )
+        return FakeResponse()
+
+    def fake_retry_delay(
+        attempt: int,
+        *,
+        retry_after: float | None = None,
+        rate_limited: bool = False,
+    ) -> float:
+        retry_parameters.append((attempt, retry_after, rate_limited))
+        return 0.01
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(tmp_path / "mimo-rate-state.json"))
+    monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(tts_module, "_mimo_retry_delay_seconds", fake_retry_delay)
+    backend = MiMoTTSBackend(api_key="test-key")
+
+    assert backend._request_audio_from_api({"model": "test"}) == "encoded"
+    assert calls == 2
+    assert retry_parameters == [(1, 7.0, True)]
+
+
+def test_mimo_rate_limited_retry_uses_a_five_second_minimum_without_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setattr(tts_module.random, "uniform", lambda _start, _end: 0.0)
+
+    assert tts_module._mimo_retry_delay_seconds(1, rate_limited=True) == 5.0
+    assert tts_module._mimo_retry_delay_seconds(
+        1,
+        retry_after=7.0,
+        rate_limited=True,
+    ) == 7.0
+
+
 def test_mimo_network_request_does_not_retry_non_retryable_http_errors(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls = 0
@@ -382,6 +672,7 @@ def test_mimo_network_request_does_not_retry_non_retryable_http_errors(
         )
 
     monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(tmp_path / "mimo-rate-state.json"))
     monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
     backend = MiMoTTSBackend(api_key="test-key")
 

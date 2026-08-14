@@ -15,12 +15,27 @@ export type BatchGenerationChapterStatus =
   | "failed"
   | "cancelled";
 
+/** The exact durable checkpoint that the backend will run for a chapter. */
+export type BatchGenerationNextStage =
+  | "voice_synthesize"
+  | "voice_assemble"
+  | "transcript"
+  | "audio_plan"
+  | "stable_audio"
+  | "mix"
+  | "complete";
+
+/** Ownership state for `nextStage`; terminal rows use `complete`. */
+export type BatchGenerationStageState = "ready" | "running" | "complete";
+
 export interface BatchGenerationChapter {
   chapterId: string;
   title: string;
   position: number;
   status: BatchGenerationChapterStatus;
   currentStage?: string | null;
+  nextStage?: BatchGenerationNextStage | null;
+  stageState?: BatchGenerationStageState | null;
   error?: string | null;
   voiceAudioPath?: string | null;
   mixedAudioPath?: string | null;
@@ -49,8 +64,57 @@ export interface BatchGenerationResponse {
   succeededCount?: number;
   failedCount?: number;
   cancelledCount?: number;
+  /** Remaining shared MiMo cooldown, when a recent 429 has rate-limited it. */
+  mimoCooldownSeconds?: number | null;
   chapters: BatchGenerationChapter[];
   reused?: boolean;
+}
+
+const DISPLAY_STAGE_BY_NEXT_STAGE: Record<BatchGenerationNextStage, string | null> = {
+  voice_synthesize: "voice",
+  voice_assemble: "voice",
+  transcript: "transcript",
+  audio_plan: "audio_plan",
+  stable_audio: "stable_audio",
+  mix: "mix",
+  complete: null,
+};
+
+/**
+ * Normalize a durable checkpoint to the existing user-facing stage names.
+ * Keeping this mapping beside the wire type prevents each UI consumer from
+ * inferring backend checkpoint names independently.
+ */
+export function batchChapterDisplayStage(
+  chapter: Pick<BatchGenerationChapter, "currentStage" | "nextStage">,
+): string | null {
+  if (chapter.currentStage) return chapter.currentStage;
+  return chapter.nextStage ? DISPLAY_STAGE_BY_NEXT_STAGE[chapter.nextStage] : null;
+}
+
+export function isBatchChapterWaitingForMiMo(
+  chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState" | "status">,
+): boolean {
+  return chapter.status !== "succeeded"
+    && chapter.status !== "failed"
+    && chapter.status !== "cancelled"
+    && chapter.nextStage === "voice_synthesize"
+    && chapter.stageState === "ready";
+}
+
+export function isBatchChapterMiMoInProgress(
+  chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState">,
+): boolean {
+  return chapter.nextStage === "voice_synthesize" && chapter.stageState === "running";
+}
+
+export function isBatchChapterStageInProgress(
+  chapter: Pick<BatchGenerationChapter, "status" | "currentStage" | "stageState">,
+): boolean {
+  // `currentStage` preserves compatibility with batches created before the
+  // stage-checkpoint migration, which did not return `stageState`.
+  return chapter.stageState === "running"
+    || (chapter.stageState == null && chapter.status === "running" && Boolean(chapter.currentStage));
 }
 
 export interface StartBatchGenerationInput {

@@ -14,8 +14,11 @@ import { audioAssetsFromArtifacts } from "../lib/audioAssets";
 import {
   batchErrorMessage,
   cancelBatchGeneration,
+  batchChapterDisplayStage,
   getActiveBatchGeneration,
   getBatchGenerationStatus,
+  isBatchChapterStageInProgress,
+  isBatchChapterWaitingForMiMo,
   isActiveBatchGeneration,
   startBatchGeneration,
   type BatchGenerationResponse,
@@ -123,16 +126,25 @@ export function useGeneration(deps: UseGenerationDeps) {
     const completed = response.completedCount ?? response.chapters.filter((chapter) =>
       ["succeeded", "failed", "cancelled"].includes(chapter.status),
     ).length;
-    const current = response.chapters.find((chapter) => chapter.status === "running");
+    const current = response.chapters.find(isBatchChapterStageInProgress)
+      ?? response.chapters.find(isBatchChapterWaitingForMiMo)
+      ?? response.chapters.find((chapter) => chapter.status === "running");
     const title = current?.title || response.chapters.find((chapter) => chapter.chapterId === response.currentChapterId)?.title;
-    const stage = current?.currentStage ?? response.currentStage;
+    const waitingForMiMo = current ? isBatchChapterWaitingForMiMo(current) : false;
+    const stage = current ? batchChapterDisplayStage(current) : response.currentStage;
+    const cooldownSeconds = response.mimoCooldownSeconds;
+    const stageProgress = waitingForMiMo
+      ? typeof cooldownSeconds === "number" && Number.isFinite(cooldownSeconds) && cooldownSeconds > 0
+        ? `MiMo 限流冷却中（约 ${Math.ceil(cooldownSeconds)} 秒）`
+        : "等待 MiMo 串行配音"
+      : stageLabel(stage);
 
     setProgress(total > 0 ? Math.round((completed / total) * 100) : 0, owner);
     setProgressDetail([
-      { label: "执行方式", value: "章节顺序队列（MiMo 片段受控并发 / Whisper / LLM / Stable Audio）" },
+      { label: "执行方式", value: "MiMo 全局串行（80 RPM），后续阶段最多 4 个 worker 并行" },
       { label: "进度", value: `${completed} / ${total} 章` },
       { label: "当前章节", value: title || "等待队列" },
-      { label: "当前阶段", value: stageLabel(stage) },
+      { label: "当前阶段", value: stageProgress },
     ], owner);
 
     setChapterAudioPaths((previous) => {
@@ -164,7 +176,7 @@ export function useGeneration(deps: UseGenerationDeps) {
     if (isActiveBatchGeneration(response.status)) {
       setStage("generating", owner);
       setAnalyzeProgress(
-        title ? `正在处理《${title}》：${stageLabel(stage)}…` : "批量生成任务已在后端排队。",
+        title ? `正在处理《${title}》：${stageProgress}…` : "批量生成任务已在后端排队。",
         owner,
       );
       return;

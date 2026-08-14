@@ -8,6 +8,8 @@ over HTTP so the React application can be used by browsers on the LAN.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import json
 import math
 import mimetypes
@@ -113,6 +115,149 @@ _BATCH_GENERATION_STAGES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class BatchStageDefinition:
+    """One durable worker command in the chapter-generation pipeline."""
+
+    name: str
+    display_stage: str
+    command: str
+    resource: str | None
+    next_stage: str
+
+
+_BATCH_STAGE_DEFINITIONS: dict[str, BatchStageDefinition] = {
+    "voice_synthesize": BatchStageDefinition(
+        "voice_synthesize",
+        "voice",
+        "synthesize_chapter_audio",
+        "mimo",
+        "voice_assemble",
+    ),
+    "voice_assemble": BatchStageDefinition(
+        "voice_assemble",
+        "voice",
+        "assemble_chapter_audio",
+        "mix",
+        "transcript",
+    ),
+    "transcript": BatchStageDefinition(
+        "transcript",
+        "transcript",
+        "transcribe_chapter_audio",
+        "mlx",
+        "audio_plan",
+    ),
+    "audio_plan": BatchStageDefinition(
+        "audio_plan",
+        "audio_plan",
+        "plan_chapter_audio",
+        "llm",
+        "stable_audio",
+    ),
+    "stable_audio": BatchStageDefinition(
+        "stable_audio",
+        "stable_audio",
+        "generate_audio_assets",
+        "mlx",
+        "mix",
+    ),
+    "mix": BatchStageDefinition(
+        "mix",
+        "mix",
+        "mix_chapter_audio",
+        "mix",
+        "complete",
+    ),
+}
+
+
+# These are deliberately conservative hard ceilings for the shared Apple
+# Silicon host. Environment variables may reduce a limit for troubleshooting,
+# but never raise it above the ceiling documented here.
+_MAX_BATCH_CHAPTER_WORKERS = 4
+_MAX_MIMO_TOTAL_CONCURRENCY = 1
+_MAX_LLM_WORKERS = 2
+_MAX_MLX_WORKERS = 1
+_MAX_MIX_WORKERS = 2
+
+
+def _safe_concurrency_setting(name: str, *, default: int, maximum: int) -> int:
+    """Read a bounded positive concurrency setting with a hard upper bound."""
+
+    try:
+        value = int(os.environ.get(name, str(default)).strip())
+    except (AttributeError, TypeError, ValueError):
+        value = default
+    return max(1, min(maximum, value))
+
+
+@dataclass(frozen=True)
+class BatchConcurrencyConfig:
+    """Resource limits shared by all durable and ad-hoc worker commands."""
+
+    chapter_workers: int = _MAX_BATCH_CHAPTER_WORKERS
+    mimo_total: int = _MAX_MIMO_TOTAL_CONCURRENCY
+    mimo_per_process: int = 1
+    llm_workers: int = _MAX_LLM_WORKERS
+    mlx_workers: int = _MAX_MLX_WORKERS
+    mix_workers: int = _MAX_MIX_WORKERS
+
+    @classmethod
+    def from_environment(cls) -> "BatchConcurrencyConfig":
+        return cls(
+            chapter_workers=_safe_concurrency_setting(
+                "AUDIOBOOK_BATCH_WORKER_CONCURRENCY",
+                default=_MAX_BATCH_CHAPTER_WORKERS,
+                maximum=_MAX_BATCH_CHAPTER_WORKERS,
+            ),
+            # MiMo rate limits apply to the whole account. These historical
+            # environment variables remain accepted at startup, but neither
+            # may raise the effective cloud-request concurrency above one.
+            mimo_total=1,
+            mimo_per_process=1,
+            llm_workers=_safe_concurrency_setting(
+                "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+                default=_MAX_LLM_WORKERS,
+                maximum=_MAX_LLM_WORKERS,
+            ),
+            mlx_workers=_safe_concurrency_setting(
+                "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+                default=_MAX_MLX_WORKERS,
+                maximum=_MAX_MLX_WORKERS,
+            ),
+            mix_workers=_safe_concurrency_setting(
+                "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
+                default=_MAX_MIX_WORKERS,
+                maximum=_MAX_MIX_WORKERS,
+            ),
+        )
+
+    @property
+    def mimo_process_slots(self) -> int:
+        """Only one MiMo synthesis subprocess may run in this web process."""
+        return 1
+
+    @property
+    def mimo_process_concurrency(self) -> int:
+        """A MiMo child process never creates parallel segment requests."""
+        return 1
+
+
+_WORKER_RESOURCE_BY_COMMAND = {
+    "synthesize_chapter_audio": "mimo",
+    "synthesize_segment_audio": "mimo",
+    "assemble_chapter_audio": "mix",
+    "analyze_chapter": "llm",
+    "plan_chapter_audio": "llm",
+    "apply_corrections": "llm",
+    "transcribe_chapter_audio": "mlx",
+    "generate_audio_assets": "mlx",
+    "mix_chapter_audio": "mix",
+    "convert_to_mp3": "mix",
+}
+
+
 def is_generic_character_key(value: object) -> bool:
     return character_name_key(value) in GENERIC_CHARACTER_KEYS
 
@@ -167,17 +312,36 @@ class ServerState:
         self.data_directory.mkdir(parents=True, exist_ok=True)
         self.books_directory.mkdir(parents=True, exist_ok=True)
         self.uploads_directory.mkdir(parents=True, exist_ok=True)
+        # Every worker child receives this path. The TTS layer locks it around
+        # the actual HTTP call, so reference generation, chapter synthesis,
+        # direct segments, and retries share one cross-process MiMo lane.
+        self.mimo_rate_state_path = self.data_directory / ".mimo-rate-state.json"
         self.db = sqlite3.connect(self.data_directory / "audiobook.db", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db_lock = threading.RLock()
-        self.worker_lock = threading.RLock()
-        self.stable_audio_generation_lock = threading.Lock()
+        self.concurrency = BatchConcurrencyConfig.from_environment()
+        self.worker_resource_semaphores = {
+            "mimo": threading.BoundedSemaphore(self.concurrency.mimo_process_slots),
+            "llm": threading.BoundedSemaphore(self.concurrency.llm_workers),
+            "mlx": threading.BoundedSemaphore(self.concurrency.mlx_workers),
+            "mix": threading.BoundedSemaphore(self.concurrency.mix_workers),
+        }
+        self._worker_resource_local = threading.local()
         self.stable_audio_jobs: dict[str, StableAudioJob] = {}
         self.batch_generation_lock = threading.RLock()
-        # A single book may have a long batch, and users may open another
-        # book in a second browser tab. Serialize the full pipeline globally:
-        # MiMo, Whisper, the LLM and MLX all compete for the same local box.
-        self.batch_generation_execution_lock = threading.Lock()
+        # The executor is shared by all books. Per-batch scheduler threads only
+        # claim work while a global slot is available, so a second book cannot
+        # create an unbounded queue behind the first one.
+        self.batch_chapter_executor = ThreadPoolExecutor(
+            max_workers=self.concurrency.chapter_workers,
+            thread_name_prefix="audiobook-chapter",
+        )
+        self.batch_chapter_slots = threading.BoundedSemaphore(
+            self.concurrency.chapter_workers
+        )
+        self.batch_stage_admission_lock = threading.RLock()
+        self._active_non_mimo_stage_workers = 0
+        self._batch_executor_shutdown = False
         self.batch_generation_jobs: dict[str, BatchGenerationJob] = {}
         self.web_port = int(os.environ.get("AUDIOBOOK_WEB_PORT", "8000"))
         self.initialize_database()
@@ -194,6 +358,9 @@ class ServerState:
                 for job in self.batch_generation_jobs.values()
             ):
                 return
+            if not self._batch_executor_shutdown:
+                self.batch_chapter_executor.shutdown(wait=False, cancel_futures=True)
+                self._batch_executor_shutdown = True
         self.db.close()
 
     def attach_web_port(self, port: int) -> None:
@@ -253,6 +420,8 @@ class ServerState:
                     position INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     current_stage TEXT,
+                    next_stage TEXT,
+                    stage_state TEXT,
                     error TEXT,
                     voice_audio_path TEXT,
                     mixed_audio_path TEXT,
@@ -295,7 +464,35 @@ class ServerState:
                 {
                     "duration_seconds": "REAL",
                     "stage_timings_json": "TEXT",
+                    "next_stage": "TEXT",
+                    "stage_state": "TEXT",
                 },
+            )
+            self.db.execute(
+                """
+                UPDATE generation_batch_chapters
+                SET next_stage = CASE
+                    WHEN status IN ('succeeded', 'failed', 'cancelled') THEN 'complete'
+                    ELSE 'voice_synthesize'
+                END
+                WHERE next_stage IS NULL OR next_stage = ''
+                """
+            )
+            self.db.execute(
+                """
+                UPDATE generation_batch_chapters
+                SET stage_state = CASE
+                    WHEN status IN ('succeeded', 'failed', 'cancelled') THEN 'complete'
+                    ELSE 'ready'
+                END
+                WHERE stage_state IS NULL OR stage_state = ''
+                """
+            )
+            self.db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_batch_chapters_ready
+                    ON generation_batch_chapters(batch_id, status, stage_state, position)
+                """
             )
             self.db.commit()
 
@@ -451,6 +648,7 @@ class ServerState:
                 )
                 self.db.execute(
                     "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                    "next_stage = 'complete', stage_state = 'complete', "
                     "completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE batch_id IN "
                     "(SELECT id FROM generation_batches WHERE book_id = ?) AND status IN ('queued', 'running')",
                     (now, now, book_id),
@@ -669,7 +867,7 @@ class ServerState:
         if command not in allowed:
             return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "unknown_command", "message": command}}
         self.validate_request_paths(request)
-        with self.worker_lock:
+        with self._worker_resource(command):
             with tempfile.TemporaryDirectory(prefix="audiobook-web-", dir=self.data_directory) as temp:
                 input_path = Path(temp) / "input.json"
                 output_path = Path(temp) / "output.json"
@@ -677,6 +875,15 @@ class ServerState:
                 environment = os.environ.copy()
                 environment.setdefault("AUDIOBOOK_TTS_DEVICE", "auto")
                 environment.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+                if _WORKER_RESOURCE_BY_COMMAND.get(command) == "mimo":
+                    # These settings are deliberately hard-coded. The child
+                    # also uses a file-backed gate at the real HTTP boundary,
+                    # which covers every process spawned by this web service.
+                    environment["AUDIOBOOK_MIMO_CONCURRENCY"] = "1"
+                    environment["AUDIOBOOK_MIMO_TOTAL_CONCURRENCY"] = "1"
+                    environment["AUDIOBOOK_MIMO_RATE_STATE_PATH"] = str(
+                        self.mimo_rate_state_path
+                    )
                 try:
                     completed = subprocess.run(
                         [sys.executable, "-m", "audiobook_worker.cli", command, str(input_path), str(output_path)],
@@ -696,6 +903,33 @@ class ServerState:
                 message = completed.stderr.strip() or f"worker exited with code {completed.returncode}"
                 return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "worker_exit_failed", "message": message}}
 
+    @contextmanager
+    def _worker_resource(self, command: str):
+        """Acquire only the scarce resource used by one worker command."""
+
+        resource = _WORKER_RESOURCE_BY_COMMAND.get(command)
+        if resource and resource == getattr(
+            self._worker_resource_local, "reserved_resource", None
+        ):
+            yield
+            return
+        semaphore = self.worker_resource_semaphores.get(resource) if resource else None
+        if semaphore is None:
+            yield
+            return
+        with semaphore:
+            yield
+
+    @contextmanager
+    def _reserved_worker_resource(self, resource: str | None):
+        """Let a stage worker use a permit admitted before executor submission."""
+        previous = getattr(self._worker_resource_local, "reserved_resource", None)
+        self._worker_resource_local.reserved_resource = resource
+        try:
+            yield
+        finally:
+            self._worker_resource_local.reserved_resource = previous
+
     # ------------------------------------------------------------------
     # Durable full-chapter generation batches
     # ------------------------------------------------------------------
@@ -709,6 +943,34 @@ class ServerState:
         except json.JSONDecodeError:
             return []
         return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+    def _mimo_cooldown_seconds(self) -> float | None:
+        """Expose a currently shared 429 cooldown without making it durable state.
+
+        The child TTS process owns the file and holds an advisory lock while it
+        writes. A status poll may observe an incomplete write, which is safely
+        treated as no displayable cooldown; the actual request gate remains the
+        authoritative enforcement point.
+        """
+
+        try:
+            raw = json.loads(self.mimo_rate_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        deadline = raw.get("cooldownUntilMonotonic")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return None
+        if not math.isfinite(deadline):
+            return None
+        now = time.monotonic()
+        # A persisted monotonic timestamp from a previous machine boot is not
+        # meaningful to this process. It is also ignored by the TTS request
+        # gate, so the UI must not display a stale multi-minute cooldown.
+        if deadline <= now or deadline > now + 301:
+            return None
+        return round(deadline - now, 3)
 
     def _batch_payload(self, batch_id: str) -> dict[str, object] | None:
         """Read one batch and its ordered chapter rows as a browser payload."""
@@ -746,6 +1008,8 @@ class ServerState:
                     "position": row["position"],
                     "status": status,
                     "currentStage": row["current_stage"],
+                    "nextStage": row["next_stage"],
+                    "stageState": row["stage_state"],
                     "error": row["error"],
                     "voiceAudioPath": row["voice_audio_path"],
                     "mixedAudioPath": row["mixed_audio_path"],
@@ -777,6 +1041,7 @@ class ServerState:
             "failedCount": failed_count,
             "cancelledCount": cancelled_count,
             "completedCount": succeeded_count + failed_count + cancelled_count,
+            "mimoCooldownSeconds": self._mimo_cooldown_seconds(),
             "chapters": chapters,
         }
 
@@ -807,8 +1072,8 @@ class ServerState:
         """Resume unfinished batches after a web-service restart.
 
         A process restart terminates a currently running worker subprocess.
-        Its chapter is therefore reset to queued and safely restarted from the
-        first cache-aware stage. Completed chapter outputs are left untouched.
+        Its precise stage checkpoint is retained and only that stage becomes
+        ready again; completed earlier stages and their artifacts stay intact.
         """
 
         now = time.time()
@@ -827,6 +1092,7 @@ class ServerState:
                     )
                     self.db.execute(
                         "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                        "next_stage = 'complete', stage_state = 'complete', "
                         "completed_at = COALESCE(completed_at, ?), updated_at = ? "
                         "WHERE batch_id = ? AND status IN ('queued', 'running')",
                         (now, now, batch_id),
@@ -838,9 +1104,8 @@ class ServerState:
                     (now, batch_id),
                 )
                 self.db.execute(
-                    "UPDATE generation_batch_chapters SET status = 'queued', current_stage = NULL, "
-                    "started_at = NULL, duration_seconds = NULL, stage_timings_json = NULL, "
-                    "updated_at = ? WHERE batch_id = ? AND status = 'running'",
+                    "UPDATE generation_batch_chapters SET stage_state = 'ready', current_stage = NULL, "
+                    "updated_at = ? WHERE batch_id = ? AND status IN ('queued', 'running')",
                     (now, batch_id),
                 )
             self.db.commit()
@@ -907,7 +1172,8 @@ class ServerState:
             )
             self.db.executemany(
                 "INSERT INTO generation_batch_chapters "
-                "(batch_id, chapter_id, position, status, updated_at) VALUES (?, ?, ?, 'queued', ?)",
+                "(batch_id, chapter_id, position, status, next_stage, stage_state, updated_at) "
+                "VALUES (?, ?, ?, 'queued', 'voice_synthesize', 'ready', ?)",
                 [
                     (batch_id, chapter_id, position, now)
                     for position, chapter_id in enumerate(chapter_ids)
@@ -968,27 +1234,6 @@ class ServerState:
             )
             self.db.commit()
         return self.batch_generation_status(batch_id)
-
-    def _set_batch_chapter_stage(
-        self,
-        batch_id: str,
-        chapter_id: str,
-        stage: str,
-    ) -> None:
-        now = time.time()
-        with self.db_lock:
-            self.db.execute(
-                "UPDATE generation_batches SET status = 'running', current_chapter_id = ?, "
-                "current_stage = ?, updated_at = ? WHERE id = ?",
-                (chapter_id, stage, now, batch_id),
-            )
-            self.db.execute(
-                "UPDATE generation_batch_chapters SET status = 'running', current_stage = ?, "
-                "started_at = COALESCE(started_at, ?), updated_at = ? "
-                "WHERE batch_id = ? AND chapter_id = ?",
-                (stage, now, now, batch_id, chapter_id),
-            )
-            self.db.commit()
 
     def _record_batch_stage_timing(
         self,
@@ -1082,45 +1327,6 @@ class ServerState:
             return error
         return fallback
 
-    def _run_batch_stage(
-        self,
-        batch_id: str,
-        chapter_id: str,
-        stage: str,
-        command: str,
-        request: dict[str, object],
-    ) -> dict[str, object]:
-        if self._batch_is_cancel_requested(batch_id):
-            raise InterruptedError("batch generation was cancelled")
-        self._set_batch_chapter_stage(batch_id, chapter_id, stage)
-        started_at = time.monotonic()
-        try:
-            if command == "generate_audio_assets":
-                # Keep MLX Stable Audio single-file even if a legacy single-asset
-                # request happens alongside a durable batch.
-                with self.stable_audio_generation_lock:
-                    result = self.run_worker(command, request)
-            else:
-                result = self.run_worker(command, request)
-        finally:
-            self._record_batch_stage_timing(
-                batch_id,
-                chapter_id,
-                stage,
-                time.monotonic() - started_at,
-            )
-        if result.get("status") != "succeeded":
-            raise BatchGenerationStageError(
-                stage,
-                self._worker_failure_message(result, f"{command} failed"),
-            )
-        # Cancellation is intentionally checked only at stage boundaries. A
-        # subprocess already in an inference call is allowed to return, so
-        # completed WAVs and manifests are never truncated or half-written.
-        if self._batch_is_cancel_requested(batch_id):
-            raise InterruptedError("batch generation was cancelled")
-        return result
-
     def _batch_chapter_inputs(
         self,
         batch_id: str,
@@ -1165,7 +1371,23 @@ class ServerState:
         }
         return context
 
-    def _execute_batch_chapter(self, batch_id: str, chapter_id: str) -> dict[str, object]:
+    @staticmethod
+    def _batch_stage_definition(next_stage: str) -> BatchStageDefinition:
+        definition = _BATCH_STAGE_DEFINITIONS.get(next_stage)
+        if definition is None:
+            raise BatchGenerationStageError(
+                "unknown",
+                f"Unknown durable batch stage: {next_stage}",
+            )
+        return definition
+
+    def _batch_stage_request(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        definition: BatchStageDefinition,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Build one stage's worker payload from durable chapter state."""
         context = self._batch_chapter_inputs(batch_id, chapter_id)
         force = bool(context["force"])
         cache_segments = bool(context["cacheSegments"]) and not force
@@ -1178,77 +1400,50 @@ class ServerState:
             "mergeSegments": True,
             "narratorVoiceId": context["narratorVoiceId"],
         }
-        self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "voice",
-            "synthesize_chapter_audio",
-            {
+        if definition.name == "voice_synthesize":
+            return context, {
                 **common_tts,
                 "outputDirectory": context["segmentAudioDirectory"],
                 "voiceProfileDirectory": context["voiceProfileDirectory"],
                 "cacheSegments": cache_segments,
                 "mixedOutputPath": context["mixedAudioPath"],
-            },
-        )
-        self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "voice",
-            "assemble_chapter_audio",
-            {
+            }
+        if definition.name == "voice_assemble":
+            return context, {
                 **common_tts,
                 "segmentAudioDirectory": context["segmentAudioDirectory"],
                 "outputPath": context["voiceAudioPath"],
-            },
-        )
-        self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "transcript",
-            "transcribe_chapter_audio",
-            {
+            }
+        if definition.name == "transcript":
+            return context, {
                 "bookId": context["bookId"],
                 "chapterId": chapter_id,
                 "scriptPath": context["scriptPath"],
                 "voiceAudioPath": context["voiceAudioPath"],
                 "analysisDirectory": context["analysisDirectory"],
-            },
-        )
-        self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "audio_plan",
-            "plan_chapter_audio",
-            {
+            }
+        if definition.name == "audio_plan":
+            return context, {
                 "bookId": context["bookId"],
                 "chapterId": chapter_id,
                 "scriptPath": context["scriptPath"],
-                "transcriptPath": str(Path(str(context["analysisDirectory"])) / "transcript.json"),
+                "transcriptPath": str(
+                    Path(str(context["analysisDirectory"])) / "transcript.json"
+                ),
                 "chapterTextPath": context["chapterTextPath"],
                 "analysisDirectory": context["analysisDirectory"],
-            },
-        )
-        assets_result = self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "stable_audio",
-            "generate_audio_assets",
-            {
+            }
+        if definition.name == "stable_audio":
+            return context, {
                 "bookId": context["bookId"],
                 "chapterId": chapter_id,
                 "scriptPath": context["scriptPath"],
                 "outputDirectory": context["audioAssetsDirectory"],
                 "mixedOutputPath": context["mixedAudioPath"],
                 "force": force,
-            },
-        )
-        self._run_batch_stage(
-            batch_id,
-            chapter_id,
-            "mix",
-            "mix_chapter_audio",
-            {
+            }
+        if definition.name == "mix":
+            return context, {
                 "bookId": context["bookId"],
                 "chapterId": chapter_id,
                 "scriptPath": context["scriptPath"],
@@ -1258,19 +1453,369 @@ class ServerState:
                 "outputPath": context["mixedAudioPath"],
                 "mergeSegments": True,
                 "narratorVoiceId": context["narratorVoiceId"],
-            },
+            }
+        raise BatchGenerationStageError(
+            definition.display_stage,
+            f"No worker request builder for {definition.name}.",
         )
-        return {
-            "voiceAudioPath": context["voiceAudioPath"],
-            "mixedAudioPath": context["mixedAudioPath"],
-            "audioAssets": assets_result.get("artifacts", []),
-        }
+
+    def _ready_batch_stage_candidates(self, batch_id: str) -> list[tuple[str, str]]:
+        """Read durable stages without claiming them so resource admission wins."""
+        with self.db_lock:
+            batch = self.db.execute(
+                "SELECT cancel_requested FROM generation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None or batch["cancel_requested"]:
+                return []
+            rows = self.db.execute(
+                """
+                SELECT chapter_id, next_stage
+                FROM generation_batch_chapters
+                WHERE batch_id = ?
+                  AND status IN ('queued', 'running')
+                  AND stage_state = 'ready'
+                  AND next_stage != 'complete'
+                ORDER BY CASE next_stage WHEN 'voice_synthesize' THEN 0 ELSE 1 END,
+                         position ASC
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [(str(row["chapter_id"]), str(row["next_stage"])) for row in rows]
+
+    def _has_pending_mimo_stage(self) -> bool:
+        """Reserve one worker position when any chapter needs serialized voice."""
+        with self.db_lock:
+            row = self.db.execute(
+                """
+                SELECT 1
+                FROM generation_batch_chapters AS bc
+                JOIN generation_batches AS b ON b.id = bc.batch_id
+                WHERE b.cancel_requested = 0
+                  AND b.status IN ('queued', 'running')
+                  AND bc.status IN ('queued', 'running')
+                  AND bc.next_stage = 'voice_synthesize'
+                  AND bc.stage_state IN ('ready', 'running')
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def _try_acquire_batch_stage_slot(
+        self,
+        resource: str | None,
+        *,
+        reserve_mimo_slot: bool,
+    ) -> bool:
+        """Reserve a real subprocess slot without allowing MiMo starvation."""
+        if not self.batch_chapter_slots.acquire(blocking=False):
+            return False
+        if resource != "mimo":
+            with self.batch_stage_admission_lock:
+                if reserve_mimo_slot and self._active_non_mimo_stage_workers >= 3:
+                    self.batch_chapter_slots.release()
+                    return False
+                self._active_non_mimo_stage_workers += 1
+        return True
+
+    def _release_batch_stage_slot(self, resource: str | None) -> None:
+        if resource != "mimo":
+            with self.batch_stage_admission_lock:
+                self._active_non_mimo_stage_workers = max(
+                    0,
+                    self._active_non_mimo_stage_workers - 1,
+                )
+        self.batch_chapter_slots.release()
+
+    def _claim_ready_batch_stage(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        definition: BatchStageDefinition,
+    ) -> bool:
+        """Atomically claim one ready checkpoint after capacity is reserved."""
+        now = time.time()
+        with self.db_lock:
+            batch = self.db.execute(
+                "SELECT cancel_requested FROM generation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None or batch["cancel_requested"]:
+                return False
+            claimed = self.db.execute(
+                """
+                UPDATE generation_batch_chapters
+                SET status = 'running',
+                    current_stage = ?,
+                    stage_state = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE batch_id = ?
+                  AND chapter_id = ?
+                  AND status IN ('queued', 'running')
+                  AND next_stage = ?
+                  AND stage_state = 'ready'
+                """,
+                (
+                    definition.display_stage,
+                    now,
+                    now,
+                    batch_id,
+                    chapter_id,
+                    definition.name,
+                ),
+            )
+            if claimed.rowcount != 1:
+                return False
+            self.db.execute(
+                """
+                UPDATE generation_batches
+                SET status = 'running',
+                    current_chapter_id = ?,
+                    current_stage = ?,
+                    updated_at = ?
+                WHERE id = ? AND cancel_requested = 0
+                """,
+                (chapter_id, definition.display_stage, now, batch_id),
+            )
+            self.db.commit()
+        return True
+
+    def _return_batch_stage_to_ready(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        definition: BatchStageDefinition,
+    ) -> None:
+        """Undo a claim when executor submission itself fails."""
+        with self.db_lock:
+            self.db.execute(
+                """
+                UPDATE generation_batch_chapters
+                SET current_stage = NULL, stage_state = 'ready', updated_at = ?
+                WHERE batch_id = ?
+                  AND chapter_id = ?
+                  AND status = 'running'
+                  AND next_stage = ?
+                  AND stage_state = 'running'
+                """,
+                (time.time(), batch_id, chapter_id, definition.name),
+            )
+            self.db.commit()
+
+    def _advance_batch_stage(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        definition: BatchStageDefinition,
+        context: dict[str, object],
+        result: dict[str, object],
+    ) -> None:
+        """Persist completed artifacts and make exactly one later stage ready."""
+        now = time.time()
+        voice_audio_path = (
+            str(context["voiceAudioPath"])
+            if definition.name == "voice_assemble"
+            else None
+        )
+        mixed_audio_path = (
+            str(context["mixedAudioPath"]) if definition.name == "mix" else None
+        )
+        audio_assets_json = (
+            json.dumps(
+                result.get("artifacts")
+                if isinstance(result.get("artifacts"), list)
+                else [],
+                ensure_ascii=False,
+            )
+            if definition.name == "stable_audio"
+            else None
+        )
+        completed = definition.next_stage == "complete"
+        with self.db_lock:
+            if completed:
+                self.db.execute(
+                    """
+                    UPDATE generation_batch_chapters
+                    SET status = 'succeeded',
+                        current_stage = NULL,
+                        next_stage = 'complete',
+                        stage_state = 'complete',
+                        error = NULL,
+                        voice_audio_path = COALESCE(?, voice_audio_path),
+                        mixed_audio_path = COALESCE(?, mixed_audio_path),
+                        audio_assets_json = COALESCE(?, audio_assets_json),
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE batch_id = ? AND chapter_id = ? AND stage_state = 'running'
+                    """,
+                    (
+                        voice_audio_path,
+                        mixed_audio_path,
+                        audio_assets_json,
+                        now,
+                        now,
+                        batch_id,
+                        chapter_id,
+                    ),
+                )
+            else:
+                self.db.execute(
+                    """
+                    UPDATE generation_batch_chapters
+                    SET status = 'running',
+                        current_stage = NULL,
+                        next_stage = ?,
+                        stage_state = 'ready',
+                        error = NULL,
+                        voice_audio_path = COALESCE(?, voice_audio_path),
+                        mixed_audio_path = COALESCE(?, mixed_audio_path),
+                        audio_assets_json = COALESCE(?, audio_assets_json),
+                        updated_at = ?
+                    WHERE batch_id = ? AND chapter_id = ? AND stage_state = 'running'
+                    """,
+                    (
+                        definition.next_stage,
+                        voice_audio_path,
+                        mixed_audio_path,
+                        audio_assets_json,
+                        now,
+                        batch_id,
+                        chapter_id,
+                    ),
+                )
+            self.db.execute(
+                """
+                UPDATE generation_batches
+                SET current_chapter_id = CASE
+                        WHEN current_chapter_id = ? THEN NULL
+                        ELSE current_chapter_id
+                    END,
+                    current_stage = CASE
+                        WHEN current_chapter_id = ? THEN NULL
+                        ELSE current_stage
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (chapter_id, chapter_id, now, batch_id),
+            )
+            self.db.commit()
+        if completed:
+            self._complete_batch_chapter_timing(batch_id, chapter_id, now)
+
+    def _run_claimed_batch_stage(
+        self,
+        batch_id: str,
+        chapter_id: str,
+        definition: BatchStageDefinition,
+    ) -> None:
+        """Run one admitted checkpoint and always release its reservations."""
+        started_at = time.monotonic()
+        try:
+            if self._batch_is_cancel_requested(batch_id):
+                raise InterruptedError("batch generation was cancelled")
+            context, request = self._batch_stage_request(
+                batch_id,
+                chapter_id,
+                definition,
+            )
+            with self._reserved_worker_resource(definition.resource):
+                result = self.run_worker(definition.command, request)
+            if result.get("status") != "succeeded":
+                raise BatchGenerationStageError(
+                    definition.display_stage,
+                    self._worker_failure_message(
+                        result,
+                        f"{definition.command} failed",
+                    ),
+                )
+            if self._batch_is_cancel_requested(batch_id):
+                raise InterruptedError("batch generation was cancelled")
+            self._advance_batch_stage(
+                batch_id,
+                chapter_id,
+                definition,
+                context,
+                result,
+            )
+        except InterruptedError:
+            self._mark_batch_chapter_cancelled(batch_id, chapter_id)
+        except BatchGenerationStageError as error:
+            self._mark_batch_chapter_failed(
+                batch_id,
+                chapter_id,
+                error.stage,
+                str(error),
+            )
+        except Exception as error:  # pragma: no cover - defensive server boundary
+            self._mark_batch_chapter_failed(
+                batch_id,
+                chapter_id,
+                definition.display_stage,
+                str(error),
+            )
+        finally:
+            self._record_batch_stage_timing(
+                batch_id,
+                chapter_id,
+                definition.display_stage,
+                time.monotonic() - started_at,
+            )
+            semaphore = self.worker_resource_semaphores.get(definition.resource)
+            if semaphore is not None:
+                semaphore.release()
+            self._release_batch_stage_slot(definition.resource)
+
+    def _try_dispatch_batch_stage(
+        self,
+        batch_id: str,
+        futures: set[Future[None]],
+    ) -> bool:
+        """Submit one ready stage only after worker and resource admission."""
+        reserve_mimo_slot = self._has_pending_mimo_stage()
+        for chapter_id, next_stage in self._ready_batch_stage_candidates(batch_id):
+            try:
+                definition = self._batch_stage_definition(next_stage)
+            except BatchGenerationStageError:
+                continue
+            if not self._try_acquire_batch_stage_slot(
+                definition.resource,
+                reserve_mimo_slot=reserve_mimo_slot,
+            ):
+                return False
+            semaphore = self.worker_resource_semaphores.get(definition.resource)
+            if semaphore is not None and not semaphore.acquire(blocking=False):
+                self._release_batch_stage_slot(definition.resource)
+                continue
+            if not self._claim_ready_batch_stage(batch_id, chapter_id, definition):
+                if semaphore is not None:
+                    semaphore.release()
+                self._release_batch_stage_slot(definition.resource)
+                continue
+            try:
+                future = self.batch_chapter_executor.submit(
+                    self._run_claimed_batch_stage,
+                    batch_id,
+                    chapter_id,
+                    definition,
+                )
+            except Exception:
+                self._return_batch_stage_to_ready(batch_id, chapter_id, definition)
+                if semaphore is not None:
+                    semaphore.release()
+                self._release_batch_stage_slot(definition.resource)
+                raise
+            futures.add(future)
+            return True
+        return False
 
     def _finish_cancelled_batch(self, batch_id: str) -> None:
         now = time.time()
         with self.db_lock:
             self.db.execute(
                 "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                "next_stage = 'complete', stage_state = 'complete', "
                 "completed_at = COALESCE(completed_at, ?), "
                 "duration_seconds = CASE WHEN started_at IS NULL THEN duration_seconds "
                 "ELSE ROUND(MAX(0.0, ? - started_at), 3) END, updated_at = ? "
@@ -1294,12 +1839,12 @@ class ServerState:
                 return True
             if batch["cancel_requested"]:
                 return False
-            pending = self.db.execute(
+            unfinished = self.db.execute(
                 "SELECT COUNT(*) AS count FROM generation_batch_chapters "
-                "WHERE batch_id = ? AND status = 'queued'",
+                "WHERE batch_id = ? AND status IN ('queued', 'running')",
                 (batch_id,),
             ).fetchone()
-            if pending is not None and int(pending["count"]) > 0:
+            if unfinished is not None and int(unfinished["count"]) > 0:
                 return False
             failed = self.db.execute(
                 "SELECT COUNT(*) AS count FROM generation_batch_chapters "
@@ -1315,15 +1860,6 @@ class ServerState:
             self.db.commit()
         return True
 
-    def _next_queued_batch_chapter(self, batch_id: str) -> str | None:
-        with self.db_lock:
-            row = self.db.execute(
-                "SELECT chapter_id FROM generation_batch_chapters WHERE batch_id = ? "
-                "AND status = 'queued' ORDER BY position ASC LIMIT 1",
-                (batch_id,),
-            ).fetchone()
-        return str(row["chapter_id"]) if row is not None else None
-
     def _mark_batch_chapter_failed(
         self,
         batch_id: str,
@@ -1333,85 +1869,81 @@ class ServerState:
     ) -> None:
         now = time.time()
         with self.db_lock:
+            # Do not overwrite an already terminal row if the user cancelled
+            # just as the worker completed a stage.
             self._record_batch_chapter_error_timing(batch_id, chapter_id, now)
             self.db.execute(
-                "UPDATE generation_batch_chapters SET status = 'failed', current_stage = ?, error = ?, "
-                "completed_at = ?, updated_at = ? WHERE batch_id = ? AND chapter_id = ?",
+                "UPDATE generation_batch_chapters SET status = 'failed', current_stage = ?, "
+                "next_stage = 'complete', stage_state = 'complete', error = ?, "
+                "completed_at = ?, updated_at = ? WHERE batch_id = ? AND chapter_id = ? "
+                "AND status = 'running'",
                 (stage, message, now, now, batch_id, chapter_id),
             )
             self.db.execute(
                 "UPDATE generation_batches SET current_chapter_id = NULL, current_stage = NULL, "
-                "updated_at = ? WHERE id = ?",
-                (now, batch_id),
+                "updated_at = ? WHERE id = ? AND current_chapter_id = ?",
+                (now, batch_id, chapter_id),
             )
             self.db.commit()
 
-    def _mark_batch_chapter_succeeded(
-        self,
-        batch_id: str,
-        chapter_id: str,
-        result: dict[str, object],
-    ) -> None:
+    def _mark_batch_chapter_cancelled(self, batch_id: str, chapter_id: str) -> None:
+        """Finish one claimed chapter after cancellation at a stage boundary."""
+
         now = time.time()
-        artifacts = result.get("audioAssets")
-        serialized_assets = json.dumps(
-            artifacts if isinstance(artifacts, list) else [], ensure_ascii=False
-        )
         with self.db_lock:
+            self._record_batch_chapter_error_timing(batch_id, chapter_id, now)
             self.db.execute(
-                "UPDATE generation_batch_chapters SET status = 'succeeded', current_stage = NULL, error = NULL, "
-                "voice_audio_path = ?, mixed_audio_path = ?, audio_assets_json = ?, completed_at = ?, "
-                "updated_at = ? WHERE batch_id = ? AND chapter_id = ?",
-                (
-                    str(result.get("voiceAudioPath") or ""),
-                    str(result.get("mixedAudioPath") or ""),
-                    serialized_assets,
-                    now,
-                    now,
-                    batch_id,
-                    chapter_id,
-                ),
+                "UPDATE generation_batch_chapters SET status = 'cancelled', current_stage = NULL, "
+                "next_stage = 'complete', stage_state = 'complete', "
+                "completed_at = ?, updated_at = ? WHERE batch_id = ? AND chapter_id = ? "
+                "AND status = 'running'",
+                (now, now, batch_id, chapter_id),
             )
             self.db.execute(
                 "UPDATE generation_batches SET current_chapter_id = NULL, current_stage = NULL, "
-                "updated_at = ? WHERE id = ?",
-                (now, batch_id),
+                "updated_at = ? WHERE id = ? AND current_chapter_id = ?",
+                (now, batch_id, chapter_id),
             )
             self.db.commit()
-        self._complete_batch_chapter_timing(batch_id, chapter_id, now)
 
     def _run_batch_generation(self, batch_id: str) -> None:
-        """Run full chapters in one server-side queue, continuing after errors."""
+        """Schedule durable checkpoints, never a whole chapter at once."""
 
+        futures: set[Future[None]] = set()
         try:
-            with self.batch_generation_execution_lock:
-                while True:
-                    if self._batch_is_cancel_requested(batch_id):
+            while True:
+                cancelled = self._batch_is_cancel_requested(batch_id)
+                if not cancelled:
+                    # Only stages with both a worker slot and the exact
+                    # resource permit are submitted. No executor thread sits
+                    # blocked behind MiMo, MLX, LLM, or ffmpeg capacity.
+                    while self._try_dispatch_batch_stage(batch_id, futures):
+                        pass
+
+                if futures:
+                    done, _ = wait(
+                        futures,
+                        timeout=0.05,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    futures.difference_update(done)
+                    # The stage worker persists expected failures itself.
+                    # Calling result here surfaces only programming errors
+                    # instead of silently losing an admission slot.
+                    for future in done:
+                        future.result()
+
+                if cancelled:
+                    if not futures:
                         self._finish_cancelled_batch(batch_id)
                         return
-                    chapter_id = self._next_queued_batch_chapter(batch_id)
-                    if chapter_id is None:
-                        self._finish_batch_if_done(batch_id)
+                    continue
+                if not futures:
+                    if self._finish_batch_if_done(batch_id):
                         return
-                    try:
-                        result = self._execute_batch_chapter(batch_id, chapter_id)
-                    except InterruptedError:
-                        self._finish_cancelled_batch(batch_id)
-                        return
-                    except BatchGenerationStageError as error:
-                        self._mark_batch_chapter_failed(
-                            batch_id, chapter_id, error.stage, str(error)
-                        )
-                        continue
-                    except Exception as error:  # pragma: no cover - defensive server boundary
-                        self._mark_batch_chapter_failed(
-                            batch_id, chapter_id, "unknown", str(error)
-                        )
-                        continue
-                    if self._batch_is_cancel_requested(batch_id):
-                        self._finish_cancelled_batch(batch_id)
-                        return
-                    self._mark_batch_chapter_succeeded(batch_id, chapter_id, result)
+                # A resource may belong to another batch. Yield briefly and
+                # re-check durable ready rows instead of occupying a worker.
+                time.sleep(0.02)
         finally:
             with self.batch_generation_lock:
                 job = self.batch_generation_jobs.get(batch_id)
@@ -1446,8 +1978,7 @@ class ServerState:
                 job.status = "running"
                 job.updated_at = time.time()
             request = dict(job.request)
-            with self.stable_audio_generation_lock:
-                result = self.run_worker("generate_audio_assets", request)
+            result = self.run_worker("generate_audio_assets", request)
             with self.batch_generation_lock:
                 job = self.stable_audio_jobs.get(job_id)
                 if job is None:

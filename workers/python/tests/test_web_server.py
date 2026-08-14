@@ -1,9 +1,14 @@
 import json
+import threading
 import time
 import wave
 from pathlib import Path
 
-from audiobook_worker.web_server import ServerState, safe_filename
+from audiobook_worker.web_server import (
+    BatchConcurrencyConfig,
+    ServerState,
+    safe_filename,
+)
 
 
 def _write_wav(path: Path) -> None:
@@ -277,21 +282,7 @@ def test_batch_generation_runs_chapters_in_order_and_persists_outputs(
         state, str(started["batchId"]), lambda response: response["status"] == "succeeded"
     )
 
-    assert [chapter for chapter, _ in calls] == [
-        "chapter_001",
-        "chapter_001",
-        "chapter_001",
-        "chapter_001",
-        "chapter_001",
-        "chapter_001",
-        "chapter_002",
-        "chapter_002",
-        "chapter_002",
-        "chapter_002",
-        "chapter_002",
-        "chapter_002",
-    ]
-    assert [command for _, command in calls[:6]] == [
+    expected_stage_commands = [
         "synthesize_chapter_audio",
         "assemble_chapter_audio",
         "transcribe_chapter_audio",
@@ -299,11 +290,417 @@ def test_batch_generation_runs_chapters_in_order_and_persists_outputs(
         "generate_audio_assets",
         "mix_chapter_audio",
     ]
+    # Chapter pipelines may now overlap. The durable contract is that each
+    # chapter itself keeps this stage order, not that one whole chapter must
+    # finish before the scheduler starts the next one.
+    assert {chapter_id for chapter_id, _ in calls} == {
+        "chapter_001",
+        "chapter_002",
+    }
+    for chapter_id in ("chapter_001", "chapter_002"):
+        assert [
+            command for called_chapter_id, command in calls if called_chapter_id == chapter_id
+        ] == expected_stage_commands
     assert finished["succeededCount"] == 2
     assert all(chapter["status"] == "succeeded" for chapter in finished["chapters"])
     assert finished["chapters"][0]["mixedAudioPath"] == str(
         work_dir / "audio" / "chapter_001_mixed.wav"
     )
+    state.close()
+
+
+def test_batch_generation_releases_mimo_for_the_next_chapter_while_later_stages_run(
+    tmp_path: Path, monkeypatch
+):
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001", "chapter_002"))
+    first_voice_started = threading.Event()
+    allow_first_voice_to_finish = threading.Event()
+    first_later_stage_started = threading.Event()
+    second_voice_started = threading.Event()
+    release_workers = threading.Event()
+    active_mimo = 0
+    maximum_mimo = 0
+    calls: list[tuple[str, str]] = []
+    lock = threading.Lock()
+
+    def fake_worker(command: str, request: dict[str, object]):
+        nonlocal active_mimo, maximum_mimo
+        chapter_id = str(request["chapterId"])
+        with lock:
+            calls.append((chapter_id, command))
+        if command == "synthesize_chapter_audio":
+            with lock:
+                active_mimo += 1
+                maximum_mimo = max(maximum_mimo, active_mimo)
+            try:
+                if chapter_id == "chapter_001":
+                    first_voice_started.set()
+                    allow_first_voice_to_finish.wait(timeout=2)
+                else:
+                    second_voice_started.set()
+                    release_workers.wait(timeout=2)
+            finally:
+                with lock:
+                    active_mimo -= 1
+        elif chapter_id == "chapter_001" and command == "assemble_chapter_audio":
+            first_later_stage_started.set()
+            release_workers.wait(timeout=2)
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    started_batch = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001", "chapter_002"]}
+    )
+
+    assert first_voice_started.wait(timeout=1)
+    time.sleep(0.05)
+    assert not second_voice_started.is_set()
+    allow_first_voice_to_finish.set()
+    assert second_voice_started.wait(timeout=1)
+    assert first_later_stage_started.wait(timeout=1)
+    assert maximum_mimo == 1
+    release_workers.set()
+    finished = _wait_for_batch(
+        state,
+        str(started_batch["batchId"]),
+        lambda response: response["status"] == "succeeded",
+    )
+
+    assert finished["succeededCount"] == 2
+    assert calls.index(("chapter_002", "synthesize_chapter_audio")) > calls.index(
+        ("chapter_001", "synthesize_chapter_audio")
+    )
+    state.close()
+
+
+def test_batch_generation_never_marks_a_batch_done_while_a_chapter_is_running(
+    tmp_path: Path, monkeypatch
+):
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001", "chapter_002"))
+    first_finished = threading.Event()
+    second_mix_started = threading.Event()
+    release_second = threading.Event()
+
+    def fake_worker(command: str, request: dict[str, object]):
+        chapter_id = str(request["chapterId"])
+        if command == "mix_chapter_audio" and chapter_id == "chapter_002":
+            second_mix_started.set()
+            release_second.wait(timeout=2)
+        if command == "mix_chapter_audio" and chapter_id == "chapter_001":
+            first_finished.set()
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    started = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001", "chapter_002"]}
+    )
+    assert first_finished.wait(timeout=1)
+    assert second_mix_started.wait(timeout=1)
+    _wait_for_batch(
+        state,
+        str(started["batchId"]),
+        lambda response: response["succeededCount"] == 1,
+    )
+
+    assert state._finish_batch_if_done(str(started["batchId"])) is False
+    assert state.batch_generation_status(str(started["batchId"]))["status"] == "running"
+    release_second.set()
+    _wait_for_batch(
+        state,
+        str(started["batchId"]),
+        lambda response: response["status"] == "succeeded",
+    )
+    state.close()
+
+
+def test_batch_generation_claim_is_atomic_under_competing_schedulers(tmp_path: Path, monkeypatch):
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001",))
+    now = time.time()
+    state.db.execute(
+        "INSERT INTO generation_batches "
+        "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
+        "VALUES ('batch_claim', 'book_123', 'queued', 0, 1, 0, ?, ?)",
+        (now, now),
+    )
+    state.db.execute(
+        "INSERT INTO generation_batch_chapters "
+        "(batch_id, chapter_id, position, status, next_stage, stage_state, updated_at) "
+        "VALUES ('batch_claim', 'chapter_001', 0, 'queued', 'voice_synthesize', 'ready', ?)",
+        (now,),
+    )
+    state.db.commit()
+    barrier = threading.Barrier(2)
+    claims: list[bool] = []
+    definition = state._batch_stage_definition("voice_synthesize")
+
+    def claim():
+        barrier.wait(timeout=1)
+        claims.append(
+            state._claim_ready_batch_stage("batch_claim", "chapter_001", definition)
+        )
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert claims.count(True) == 1
+    assert claims.count(False) == 1
+    chapter = state.batch_generation_status("batch_claim")["chapters"][0]
+    assert chapter["status"] == "running"
+    assert chapter["nextStage"] == "voice_synthesize"
+    assert chapter["stageState"] == "running"
+    state.close()
+
+
+def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
+    monkeypatch
+):
+    for name in (
+        "AUDIOBOOK_BATCH_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
+        "AUDIOBOOK_MIMO_CONCURRENCY",
+        "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    defaults = BatchConcurrencyConfig.from_environment()
+    assert defaults.chapter_workers == 4
+    assert defaults.mimo_total == 1
+    assert defaults.mimo_per_process == 1
+    assert defaults.mimo_process_slots == 1
+    assert defaults.mimo_process_concurrency == 1
+    assert defaults.llm_workers == 2
+    assert defaults.mlx_workers == 1
+    assert defaults.mix_workers == 2
+
+    for name in (
+        "AUDIOBOOK_BATCH_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
+        "AUDIOBOOK_MIMO_CONCURRENCY",
+        "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
+    ):
+        monkeypatch.setenv(name, "99")
+    capped = BatchConcurrencyConfig.from_environment()
+    assert capped.chapter_workers == 4
+    assert capped.mimo_total == 1
+    assert capped.mimo_per_process == 1
+    assert capped.mimo_process_slots == 1
+    assert capped.llm_workers == 2
+    assert capped.mlx_workers == 1
+    assert capped.mix_workers == 2
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_TOTAL_CONCURRENCY", "1")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "4")
+    minimum_mimo = BatchConcurrencyConfig.from_environment()
+    assert minimum_mimo.mimo_total == 1
+    assert minimum_mimo.mimo_per_process == 1
+    assert minimum_mimo.mimo_process_concurrency == 1
+    assert minimum_mimo.mimo_process_slots == 1
+
+
+def test_batch_status_exposes_the_shared_mimo_rate_cooldown(tmp_path: Path, monkeypatch):
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001",))
+    monkeypatch.setattr(state, "_launch_batch_generation_locked", lambda _batch_id: None)
+    started = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001"]}
+    )
+    state.mimo_rate_state_path.write_text(
+        json.dumps({"cooldownUntilMonotonic": time.monotonic() + 5.0}),
+        encoding="utf-8",
+    )
+
+    cooldown = state.batch_generation_status(str(started["batchId"]))["mimoCooldownSeconds"]
+
+    assert isinstance(cooldown, float)
+    assert 4.0 <= cooldown <= 5.0
+    state.close()
+
+
+def test_batch_stage_admission_keeps_one_worker_slot_for_waiting_mimo(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state = ServerState(tmp_path)
+    chapter_ids = (
+        "chapter_001",
+        "chapter_002",
+        "chapter_003",
+        "chapter_004",
+        "chapter_005",
+    )
+    _seed_batch_book(state, chapter_ids)
+    now = time.time()
+    state.db.execute(
+        "INSERT INTO generation_batches "
+        "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
+        "VALUES ('batch_reservation', 'book_123', 'queued', 0, 1, 0, ?, ?)",
+        (now, now),
+    )
+    state.db.executemany(
+        "INSERT INTO generation_batch_chapters "
+        "(batch_id, chapter_id, position, status, next_stage, stage_state, updated_at) "
+        "VALUES ('batch_reservation', ?, ?, 'queued', ?, 'ready', ?)",
+        [
+            ("chapter_001", 0, "voice_synthesize", now),
+            ("chapter_002", 1, "audio_plan", now),
+            ("chapter_003", 2, "audio_plan", now),
+            ("chapter_004", 3, "voice_assemble", now),
+            ("chapter_005", 4, "mix", now),
+        ],
+    )
+    state.db.commit()
+
+    entered_three_non_mimo_stages = threading.Event()
+    release_workers = threading.Event()
+    calls: list[tuple[str, str]] = []
+    calls_lock = threading.Lock()
+
+    def fake_worker(command: str, request: dict[str, object]):
+        with calls_lock:
+            calls.append((str(request["chapterId"]), command))
+            if len(calls) == 3:
+                entered_three_non_mimo_stages.set()
+        release_workers.wait(timeout=2)
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    # Model a direct MiMo request already holding the one resource permit.
+    # The queued voice stage must then reserve the fourth worker position
+    # instead of allowing all four later-stage workers to start.
+    assert state.worker_resource_semaphores["mimo"].acquire(blocking=False)
+    try:
+        with state.batch_generation_lock:
+            state._launch_batch_generation_locked("batch_reservation")
+        assert entered_three_non_mimo_stages.wait(timeout=1)
+        time.sleep(0.05)
+        assert len(calls) == 3
+        assert {command for _, command in calls} == {
+            "plan_chapter_audio",
+            "assemble_chapter_audio",
+        }
+
+        state.cancel_batch_generation("batch_reservation")
+        release_workers.set()
+    finally:
+        state.worker_resource_semaphores["mimo"].release()
+
+    finished = _wait_for_batch(
+        state,
+        "batch_reservation",
+        lambda response: response["status"] == "cancelled",
+    )
+    assert all(chapter["status"] == "cancelled" for chapter in finished["chapters"])
+    state.close()
+
+
+def test_worker_resource_limits_bound_mimo_mlx_llm_and_mix_commands(
+    tmp_path: Path, monkeypatch
+):
+    for name in (
+        "AUDIOBOOK_BATCH_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
+        "AUDIOBOOK_MIMO_CONCURRENCY",
+        "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    state = ServerState(tmp_path)
+    active: dict[str, int] = {"mimo": 0, "mlx": 0, "llm": 0, "mix": 0}
+    maximum: dict[str, int] = {"mimo": 0, "mlx": 0, "llm": 0, "mix": 0}
+    lock = threading.Lock()
+    release = threading.Event()
+    entered: dict[str, threading.Event] = {
+        "mimo": threading.Event(),
+        "mlx": threading.Event(),
+        "llm": threading.Event(),
+        "mix": threading.Event(),
+    }
+    resource_by_command = {
+        "synthesize_chapter_audio": "mimo",
+        "synthesize_segment_audio": "mimo",
+        "transcribe_chapter_audio": "mlx",
+        "plan_chapter_audio": "llm",
+        "mix_chapter_audio": "mix",
+        "convert_to_mp3": "mix",
+    }
+
+    mimo_process_concurrencies: list[str | None] = []
+    mimo_rate_state_paths: list[str | None] = []
+
+    def fake_subprocess_run(_args, **kwargs):
+        command = str(_args[3])
+        resource = resource_by_command[command]
+        if resource == "mimo":
+            environment = kwargs.get("env")
+            mimo_process_concurrencies.append(
+                environment.get("AUDIOBOOK_MIMO_CONCURRENCY")
+                if isinstance(environment, dict)
+                else None
+            )
+            mimo_rate_state_paths.append(
+                environment.get("AUDIOBOOK_MIMO_RATE_STATE_PATH")
+                if isinstance(environment, dict)
+                else None
+            )
+        with lock:
+            active[resource] += 1
+            maximum[resource] = max(maximum[resource], active[resource])
+            entered[resource].set()
+        release.wait(timeout=2)
+        with lock:
+            active[resource] -= 1
+        output_path = Path(_args[5])
+        output_path.write_text(
+            json.dumps({"status": "succeeded", "warnings": [], "artifacts": []}),
+            encoding="utf-8",
+        )
+        return type("Completed", (), {"stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("audiobook_worker.web_server.subprocess.run", fake_subprocess_run)
+    requests = [
+        ("synthesize_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("synthesize_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("synthesize_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("synthesize_segment_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("transcribe_chapter_audio", {"voiceAudioPath": str(tmp_path / "voice.wav")}),
+        ("transcribe_chapter_audio", {"voiceAudioPath": str(tmp_path / "voice.wav")}),
+        ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("mix_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("mix_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
+        ("convert_to_mp3", {"wavPath": str(tmp_path / "voice.wav")}),
+    ]
+    threads = [
+        threading.Thread(target=state.run_worker, args=(command, request))
+        for command, request in requests
+    ]
+    for thread in threads:
+        thread.start()
+    assert entered["mimo"].wait(timeout=1)
+    assert entered["mlx"].wait(timeout=1)
+    assert entered["llm"].wait(timeout=1)
+    assert entered["mix"].wait(timeout=1)
+    time.sleep(0.05)
+    assert maximum == {"mimo": 1, "mlx": 1, "llm": 2, "mix": 2}
+    assert mimo_process_concurrencies == ["1"]
+    assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)]
+    release.set()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert mimo_process_concurrencies == ["1", "1", "1", "1"]
+    assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)] * 4
     state.close()
 
 
@@ -351,7 +748,7 @@ def test_batch_generation_upgrades_legacy_database_with_timing_columns(tmp_path:
         row[1]
         for row in state.db.execute("PRAGMA table_info(generation_batch_chapters)").fetchall()
     }
-    assert {"duration_seconds", "stage_timings_json"} <= columns
+    assert {"duration_seconds", "stage_timings_json", "next_stage", "stage_state"} <= columns
     state.close()
 
 
@@ -419,7 +816,7 @@ def test_batch_generation_cancel_marks_remaining_chapters_without_losing_complet
     state.close()
 
 
-def test_batch_generation_resumes_queued_rows_after_restart(tmp_path: Path, monkeypatch):
+def test_batch_generation_resumes_only_the_interrupted_stage_after_restart(tmp_path: Path, monkeypatch):
     first_state = ServerState(tmp_path)
     _seed_batch_book(first_state, ("chapter_001",))
     now = time.time()
@@ -430,8 +827,13 @@ def test_batch_generation_resumes_queued_rows_after_restart(tmp_path: Path, monk
     )
     first_state.db.execute(
         "INSERT INTO generation_batch_chapters (batch_id, chapter_id, position, status, current_stage, updated_at) "
-        "VALUES ('batch_1', 'chapter_001', 0, 'running', 'mix', ?)",
+        "VALUES ('batch_1', 'chapter_001', 0, 'running', 'audio_plan', ?)",
         (now,),
+    )
+    first_state.db.execute(
+        "UPDATE generation_batch_chapters SET next_stage = 'audio_plan', stage_state = 'running', "
+        "voice_audio_path = ?, stage_timings_json = ? WHERE batch_id = 'batch_1' AND chapter_id = 'chapter_001'",
+        ("/existing/chapter_001.wav", json.dumps({"voice": 12.5})),
     )
     first_state.db.commit()
     first_state.close()
@@ -441,8 +843,13 @@ def test_batch_generation_resumes_queued_rows_after_restart(tmp_path: Path, monk
     payload = resumed.batch_generation_status("batch_1")
 
     assert payload["status"] == "queued"
-    assert payload["chapters"][0]["status"] == "queued"
-    assert payload["chapters"][0]["currentStage"] is None
+    chapter = payload["chapters"][0]
+    assert chapter["status"] == "running"
+    assert chapter["currentStage"] is None
+    assert chapter["nextStage"] == "audio_plan"
+    assert chapter["stageState"] == "ready"
+    assert chapter["voiceAudioPath"] == "/existing/chapter_001.wav"
+    assert chapter["stageTimings"] == {"voice": 12.5}
     resumed.close()
 
 
