@@ -270,15 +270,18 @@ export function useGeneration(deps: UseGenerationDeps) {
     }
   }, [publishBatch, setError, setStage, stopPolling]);
 
-  const beginBatch = useCallback(async (chapterIds: string[], options: { force?: boolean; cacheSegments?: boolean } = {}) => {
-    if (!book || !analysis || chapterIds.length === 0) {
+  const startBatch = useCallback(async (chapterIds: string[], options: { force?: boolean; cacheSegments?: boolean } = {}) => {
+    if (!book || chapterIds.length === 0) {
       if (book) setError("请选择至少一个已分析章节。", book.bookId);
-      return;
+      return false;
     }
-    const validIds = chapterIds.filter((chapterId) => Boolean(analysis.scriptPaths[chapterId]));
-    if (validIds.length === 0) {
-      setError("所选章节尚未完成文本分析，无法开始全流程生成。", book.bookId);
-      return;
+    const requestedIds = new Set(chapterIds);
+    const orderedChapterIds = book.chapters
+      .map((chapter) => chapter.id)
+      .filter((chapterId) => requestedIds.has(chapterId));
+    if (orderedChapterIds.length === 0) {
+      setError("所选章节不属于当前书籍，无法开始全流程生成。", book.bookId);
+      return false;
     }
     stopPolling();
     setError(null, book.bookId);
@@ -289,7 +292,7 @@ export function useGeneration(deps: UseGenerationDeps) {
     try {
       const response = await startBatchGeneration({
         bookId: book.bookId,
-        chapterIds: validIds,
+        chapterIds: orderedChapterIds,
         force: options.force === true,
         cacheSegments: options.cacheSegments !== false,
       });
@@ -298,13 +301,14 @@ export function useGeneration(deps: UseGenerationDeps) {
       activeBookIdRef.current = book.bookId;
       publishBatch(response, book.bookId);
       if (isActiveBatchGeneration(response.status)) void pollBatch(response.batchId, book.bookId);
+      return true;
     } catch (error) {
       setError(`无法启动批量生成：${String(error)}`, book.bookId);
       setAnalyzeProgress("批量生成未启动。", book.bookId);
       setStage("error", book.bookId);
+      return false;
     }
   }, [
-    analysis,
     book,
     pollBatch,
     publishBatch,
@@ -315,6 +319,26 @@ export function useGeneration(deps: UseGenerationDeps) {
     setStage,
     stopPolling,
   ]);
+
+  const beginBatch = useCallback(async (chapterIds: string[], options: { force?: boolean; cacheSegments?: boolean } = {}) => {
+    if (!book || !analysis || chapterIds.length === 0) {
+      if (book) setError("请选择至少一个已分析章节。", book.bookId);
+      return false;
+    }
+    const validIds = chapterIds.filter((chapterId) => Boolean(analysis.scriptPaths[chapterId]));
+    if (validIds.length === 0) {
+      setError("所选章节尚未完成文本分析，无法开始全流程生成。", book.bookId);
+      return false;
+    }
+    return startBatch(validIds, options);
+  }, [analysis, book, setError, startBatch]);
+
+  const startAnalyzedChapters = useCallback(async (chapterIds: string[]) => {
+    // This path is called directly by the analysis hook after it has persisted
+    // each fresh script. Do not wait for React to publish analysis.scriptPaths:
+    // that would make an immediate post-analysis generation race the render.
+    return startBatch(chapterIds, { force: false, cacheSegments: true });
+  }, [startBatch]);
 
   useEffect(() => {
     activeBookIdRef.current = book?.bookId ?? null;
@@ -417,5 +441,6 @@ export function useGeneration(deps: UseGenerationDeps) {
     handleRegenerateAudioAsset,
     handleRegenerateChapter,
     handleRegenerateAll,
+    startAnalyzedChapters,
   };
 }

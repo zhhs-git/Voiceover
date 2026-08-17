@@ -271,34 +271,13 @@ export function BookDetailView({
         ? selectedChapterId
         : listenableChapters[0]?.id;
 
-  const { handleAnalyze } = useChapterAnalysis({
-    book,
-    analysis: pipeline.analysis,
-    selectedChapters: pipeline.selectedChapters,
-    setStage: pipeline.setStage,
-    setError: pipeline.setError,
-    setSavedMessage: pipeline.setSavedMessage,
-    setAnalyzeProgress: pipeline.setAnalyzeProgress,
-    setChapterStatuses: pipeline.setChapterStatuses,
-    setProgressDetail: pipeline.setProgressDetail,
-    setProgress: pipeline.setProgress,
-    setWorkflowStatus: pipeline.setWorkflowStatus,
-    setAnalysis: pipeline.setAnalysis,
-    setChapterAudioPaths: pipeline.setChapterAudioPaths,
-    setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
-    setAudioAssets: pipeline.setAudioAssets,
-    setCurrentStep: NOOP_SET_CURRENT_STEP,
-    setTab: pipeline.setTab,
-    abortRef,
-    db,
-  });
-
   const {
     handleGenerate,
     handleStopGeneration,
     handleRegenerateAudioAsset,
     handleRegenerateChapter,
     handleRegenerateAll,
+    startAnalyzedChapters,
   } =
     useGeneration({
       book,
@@ -323,6 +302,29 @@ export function BookDetailView({
       setCurrentStep: NOOP_SET_CURRENT_STEP,
       abortRef,
     });
+
+  const { handleAnalyze } = useChapterAnalysis({
+    book,
+    analysis: pipeline.analysis,
+    selectedChapters: pipeline.selectedChapters,
+    setStage: pipeline.setStage,
+    setError: pipeline.setError,
+    setSavedMessage: pipeline.setSavedMessage,
+    setAnalyzeProgress: pipeline.setAnalyzeProgress,
+    setChapterStatuses: pipeline.setChapterStatuses,
+    setProgressDetail: pipeline.setProgressDetail,
+    setProgress: pipeline.setProgress,
+    setWorkflowStatus: pipeline.setWorkflowStatus,
+    setAnalysis: pipeline.setAnalysis,
+    setChapterAudioPaths: pipeline.setChapterAudioPaths,
+    setChapterMixedAudioPaths: pipeline.setChapterMixedAudioPaths,
+    setAudioAssets: pipeline.setAudioAssets,
+    setCurrentStep: NOOP_SET_CURRENT_STEP,
+    setTab: pipeline.setTab,
+    startAnalyzedChapters,
+    abortRef,
+    db,
+  });
 
   useEffect(() => {
     selectionWasChangedRef.current = false;

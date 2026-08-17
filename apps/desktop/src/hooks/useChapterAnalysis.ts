@@ -55,6 +55,7 @@ interface UseChapterAnalysisDeps {
   ) => void;
   setCurrentStep: (step: WorkspaceStep) => void;
   setTab: (tab: DetailTab, owner?: string) => void;
+  startAnalyzedChapters: (chapterIds: string[]) => Promise<boolean>;
   abortRef: React.MutableRefObject<AbortController | null>;
   db: {
     upsertChapter: (record: {
@@ -97,6 +98,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     setAudioAssets,
     setCurrentStep,
     setTab,
+    startAnalyzedChapters,
     abortRef,
     db,
   } = deps;
@@ -172,6 +174,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     try {
       const statuses: Record<string, string> = {};
       let doneCount = 0;
+      const completedChapterIds: string[] = [];
       const failureMessages: string[] = [];
 
       for (let i = 0; i < chaptersToAnalyze.length; i++) {
@@ -233,9 +236,6 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
           }
 
           const artifact = (result.artifacts as Array<{ path: string }>)[0];
-          statuses[chapter.id] = "done";
-          doneCount++;
-
           // The new scene plan invalidates all derived audio for this chapter.
           // Clear the live UI snapshot together with the worker-side files so
           // an old track cannot be played or mixed with the new script.
@@ -255,13 +255,15 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
             return next;
           }, book.bookId);
 
-          db.upsertChapter({
+          // The durable chapter row is what batch_generation_start reads to
+          // locate the script. Await it before auto-starting generation.
+          await db.upsertChapter({
             id: chapter.id,
             bookId: book.bookId,
             title: chapter.title,
             status: "succeeded",
             scriptPath: artifact.path,
-          }).catch(() => {});
+          });
 
           // Read script to extract characters
           const scriptRaw = await invoke<string>("run_worker", {
@@ -380,6 +382,10 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
               },
             };
           }, book.bookId);
+
+          statuses[chapter.id] = "done";
+          doneCount++;
+          completedChapterIds.push(chapter.id);
         } catch (error) {
           statuses[chapter.id] = "failed";
           const detail = (error instanceof Error ? error.message : String(error)).slice(
@@ -421,10 +427,13 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
       }
       clearController();
 
-      if (doneCount > 0) {
-        setCurrentStep(3);
-        // Auto-advance to review tab so user can see characters
-        setTab("review", book.bookId);
+      if (!wasStopped && completedChapterIds.length > 0) {
+        // Skip the optional manual review screen. The batch hook deliberately
+        // accepts this completed-ID snapshot, so the generation request does
+        // not race the asynchronous React analysis-state update.
+        setCurrentStep(4);
+        setTab("generate", book.bookId);
+        await startAnalyzedChapters(completedChapterIds);
       }
     } catch (err) {
       clearInterval(elapsedTimer);
@@ -460,6 +469,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     setSavedMessage,
     setStage,
     setTab,
+    startAnalyzedChapters,
   ]);
 
   return { handleAnalyze };

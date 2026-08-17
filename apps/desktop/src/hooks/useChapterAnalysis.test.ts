@@ -32,6 +32,10 @@ describe("useChapterAnalysis", () => {
   });
 
   it("does not synthesize audio while re-analyzing a chapter with an existing script", async () => {
+    const setCurrentStep = vi.fn();
+    const setTab = vi.fn();
+    const startAnalyzedChapters = vi.fn().mockResolvedValue(true);
+    const upsertChapter = vi.fn().mockResolvedValue(undefined);
     const deps = {
       book: {
         title: "Book",
@@ -64,11 +68,12 @@ describe("useChapterAnalysis", () => {
       setChapterAudioPaths: vi.fn(),
       setChapterMixedAudioPaths: vi.fn(),
       setAudioAssets: vi.fn(),
-      setCurrentStep: vi.fn(),
-      setTab: vi.fn(),
+      setCurrentStep,
+      setTab,
+      startAnalyzedChapters,
       abortRef: { current: null },
       db: {
-        upsertChapter: vi.fn().mockResolvedValue(undefined),
+        upsertChapter,
         upsertCharacter: vi.fn().mockResolvedValue(undefined),
       },
     } as never;
@@ -86,5 +91,11 @@ describe("useChapterAnalysis", () => {
       command: "_read_file",
       inputJson: JSON.stringify({ path: "/tmp/chapter.json" }),
     });
+    expect(setTab).toHaveBeenCalledWith("generate", "book_123");
+    expect(setCurrentStep).toHaveBeenCalledWith(4);
+    expect(startAnalyzedChapters).toHaveBeenCalledWith(["chapter_001"]);
+    expect(upsertChapter.mock.invocationCallOrder[0]).toBeLessThan(
+      startAnalyzedChapters.mock.invocationCallOrder[0],
+    );
   });
 });

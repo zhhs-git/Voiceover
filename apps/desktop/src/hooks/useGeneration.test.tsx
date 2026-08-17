@@ -128,6 +128,55 @@ describe("useGeneration", () => {
     unmount();
   });
 
+  it("starts persisted analysis results without waiting for analysis state to re-render", async () => {
+    batchGeneration.startBatchGeneration.mockResolvedValue({
+      batchId: "batch_after_analysis",
+      bookId: book.bookId,
+      status: "queued",
+      totalCount: 1,
+      completedCount: 0,
+      chapters: [{
+        chapterId: "chapter_1",
+        title: "第一章",
+        position: 0,
+        status: "queued",
+      }],
+    });
+    const store = usePipelineStore.getState();
+    const { result, unmount } = renderHook(() => useGeneration({
+      book,
+      analysis: null,
+      selectedChapters: new Set(["chapter_1"]),
+      chapterAudioPaths: {},
+      correctionState: { affectedChapters: [] },
+      setStage: store.setStage,
+      setError: store.setError,
+      setSavedMessage: store.setSavedMessage,
+      setAnalyzeProgress: store.setAnalyzeProgress,
+      setProgressDetail: store.setProgressDetail,
+      setProgress: store.setProgress,
+      setChapterAudioPaths: store.setChapterAudioPaths,
+      setChapterMixedAudioPaths: store.setChapterMixedAudioPaths,
+      setAudioAssets: store.setAudioAssets,
+      setGenerationBatch: store.setGenerationBatch,
+      setWorkflowStatuses: store.setWorkflowStatuses,
+      setCurrentStep: vi.fn(),
+      abortRef: { current: null },
+    }));
+
+    await act(async () => {
+      await result.current.startAnalyzedChapters(["chapter_1"]);
+    });
+
+    expect(batchGeneration.startBatchGeneration).toHaveBeenCalledWith({
+      bookId: "book_1",
+      chapterIds: ["chapter_1"],
+      force: false,
+      cacheSegments: true,
+    });
+    unmount();
+  });
+
   it("keeps polling after a queued update re-renders the page with a fresh callback prop", async () => {
     vi.useFakeTimers();
     const queuedChapter = {
