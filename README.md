@@ -251,6 +251,36 @@ export AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS="0.75"  # 重试的指数退避基�
 批量队列会逐章显示“等待 MiMo 串行配音”“MiMo 配音中”或具体的后续阶段；429 冷却时会
 显示剩余等待时间。
 
+## 外部自动生成接口
+
+如果调用方不需要人工审阅角色，可上传一本 EPUB、PDF 或 TXT，服务端会自动提取、
+逐章分析、接受分析出的角色与音色设计、生成音频，并下载一个 ZIP。ZIP 内每章各有
+一个按章节顺序命名的 MP3，例如 `001-第一章.mp3`。
+
+```bash
+curl --fail --show-error --location \
+  -X POST 'http://127.0.0.1:8000/api/external/audiobook/chapters.mp3.zip' \
+  -F 'file=@./novel.epub' \
+  --output novel-chapters-mp3.zip
+```
+
+可选的 `narratorVoiceId` 查询参数为 `narrator_female`（默认）、`narrator_male` 或
+`narrator_default`：
+
+```bash
+curl --fail --show-error --location \
+  -X POST 'http://127.0.0.1:8000/api/external/audiobook/chapters.mp3.zip?narratorVoiceId=narrator_male' \
+  -H 'X-File-Name: novel.txt' \
+  -H 'Content-Type: text/plain; charset=utf-8' \
+  --data-binary '@./novel.txt' \
+  --output novel-chapters-mp3.zip
+```
+
+这是一个同步长请求：连接会持续到全部章节完成。默认最长等待 24 小时，可通过
+`AUDIOBOOK_EXTERNAL_AUTOMATION_TIMEOUT_SECONDS` 调整。失败时响应是 JSON，包含错误码
+以及失败章节（如适用）；成功时响应的 `Content-Type` 为 `application/zip`，并附带
+`X-Audiobook-Book-Id` 和 `X-Audiobook-Chapter-Count` 头。
+
 ## 项目结构
 
 ```text

@@ -2,11 +2,14 @@ import json
 import threading
 import time
 import wave
+import zipfile
 from pathlib import Path
 
 from audiobook_worker.web_server import (
     BatchConcurrencyConfig,
+    ExternalAudiobookArchive,
     ServerState,
+    WebHandler,
     safe_filename,
 )
 
@@ -250,7 +253,189 @@ def _seed_batch_book(state: ServerState, chapter_ids: tuple[str, ...]) -> Path:
     return work_dir
 
 
-def test_batch_generation_runs_chapters_in_order_and_persists_outputs(
+def test_external_audiobook_archive_automates_analysis_generation_and_chapter_mp3s(
+    tmp_path: Path, monkeypatch
+):
+    state = ServerState(tmp_path)
+    upload_path = state.uploads_directory / "novel.txt"
+    upload_path.write_text("第一章", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+    analysis_requests: list[dict[str, object]] = []
+
+    def fake_worker(command: str, request: dict[str, object]):
+        calls.append((command, str(request.get("chapterId") or "")))
+        if command == "extract_book":
+            chapters_dir = Path(str(request["outputDirectory"]))
+            chapters_dir.mkdir(parents=True, exist_ok=True)
+            chapters = []
+            for chapter_id, title in (("chapter_001", "第一章"), ("chapter_002", "第二章")):
+                text_path = chapters_dir / f"{chapter_id}.txt"
+                text_path.write_text(title, encoding="utf-8")
+                chapters.append(
+                    {
+                        "id": chapter_id,
+                        "title": title,
+                        "textPath": str(text_path),
+                    }
+                )
+            return {
+                "status": "succeeded",
+                "warnings": [],
+                "artifacts": [{"kind": "book_extraction", "metadata": {"title": "示例书", "chapters": chapters}}],
+            }
+        if command == "analyze_chapter":
+            analysis_requests.append(request)
+            chapter_id = str(request["chapterId"])
+            scripts_dir = Path(str(request["outputDirectory"]))
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            script_path = scripts_dir / f"{chapter_id}.json"
+            script_path.write_text(
+                json.dumps({"chapterId": chapter_id, "characters": [{"id": "hero", "canonicalName": "主角"}]}),
+                encoding="utf-8",
+            )
+            return {
+                "status": "succeeded",
+                "warnings": [],
+                "artifacts": [{"kind": "chapter_script", "path": str(script_path)}],
+            }
+        if command == "convert_to_mp3":
+            output_path = Path(str(request["outputPath"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"ID3fake-mp3")
+            return {"status": "succeeded", "warnings": [], "artifacts": [{"kind": "mp3", "path": str(output_path)}]}
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+
+    def fake_start_batch(request: dict[str, object]):
+        book_id = str(request["bookId"])
+        work_dir = state.work_directory(book_id)
+        chapters = []
+        for position, chapter_id in enumerate(request["chapterIds"]):
+            mixed_path = work_dir / "audio" / f"{chapter_id}_mixed.wav"
+            _write_wav(mixed_path)
+            chapters.append(
+                {
+                    "chapterId": chapter_id,
+                    "title": "第一章" if chapter_id == "chapter_001" else "第二章",
+                    "position": position,
+                    "status": "succeeded",
+                    "mixedAudioPath": str(mixed_path),
+                }
+            )
+        return {"batchId": "batch_api", "status": "queued", "chapters": chapters}
+
+    monkeypatch.setattr(state, "start_batch_generation", fake_start_batch)
+    monkeypatch.setattr(
+        state,
+        "_wait_for_external_batch",
+        lambda batch_id: {
+            "batchId": batch_id,
+            "status": "succeeded",
+            "chapters": fake_start_batch({"bookId": state.list_books()[0]["id"], "chapterIds": ["chapter_001", "chapter_002"]})["chapters"],
+        },
+    )
+
+    archive = state.create_external_audiobook_archive(
+        filename="novel.txt",
+        upload_path=upload_path,
+    )
+
+    assert archive.chapter_count == 2
+    assert archive.archive_path.is_file()
+    assert archive.download_filename == "示例书-chapters-mp3.zip"
+    with zipfile.ZipFile(archive.archive_path) as zipped:
+        assert zipped.namelist() == ["001-第一章.mp3", "002-第二章.mp3"]
+        assert zipped.read("001-第一章.mp3") == b"ID3fake-mp3"
+    assert [command for command, _ in calls] == [
+        "extract_book",
+        "analyze_chapter",
+        "analyze_chapter",
+        "convert_to_mp3",
+        "convert_to_mp3",
+    ]
+    assert analysis_requests[0]["knownCharacters"] is None
+    assert analysis_requests[1]["knownCharacters"] == [
+        {"id": "hero", "canonicalName": "主角"}
+    ]
+    state.close()
+
+
+def test_external_audiobook_archive_rejects_unsupported_upload(tmp_path: Path):
+    state = ServerState(tmp_path)
+    upload_path = state.uploads_directory / "novel.docx"
+    upload_path.write_bytes(b"not a supported book")
+
+    try:
+        state.create_external_audiobook_archive(
+            filename="novel.docx",
+            upload_path=upload_path,
+        )
+    except Exception as error:
+        assert getattr(error, "code", None) == "unsupported_book_format"
+    else:
+        raise AssertionError("unsupported uploads must fail")
+    state.close()
+
+
+def test_external_audiobook_http_endpoint_returns_a_zip_download(tmp_path: Path, monkeypatch):
+    state = ServerState(tmp_path)
+    upload_path = state.uploads_directory / "novel.txt"
+    upload_path.write_bytes(b"book body")
+    archive_path = tmp_path / "chapter-audio.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("001-第一章.mp3", b"ID3fake-mp3")
+    captured: dict[str, object] = {}
+
+    def fake_create_archive(*, filename: str, upload_path: Path, narrator_voice_id: str):
+        captured.update(
+            {
+                "filename": filename,
+                "upload": upload_path.read_bytes(),
+                "narratorVoiceId": narrator_voice_id,
+            }
+        )
+        return ExternalAudiobookArchive(
+            book_id="book_api",
+            archive_path=archive_path,
+            download_filename="示例书-chapters-mp3.zip",
+            chapter_count=1,
+        )
+
+    monkeypatch.setattr(state, "create_external_audiobook_archive", fake_create_archive)
+    served: dict[str, object] = {}
+
+    class FakeHandler:
+        path = "/api/external/audiobook/chapters.mp3.zip?narratorVoiceId=narrator_male"
+
+        def __init__(self, handler_state, handler_upload):
+            self.state = handler_state
+            self.upload = handler_upload
+
+        def save_external_audiobook_upload(self):
+            return self.upload, "novel.txt"
+
+        def serve_file(self, path: Path, **kwargs):
+            served["path"] = path
+            served.update(kwargs)
+
+    WebHandler.external_audiobook_chapters_mp3(FakeHandler(state, upload_path))
+
+    assert served["path"] == archive_path
+    assert served["download_filename"] == "示例书-chapters-mp3.zip"
+    assert served["extra_headers"] == {
+        "X-Audiobook-Book-Id": "book_api",
+        "X-Audiobook-Chapter-Count": "1",
+    }
+    assert captured == {
+        "filename": "novel.txt",
+        "upload": b"book body",
+        "narratorVoiceId": "narrator_male",
+    }
+    state.close()
+
+
+def test_batch_generation_preserves_each_chapter_stage_order_and_persists_outputs(
     tmp_path: Path, monkeypatch
 ):
     state = ServerState(tmp_path)

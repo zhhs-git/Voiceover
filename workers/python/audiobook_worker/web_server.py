@@ -24,18 +24,22 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from audiobook_worker.script_builder import normalize_narrator_voice_id
 
 
 MAX_UPLOAD_BYTES = int(os.environ.get("AUDIOBOOK_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 WORKER_TIMEOUT_SECONDS = int(os.environ.get("AUDIOBOOK_WORKER_TIMEOUT_SECONDS", str(24 * 60 * 60)))
+EXTERNAL_AUTOMATION_TIMEOUT_SECONDS = int(
+    os.environ.get("AUDIOBOOK_EXTERNAL_AUTOMATION_TIMEOUT_SECONDS", str(24 * 60 * 60))
+)
 SAFE_ID_PATTERN = re.compile(r"[\w-]+", re.UNICODE)
 GENERIC_CHARACTER_LABELS = {
     "小姐", "少爷", "姑娘", "公子", "夫人", "太太", "老爷", "殿下", "陛下",
@@ -102,12 +106,45 @@ class BatchGenerationStageError(RuntimeError):
         self.stage = stage
 
 
+class ExternalAudiobookError(RuntimeError):
+    """A client-visible failure in the upload-to-MP3 automation endpoint."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+        status: HTTPStatus = HTTPStatus.UNPROCESSABLE_ENTITY,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+        self.status = status
+
+    def payload(self) -> dict[str, object]:
+        error: dict[str, object] = {"code": self.code, "message": str(self)}
+        if self.details:
+            error["details"] = self.details
+        return {"error": error}
+
+
 @dataclass
 class BatchGenerationJob:
     """In-memory handle for a durable SQLite-backed generation batch."""
 
     batch_id: str
     thread: threading.Thread | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class ExternalAudiobookArchive:
+    """A temporary ZIP archive containing one MP3 for every book chapter."""
+
+    book_id: str
+    archive_path: Path
+    download_filename: str
+    chapter_count: int
 
 
 _BATCH_GENERATION_STAGES = frozenset(
@@ -1950,6 +1987,266 @@ class ServerState:
                 if job is not None and job.thread is threading.current_thread():
                     self.batch_generation_jobs.pop(batch_id, None)
 
+    def _run_external_worker(
+        self,
+        command: str,
+        request: dict[str, object],
+        *,
+        error_code: str,
+        fallback_message: str,
+        details: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Run a worker and translate its failure into an API-safe error."""
+
+        result = self.run_worker(command, request)
+        if result.get("status") == "succeeded":
+            return result
+        raise ExternalAudiobookError(
+            error_code,
+            self._worker_failure_message(result, fallback_message),
+            details=details,
+        )
+
+    def _wait_for_external_batch(self, batch_id: str) -> dict[str, object]:
+        """Wait for a durable batch without polling over HTTP from the caller."""
+
+        deadline = time.monotonic() + EXTERNAL_AUTOMATION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            payload = self.batch_generation_status(batch_id)
+            status = str(payload.get("status") or "")
+            if status not in {"queued", "running"}:
+                return payload
+            time.sleep(0.1)
+        self.cancel_batch_generation(batch_id)
+        raise ExternalAudiobookError(
+            "generation_timeout",
+            "Timed out while generating chapter audio.",
+            details={"batchId": batch_id},
+            status=HTTPStatus.GATEWAY_TIMEOUT,
+        )
+
+    def _external_archive_path(self, book_id: str) -> Path:
+        directory = self.work_directory(book_id) / "exports"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "chapters.mp3.zip"
+
+    def create_external_audiobook_archive(
+        self,
+        *,
+        filename: str,
+        upload_path: Path,
+        narrator_voice_id: str = "narrator_female",
+    ) -> ExternalAudiobookArchive:
+        """Extract, analyze, auto-accept, generate, and package chapter MP3s.
+
+        The endpoint deliberately accepts the analysis result as-is. "Review" is
+        an optional interactive editing step in the browser workflow, so it does
+        not block external automation.
+        """
+
+        suffix = upload_path.suffix.lower()
+        if suffix not in {".epub", ".pdf", ".txt"}:
+            raise ExternalAudiobookError(
+                "unsupported_book_format",
+                "Only EPUB, PDF, and TXT uploads are supported.",
+                details={"filename": filename},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if not upload_path.is_file() or upload_path.stat().st_size == 0:
+            raise ExternalAudiobookError(
+                "empty_upload",
+                "The uploaded book is empty.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(filename).stem).strip("_") or "book"
+        book_id = f"api_{stem[:36]}_{secrets.token_hex(4)}"
+        work_dir = self.work_directory(book_id)
+        extracted = self._run_external_worker(
+            "extract_book",
+            {
+                "bookPath": str(upload_path),
+                "outputDirectory": str(work_dir / "chapters"),
+            },
+            error_code="book_extraction_failed",
+            fallback_message="Unable to extract the uploaded book.",
+        )
+        artifact = (extracted.get("artifacts") or [{}])[0]
+        metadata = artifact.get("metadata", {}) if isinstance(artifact, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        raw_chapters = metadata.get("chapters")
+        if not isinstance(raw_chapters, list) or not raw_chapters:
+            raise ExternalAudiobookError(
+                "no_chapters_found",
+                "No readable chapters were found in the uploaded book.",
+            )
+
+        title = str(metadata.get("title") or Path(filename).stem).strip() or "book"
+        self.create_book(
+            {
+                "id": book_id,
+                "title": title,
+                "sourcePath": str(upload_path),
+                "workDir": str(work_dir),
+            }
+        )
+        self.set_narrator_voice(book_id, narrator_voice_id)
+
+        known_characters_by_id: dict[str, dict[str, object]] = {}
+        chapter_ids: list[str] = []
+        try:
+            for chapter in raw_chapters:
+                if not isinstance(chapter, dict):
+                    raise ExternalAudiobookError(
+                        "invalid_extraction_result",
+                        "The extraction result contains an invalid chapter.",
+                    )
+                chapter_id = str(chapter.get("id") or "")
+                chapter_title = str(chapter.get("title") or chapter_id)
+                chapter_text_path = str(chapter.get("textPath") or "")
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", chapter_id) or not chapter_text_path:
+                    raise ExternalAudiobookError(
+                        "invalid_extraction_result",
+                        "The extraction result contains an invalid chapter identifier or text path.",
+                    )
+                self.upsert_chapter(
+                    {
+                        "id": chapter_id,
+                        "bookId": book_id,
+                        "title": chapter_title,
+                        "status": "pending",
+                        "scriptPath": None,
+                    }
+                )
+                analyzed = self._run_external_worker(
+                    "analyze_chapter",
+                    {
+                        "bookId": book_id,
+                        "chapterId": chapter_id,
+                        "title": chapter_title,
+                        "chapterTextPath": chapter_text_path,
+                        "outputDirectory": str(work_dir / "scripts"),
+                        "narratorVoiceId": narrator_voice_id,
+                        "knownCharacters": list(known_characters_by_id.values()) or None,
+                    },
+                    error_code="chapter_analysis_failed",
+                    fallback_message=f"Unable to analyze chapter: {chapter_title}",
+                    details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                )
+                analyzed_artifact = (analyzed.get("artifacts") or [{}])[0]
+                script_path = (
+                    str(analyzed_artifact.get("path") or "")
+                    if isinstance(analyzed_artifact, dict)
+                    else ""
+                )
+                if not script_path:
+                    raise ExternalAudiobookError(
+                        "chapter_analysis_failed",
+                        f"Analysis did not return a script for chapter: {chapter_title}",
+                        details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                    )
+                self.upsert_chapter(
+                    {
+                        "id": chapter_id,
+                        "bookId": book_id,
+                        "title": chapter_title,
+                        "status": "succeeded",
+                        "scriptPath": script_path,
+                    }
+                )
+                try:
+                    script = json.loads(Path(script_path).read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise ExternalAudiobookError(
+                        "chapter_analysis_failed",
+                        f"Analysis created an unreadable script for chapter: {chapter_title}",
+                        details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                    ) from error
+                characters = script.get("characters") if isinstance(script, dict) else None
+                if isinstance(characters, list):
+                    for character in characters:
+                        if not isinstance(character, dict):
+                            continue
+                        character_id = str(character.get("id") or "")
+                        if character_id:
+                            known_characters_by_id[character_id] = character
+                chapter_ids.append(chapter_id)
+
+            batch = self.start_batch_generation(
+                {
+                    "bookId": book_id,
+                    "chapterIds": chapter_ids,
+                    "force": False,
+                    "cacheSegments": True,
+                }
+            )
+            batch_id = str(batch.get("batchId") or "")
+            if not batch_id:
+                raise ExternalAudiobookError(
+                    "generation_start_failed",
+                    self._worker_failure_message(batch, "Unable to start chapter audio generation."),
+                )
+            completed = self._wait_for_external_batch(batch_id)
+            if completed.get("status") != "succeeded":
+                failed_chapters = [
+                    {
+                        "chapterId": chapter.get("chapterId"),
+                        "title": chapter.get("title"),
+                        "stage": chapter.get("currentStage"),
+                        "error": chapter.get("error"),
+                    }
+                    for chapter in completed.get("chapters", [])
+                    if isinstance(chapter, dict) and chapter.get("status") != "succeeded"
+                ]
+                raise ExternalAudiobookError(
+                    "chapter_generation_failed",
+                    "One or more chapters could not be generated.",
+                    details={"batchId": batch_id, "chapters": failed_chapters},
+                )
+
+            archive_path = self._external_archive_path(book_id)
+            with zipfile.ZipFile(
+                archive_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                for position, chapter in enumerate(completed.get("chapters", []), start=1):
+                    if not isinstance(chapter, dict):
+                        continue
+                    chapter_id = str(chapter.get("chapterId") or "")
+                    chapter_title = str(chapter.get("title") or chapter_id)
+                    mixed_path = Path(str(chapter.get("mixedAudioPath") or ""))
+                    if not mixed_path.is_file():
+                        raise ExternalAudiobookError(
+                            "chapter_generation_failed",
+                            f"Generated audio is missing for chapter: {chapter_title}",
+                            details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                        )
+                    mp3_path = work_dir / "exports" / "mp3" / f"{chapter_id}.mp3"
+                    self._run_external_worker(
+                        "convert_to_mp3",
+                        {"wavPath": str(mixed_path), "outputPath": str(mp3_path)},
+                        error_code="mp3_conversion_failed",
+                        fallback_message=f"Unable to convert chapter to MP3: {chapter_title}",
+                        details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                    )
+                    safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", chapter_title).strip() or chapter_id
+                    archive.write(mp3_path, f"{position:03d}-{safe_title}.mp3")
+        except Exception:
+            # The imported source and work directory are retained for diagnosis
+            # and possible recovery through the normal web UI.
+            raise
+
+        download_stem = re.sub(r"[\\/:*?\"<>|]+", "_", title).strip() or "audiobook"
+        return ExternalAudiobookArchive(
+            book_id=book_id,
+            archive_path=archive_path,
+            download_filename=f"{download_stem}-chapters-mp3.zip",
+            chapter_count=len(chapter_ids),
+        )
+
     # ------------------------------------------------------------------
     # Compatibility API for an older single-chapter asset button.
     # It now uses the local CLI only; it never opens Gradio, runs quality
@@ -2235,6 +2532,9 @@ class WebHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/external/audiobook/chapters.mp3.zip":
+                self.external_audiobook_chapters_mp3()
+                return
             if parsed.path == "/api/books/import":
                 self.import_book()
                 return
@@ -2249,6 +2549,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_error_json("not found", HTTPStatus.NOT_FOUND)
         except FileNotFoundError:
             self.send_error_json("file not found", HTTPStatus.NOT_FOUND)
+        except ExternalAudiobookError as error:
+            self.send_json(error.payload(), error.status)
         except (ValueError, KeyError, json.JSONDecodeError) as error:
             self.send_error_json(str(error), HTTPStatus.BAD_REQUEST)
         except Exception as error:  # pragma: no cover
@@ -2341,6 +2643,105 @@ class WebHandler(BaseHTTPRequestHandler):
         response = dict(result)
         response["artifacts"] = [{**artifact, "metadata": metadata}]
         self.send_json(response)
+
+    def external_audiobook_chapters_mp3(self) -> None:
+        """Run the non-interactive book-to-chapter-MP3 API and stream its ZIP."""
+
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        narrator_voice_id = str(
+            query.get("narratorVoiceId", ["narrator_female"])[0] or "narrator_female"
+        )
+        if narrator_voice_id not in {
+            "narrator_default",
+            "narrator_female",
+            "narrator_male",
+        }:
+            raise ExternalAudiobookError(
+                "invalid_narrator_voice",
+                "narratorVoiceId must be narrator_female, narrator_male, or narrator_default.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        upload_path, filename = self.save_external_audiobook_upload()
+        archive = self.state.create_external_audiobook_archive(
+            filename=filename,
+            upload_path=upload_path,
+            narrator_voice_id=narrator_voice_id,
+        )
+        self.serve_file(
+            archive.archive_path,
+            download_filename=archive.download_filename,
+            extra_headers={
+                "X-Audiobook-Book-Id": archive.book_id,
+                "X-Audiobook-Chapter-Count": str(archive.chapter_count),
+            },
+        )
+
+    def save_external_audiobook_upload(self) -> tuple[Path, str]:
+        """Store a raw or multipart external API upload in the managed area."""
+
+        parsed = urlparse(self.path)
+        query_filename = parse_qs(parsed.query).get("filename", [""])[0]
+        content_type = self.headers.get("Content-Type", "").lower()
+        if content_type.startswith("multipart/form-data"):
+            upload_path, multipart_filename = self.save_multipart_upload()
+            requested_filename = (
+                self.headers.get("X-File-Name")
+                or query_filename
+                or multipart_filename
+            )
+            if not requested_filename:
+                upload_path.unlink(missing_ok=True)
+                raise ExternalAudiobookError(
+                    "missing_filename",
+                    "Provide a filename through the multipart upload, X-File-Name header, or filename query parameter.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            filename = safe_filename(requested_filename)
+            final_upload_path = self.state.uploads_directory / f"api-{uuid.uuid4().hex}-{filename}"
+            upload_path.replace(final_upload_path)
+            upload_path = final_upload_path
+        else:
+            requested_filename = self.headers.get("X-File-Name") or query_filename
+            if not requested_filename:
+                requested_filename = {
+                    "application/pdf": "book.pdf",
+                    "application/epub+zip": "book.epub",
+                    "text/plain": "book.txt",
+                }.get(content_type.split(";", 1)[0], "")
+            if not requested_filename:
+                raise ExternalAudiobookError(
+                    "missing_filename",
+                    "Provide X-File-Name or a filename query parameter for this content type.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            filename = safe_filename(requested_filename)
+            upload_path = self.state.uploads_directory / f"api-{uuid.uuid4().hex}-{filename}"
+            try:
+                with upload_path.open("wb") as destination:
+                    self.copy_upload_body(destination)
+            except Exception:
+                upload_path.unlink(missing_ok=True)
+                raise
+
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".epub", ".pdf", ".txt"}:
+            upload_path.unlink(missing_ok=True)
+            raise ExternalAudiobookError(
+                "unsupported_book_format",
+                "Only EPUB, PDF, and TXT uploads are supported.",
+                details={"filename": filename},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if not upload_path.is_file() or upload_path.stat().st_size == 0:
+            upload_path.unlink(missing_ok=True)
+            raise ExternalAudiobookError(
+                "empty_upload",
+                "The uploaded book is empty.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        return upload_path, filename
 
     def save_multipart_upload(self) -> tuple[Path, str | None]:
         """Extract the first file part from a multipart browser upload."""
@@ -2502,7 +2903,14 @@ class WebHandler(BaseHTTPRequestHandler):
             return self.state.characters(str(args["bookId"]))
         raise ValueError(f"unknown invoke command: {command}")
 
-    def serve_file(self, path: Path, *, send_body: bool = True) -> None:
+    def serve_file(
+        self,
+        path: Path,
+        *,
+        send_body: bool = True,
+        download_filename: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -2544,6 +2952,15 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
+        if download_filename:
+            filename = safe_filename(download_filename)
+            ascii_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename) or "download"
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{ascii_filename}\"; filename*=UTF-8''{quote(filename)}",
+            )
+        for header, value in (extra_headers or {}).items():
+            self.send_header(header, value)
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.end_headers()
