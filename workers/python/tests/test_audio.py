@@ -1,3 +1,4 @@
+import json
 import shutil
 import wave
 from pathlib import Path
@@ -336,6 +337,95 @@ def test_v2_music_fills_cue_gaps_and_keeps_breaks_inside_their_scene(tmp_path: P
     assert music_tracks[2].start_seconds < plan.duration_seconds
     assert "filled_music_cue_gap:scene_001:0-0" in plan.warnings
     assert "music_break_outside_scene:0" in plan.warnings
+
+
+def test_quality_rejected_assets_never_use_filesystem_fallback(tmp_path: Path):
+    backend = MockTTSBackend()
+    segment_directory = tmp_path / "segments"
+    segment_paths = [
+        backend.synthesize_segment(
+            {"id": f"seg_{index:04d}", "text": "line"},
+            segment_directory,
+        ).path
+        for index in range(2)
+    ]
+    asset_directory = tmp_path / "audio-assets"
+    valid_music = backend.synthesize_segment(
+        {"id": "scene_002", "text": "approved music"},
+        asset_directory / "music",
+    ).path
+    # A stale conventional filename exists for both rejected assets. The mix
+    # plan must not pick either one merely because it is readable on disk.
+    backend.synthesize_segment(
+        {"id": "scene_001", "text": "rejected music"},
+        asset_directory / "music",
+    )
+    backend.synthesize_segment(
+        {"id": "door", "text": "rejected sfx"},
+        asset_directory / "sfx",
+    )
+    (asset_directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "assets": {
+                    "music:scene_002": {"path": str(valid_music)},
+                },
+                "rejectedAssets": {
+                    "music:scene_001": {"reason": "quality_retries_exhausted"},
+                    "sfx:door": {"reason": "quality_retries_exhausted"},
+                },
+                "qualityFallbacks": {
+                    "music:scene_001": {
+                        "assetKey": "music:scene_002",
+                        "reason": "quality_nearby_scene",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = build_audio_mix_plan(
+        segment_paths,
+        [
+            {"id": "seg_0000", "sourceSegmentIds": ["seg_0000"]},
+            {"id": "seg_0001", "sourceSegmentIds": ["seg_0001"]},
+        ],
+        {
+            "segments": [{"id": "seg_0000"}, {"id": "seg_0001"}],
+            "audioPlan": {
+                "scenes": [
+                    {
+                        "id": "scene_001",
+                        "startSegmentIndex": 0,
+                        "endSegmentIndex": 0,
+                        "music": {"model": "sm-music"},
+                        "sfx": [{
+                            "id": "door",
+                            "anchorSegmentIndex": 0,
+                            "timing": "during",
+                        }],
+                    },
+                    {
+                        "id": "scene_002",
+                        "startSegmentIndex": 1,
+                        "endSegmentIndex": 1,
+                        "music": {"model": "sm-music"},
+                        "sfx": [],
+                    },
+                ]
+            },
+        },
+        asset_directory,
+    )
+
+    music_tracks = [track for track in plan.tracks if track.kind == "music"]
+    assert len(music_tracks) == 2
+    assert music_tracks[0].path == valid_music
+    assert not [track for track in plan.tracks if track.kind == "sfx"]
+    assert "quality_rejected_sfx:door" in plan.warnings
+    assert any(warning.startswith("quality_music_fallback:scene_001:") for warning in plan.warnings)
 
 
 def test_sfx_anchor_spanning_segments_is_kept_at_chapter_start(tmp_path: Path):

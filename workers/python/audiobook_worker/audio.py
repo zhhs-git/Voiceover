@@ -296,6 +296,15 @@ def build_audio_mix_plan(
             )
             if asset_path is None:
                 warnings.append(f"missing_music_asset:{asset_id}")
+            else:
+                quality_fallback = _quality_fallback_for_audio_asset(
+                    manifest, "music", asset_id
+                )
+                if quality_fallback is not None:
+                    warnings.append(
+                        f"quality_music_fallback:{asset_id}:{quality_fallback[0]}:"
+                        f"{quality_fallback[1]}"
+                    )
 
         resolved_scenes.append(
             (
@@ -413,6 +422,14 @@ def build_audio_mix_plan(
                 if path is None:
                     warnings.append(f"missing_music_asset:{variant_id}")
                     continue
+                quality_fallback = _quality_fallback_for_audio_asset(
+                    manifest, "music", variant_id
+                )
+                if quality_fallback is not None:
+                    warnings.append(
+                        f"quality_music_fallback:{variant_id}:{quality_fallback[0]}:"
+                        f"{quality_fallback[1]}"
+                    )
                 variant_paths[variant_id] = path
 
             raw_cues = raw_scene.get("musicCues", [])
@@ -634,7 +651,10 @@ def build_audio_mix_plan(
                 asset_root, manifest, "sfx", asset_id
             )
             if asset_path is None:
-                warnings.append(f"missing_sfx_asset:{asset_id}")
+                if _is_quality_rejected_audio_asset(manifest, "sfx", asset_id):
+                    warnings.append(f"quality_rejected_sfx:{asset_id}")
+                else:
+                    warnings.append(f"missing_sfx_asset:{asset_id}")
                 continue
             effect_duration = _wav_duration(asset_path)
             timing = str(raw_effect.get("timing") or "during")
@@ -893,19 +913,65 @@ def _read_audio_asset_manifest(asset_directory: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _quality_fallback_for_audio_asset(
+    manifest: dict[str, Any],
+    kind: str,
+    asset_id: str,
+) -> tuple[str, str] | None:
+    """Return the manifest key selected after a quality rejection, if any."""
+
+    if kind != "music":
+        return None
+    raw_fallbacks = manifest.get("qualityFallbacks")
+    if not isinstance(raw_fallbacks, dict):
+        return None
+    raw_fallback = raw_fallbacks.get(f"{kind}:{asset_id}")
+    if not isinstance(raw_fallback, dict):
+        return None
+    target_key = raw_fallback.get("assetKey")
+    if not isinstance(target_key, str) or not target_key.startswith("music:"):
+        return None
+    reason = raw_fallback.get("reason")
+    return target_key, str(reason) if isinstance(reason, str) else "quality_fallback"
+
+
+def _is_quality_rejected_audio_asset(
+    manifest: dict[str, Any],
+    kind: str,
+    asset_id: str,
+) -> bool:
+    rejected_assets = manifest.get("rejectedAssets")
+    return isinstance(rejected_assets, dict) and f"{kind}:{asset_id}" in rejected_assets
+
+
+def _manifest_audio_asset_path(manifest: dict[str, Any], key: str) -> Path | None:
+    assets = manifest.get("assets", {})
+    value = assets.get(key) if isinstance(assets, dict) else None
+    if isinstance(value, dict) and isinstance(value.get("path"), str):
+        path = Path(value["path"])
+        if path.is_file() and _is_readable_wav(path):
+            return path
+    return None
+
+
 def _resolve_audio_asset_path(
     asset_directory: Path,
     manifest: dict[str, Any],
     kind: str,
     asset_id: str,
 ) -> Path | None:
-    assets = manifest.get("assets", {})
-    if isinstance(assets, dict):
-        value = assets.get(f"{kind}:{asset_id}")
-        if isinstance(value, dict) and isinstance(value.get("path"), str):
-            path = Path(value["path"])
-            if path.is_file() and _is_readable_wav(path):
-                return path
+    manifest_key = f"{kind}:{asset_id}"
+    direct_path = _manifest_audio_asset_path(manifest, manifest_key)
+    if direct_path is not None:
+        return direct_path
+    # A rejected file is deliberately excluded even if an older WAV with the
+    # conventional filename still exists.  This prevents a stale filesystem
+    # fallback from reintroducing a detected sharp transient into the mix.
+    if _is_quality_rejected_audio_asset(manifest, kind, asset_id):
+        fallback = _quality_fallback_for_audio_asset(manifest, kind, asset_id)
+        if fallback is None:
+            return None
+        return _manifest_audio_asset_path(manifest, fallback[0])
     safe_id = "".join(character if character.isalnum() or character in "-_." else "_" for character in asset_id).strip("._")
     if not safe_id:
         return None

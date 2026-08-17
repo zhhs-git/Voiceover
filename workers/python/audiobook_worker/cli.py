@@ -1783,11 +1783,29 @@ def _generate_audio_assets(request: dict[str, Any]) -> dict[str, Any]:
         )
 
     artifacts = [asset.to_artifact() for asset in result.assets]
+    manifest_metadata: dict[str, Any] = {
+        "assetCount": len(result.assets),
+        "warningCount": len(result.warnings),
+    }
+    try:
+        manifest_payload = _read_json_object(result.manifest_path)
+    except (OSError, ValueError):
+        manifest_payload = {}
+    rejected_assets = manifest_payload.get("rejectedAssets")
+    if isinstance(rejected_assets, dict):
+        manifest_metadata["rejectedAssets"] = [
+            {"assetKey": key, **value}
+            for key, value in rejected_assets.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        ]
+    quality_fallbacks = manifest_payload.get("qualityFallbacks")
+    if isinstance(quality_fallbacks, dict):
+        manifest_metadata["qualityFallbacks"] = quality_fallbacks
     artifacts.append(
         {
             "kind": "stable_audio_manifest",
             "path": str(result.manifest_path),
-            "metadata": {"assetCount": len(result.assets)},
+            "metadata": manifest_metadata,
         }
     )
     state = _read_json_object(state_path)

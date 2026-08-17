@@ -1,8 +1,9 @@
-"""Minimal local detection of sharp transients and clipping in WAV audio.
+"""Local detection and safe repair helpers for sharp WAV transients.
 
-This module is intentionally independent from the Stable Audio workflow.  It
-only inspects an existing WAV file and reports suspicious short windows; it
-does not alter the file or decide whether an asset may be mixed.
+The detector intentionally remains usable as a standalone command-line tool.
+The Stable Audio pipeline consumes its structured result separately and uses
+the repair helper only for short, well-bounded defects; this module never
+decides whether an asset may be mixed.
 """
 
 from __future__ import annotations
@@ -23,6 +24,12 @@ _FRAME_RE = re.compile(
     r"^frame:(?P<index>\d+)\s+pts:\S+\s+pts_time:(?P<time>\S+)"
 )
 SHARP_PEAK_THRESHOLD_DBFS = -10.0
+AUDIO_QUALITY_DETECTOR_VERSION = 1
+MAX_REPAIR_INTERVAL_SECONDS = 0.15
+MAX_REPAIR_TOTAL_SECONDS = 0.50
+REPAIR_PADDING_SECONDS = 0.02
+REPAIR_CROSSFADE_SECONDS = 0.03
+MIN_REPAIR_RETAINED_PIECE_SECONDS = 0.06
 _STAT_RE = re.compile(
     r"^lavfi\.astats\.1\.(?P<name>[A-Za-z0-9_]+)=(?P<value>\S+)"
 )
@@ -79,6 +86,47 @@ class AudioQualityResult:
     @property
     def is_suspicious(self) -> bool:
         return self.status != "normal"
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable JSON-safe representation for manifests and reports."""
+
+        return {
+            "path": str(self.path),
+            "durationSeconds": self.duration_seconds,
+            "status": self.status,
+            "riskScore": self.risk_score,
+            "suspiciousTimes": list(self.suspicious_times),
+            "suspiciousIntervals": [list(interval) for interval in self.suspicious_intervals],
+            "issues": list(self.issues),
+            "windowsAnalyzed": self.windows_analyzed,
+            "clippedWindows": self.clipped_windows,
+            "highFrequencyBurstWindows": self.high_frequency_burst_windows,
+        }
+
+
+@dataclass(frozen=True)
+class AudioQualityRepairResult:
+    """Outcome of a non-destructive short-interval repair attempt."""
+
+    status: str
+    source_path: Path
+    output_path: Path | None
+    intervals: tuple[tuple[float, float], ...]
+    reason: str | None = None
+
+    @property
+    def repaired(self) -> bool:
+        return self.status == "repaired" and self.output_path is not None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "sourcePath": str(self.source_path),
+            "outputPath": str(self.output_path) if self.output_path else None,
+            "intervals": [list(interval) for interval in self.intervals],
+            "reason": self.reason,
+            "crossfadeSeconds": REPAIR_CROSSFADE_SECONDS if self.repaired else None,
+        }
 
 
 def _finite_float(value: str | float | None) -> float | None:
@@ -364,6 +412,201 @@ def _merge_intervals(
         else:
             merged.append([start, end])
     return tuple((round(start, 2), round(end, 2)) for start, end in merged)
+
+
+def _safe_repair_intervals(
+    intervals: Iterable[tuple[float, float]],
+    *,
+    duration_seconds: float,
+) -> tuple[tuple[tuple[float, float], ...], str | None]:
+    """Validate, pad, and merge intervals before a destructive edit.
+
+    The detector reports listening ranges rounded for people.  Repair needs a
+    small context margin, but it must never remove a large part of a cue or
+    manufacture a crossfade at the edge of a file.
+    """
+
+    raw: list[tuple[float, float]] = []
+    for interval in intervals:
+        if not isinstance(interval, (tuple, list)) or len(interval) != 2:
+            return (), "invalid_interval"
+        start, end = interval
+        if not (
+            isinstance(start, (int, float))
+            and not isinstance(start, bool)
+            and isinstance(end, (int, float))
+            and not isinstance(end, bool)
+            and math.isfinite(float(start))
+            and math.isfinite(float(end))
+        ):
+            return (), "invalid_interval"
+        start_seconds = float(start)
+        end_seconds = float(end)
+        if not 0 <= start_seconds < end_seconds <= duration_seconds:
+            return (), "interval_outside_audio"
+        if end_seconds - start_seconds > MAX_REPAIR_INTERVAL_SECONDS + 1e-9:
+            return (), "interval_too_long"
+        raw.append((start_seconds, end_seconds))
+
+    if not raw:
+        return (), "no_intervals"
+    if sum(end - start for start, end in raw) > MAX_REPAIR_TOTAL_SECONDS + 1e-9:
+        return (), "total_interval_too_long"
+
+    padded = sorted(
+        (
+            max(0.0, start - REPAIR_PADDING_SECONDS),
+            min(duration_seconds, end + REPAIR_PADDING_SECONDS),
+        )
+        for start, end in raw
+    )
+    merged: list[list[float]] = []
+    for start, end in padded:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    if any(
+        start < MIN_REPAIR_RETAINED_PIECE_SECONDS
+        or duration_seconds - end < MIN_REPAIR_RETAINED_PIECE_SECONDS
+        for start, end in merged
+    ):
+        return (), "interval_near_audio_edge"
+
+    kept_lengths: list[float] = []
+    cursor = 0.0
+    for start, end in merged:
+        kept_lengths.append(start - cursor)
+        cursor = end
+    kept_lengths.append(duration_seconds - cursor)
+    if any(length < MIN_REPAIR_RETAINED_PIECE_SECONDS for length in kept_lengths):
+        return (), "insufficient_audio_for_crossfade"
+
+    return tuple((start, end) for start, end in merged), None
+
+
+def repair_short_suspicious_intervals(
+    source_path: str | Path,
+    output_path: str | Path,
+    intervals: Iterable[tuple[float, float]],
+    *,
+    ffmpeg_path: str | Path | None = None,
+) -> AudioQualityRepairResult:
+    """Remove tiny bad spans and crossfade the remaining audio.
+
+    ``source_path`` is never modified.  The caller is responsible for placing
+    it in a preserved/rejected location before asking for a repair.  A failed
+    attempt leaves no partially-written ``output_path`` behind.
+    """
+
+    source = Path(source_path).expanduser().resolve()
+    destination = Path(output_path).expanduser().resolve()
+    if source == destination:
+        return AudioQualityRepairResult(
+            "not_eligible", source, None, (), "source_and_output_must_differ"
+        )
+    try:
+        duration_seconds, _sample_rate, _sample_width = _wav_duration(source)
+    except AudioQualityError as error:
+        return AudioQualityRepairResult("failed", source, None, (), str(error))
+
+    safe_intervals, reason = _safe_repair_intervals(
+        intervals,
+        duration_seconds=duration_seconds,
+    )
+    if reason is not None:
+        return AudioQualityRepairResult("not_eligible", source, None, (), reason)
+
+    kept: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in safe_intervals:
+        kept.append((cursor, start))
+        cursor = end
+    kept.append((cursor, duration_seconds))
+
+    labels: list[str] = []
+    filters: list[str] = []
+    for index, (start, end) in enumerate(kept):
+        label = f"kept{index}"
+        labels.append(label)
+        filters.append(
+            f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[{label}]"
+        )
+    current = labels[0]
+    for index, label in enumerate(labels[1:], start=1):
+        joined = f"joined{index}"
+        filters.append(
+            f"[{current}][{label}]acrossfade=d={REPAIR_CROSSFADE_SECONDS:.6f}:"
+            f"c1=tri:c2=tri[{joined}]"
+        )
+        current = joined
+
+    try:
+        executable = _find_ffmpeg(ffmpeg_path)
+    except AudioQualityError as error:
+        return AudioQualityRepairResult(
+            "failed", source, None, safe_intervals, str(error)
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = destination.with_name(
+        f".{destination.stem}.quality-repair.part{destination.suffix}"
+    )
+    command = [
+        executable,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        f"[{current}]",
+        "-c:a",
+        "pcm_s16le",
+        str(temporary_path),
+    ]
+    try:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return AudioQualityRepairResult(
+                "failed", source, None, safe_intervals, "ffmpeg_repair_timeout"
+            )
+        except OSError as error:
+            return AudioQualityRepairResult(
+                "failed", source, None, safe_intervals, f"ffmpeg_repair_failed:{error}"
+            )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            return AudioQualityRepairResult(
+                "failed",
+                source,
+                None,
+                safe_intervals,
+                detail[-1] if detail else "ffmpeg_repair_failed",
+            )
+        try:
+            _wav_duration(temporary_path)
+        except AudioQualityError as error:
+            return AudioQualityRepairResult(
+                "failed", source, None, safe_intervals, str(error)
+            )
+        temporary_path.replace(destination)
+        return AudioQualityRepairResult(
+            "repaired", source, destination, safe_intervals
+        )
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _spectral_event_times(

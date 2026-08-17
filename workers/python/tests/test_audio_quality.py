@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from audiobook_worker.audio_quality import analyze_audio, main
+from audiobook_worker.audio_quality import (
+    AUDIO_QUALITY_DETECTOR_VERSION,
+    analyze_audio,
+    main,
+    repair_short_suspicious_intervals,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -105,6 +110,44 @@ def test_short_abrupt_low_frequency_burst_is_a_spectral_candidate(tmp_path: Path
     assert result.status == "sharp_suspected"
     assert "tonal_spectral_event" in result.issues
     assert any(0.15 <= start_time <= 0.35 for start_time, _ in result.suspicious_intervals)
+
+
+def test_short_interval_repair_preserves_source_and_writes_shorter_wav(tmp_path: Path):
+    sample_rate = 24000
+    source = tmp_path / "source.wav"
+    repaired = tmp_path / "repaired.wav"
+    samples = _sine(sample_rate, 0.8, 440, 0.2)
+    burst = _sine(sample_rate, 0.04, 9000, 0.95)
+    start = round(sample_rate * 0.32)
+    samples[start : start + len(burst)] = burst
+    _write_wav(source, samples, sample_rate)
+
+    result = repair_short_suspicious_intervals(
+        source,
+        repaired,
+        ((0.32, 0.36),),
+    )
+
+    assert result.repaired
+    assert result.status == "repaired"
+    assert source.is_file()
+    assert repaired.is_file()
+    with wave.open(str(source), "rb") as original, wave.open(str(repaired), "rb") as output:
+        assert output.getnframes() < original.getnframes()
+    assert result.to_dict()["crossfadeSeconds"] == pytest.approx(0.03)
+    assert AUDIO_QUALITY_DETECTOR_VERSION >= 1
+
+
+def test_repair_rejects_interval_at_audio_edge(tmp_path: Path):
+    source = tmp_path / "source.wav"
+    repaired = tmp_path / "repaired.wav"
+    _write_wav(source, _sine(24000, 0.6, 440, 0.2))
+
+    result = repair_short_suspicious_intervals(source, repaired, ((0.0, 0.05),))
+
+    assert result.status == "not_eligible"
+    assert result.reason == "interval_near_audio_edge"
+    assert not repaired.exists()
 
 
 def test_cli_prints_a_human_readable_result(tmp_path: Path, capsys):

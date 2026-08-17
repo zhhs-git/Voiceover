@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from audiobook_worker import stable_audio
+from audiobook_worker.audio_quality import AudioQualityRepairResult, AudioQualityResult
 from audiobook_worker.stable_audio import (
     StableAudioConfig,
     StableAudioError,
@@ -24,6 +25,21 @@ def _command_output_path(command: list[str]) -> Path:
     if "--out" in command:
         return Path(command[command.index("--out") + 1])
     return Path(command[-1])
+
+
+def _quality_result(path: Path, *, suspicious: bool) -> AudioQualityResult:
+    return AudioQualityResult(
+        path=path,
+        duration_seconds=0.1,
+        status="sharp_suspected" if suspicious else "normal",
+        risk_score=0.8 if suspicious else 0.0,
+        suspicious_times=(0.04,) if suspicious else (),
+        suspicious_intervals=((0.02, 0.08),) if suspicious else (),
+        issues=("high_frequency_burst",) if suspicious else (),
+        windows_analyzed=2,
+        clipped_windows=0,
+        high_frequency_burst_windows=1 if suspicious else 0,
+    )
 
 
 def _script_payload() -> dict:
@@ -65,6 +81,7 @@ def test_generates_music_and_sfx_with_expected_commands_and_cache(tmp_path, monk
         root=tmp_path,
         executable=executable,
         timeout_seconds=10,
+        quality_enabled=False,
     )
     calls = []
 
@@ -211,7 +228,7 @@ def test_generates_three_same_theme_music_variants_and_reuses_cache(
     )
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -297,7 +314,7 @@ def test_music_variants_share_palette_anchor_and_deterministic_seed(
     )
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -322,7 +339,7 @@ def test_generation_prunes_manifest_entries_from_an_older_audio_plan(tmp_path, m
     script_path.write_text(json.dumps(old_script, ensure_ascii=False), encoding="utf-8")
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
 
     def fake_run(command, **kwargs):
         _write_test_wav(_command_output_path(command))
@@ -359,7 +376,7 @@ def test_audio_plan_change_invalidates_stable_audio_cache(tmp_path, monkeypatch)
     script_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -384,7 +401,7 @@ def test_can_force_regenerate_only_one_selected_asset(tmp_path, monkeypatch):
     script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -424,7 +441,7 @@ def test_selected_asset_must_exist_in_the_audio_plan(tmp_path):
             tmp_path / "audio-assets",
             asset_id="missing",
             asset_kind="music",
-            config=StableAudioConfig(root=tmp_path, executable=executable),
+            config=StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False),
         )
 
     assert raised.value.code == "audio_asset_not_found"
@@ -442,7 +459,7 @@ def test_rejects_audio_plan_model_that_does_not_match_config(tmp_path):
         generate_audio_assets(
             script_path,
             tmp_path / "audio-assets",
-            config=StableAudioConfig(root=tmp_path, executable=executable),
+            config=StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False),
         )
 
     assert raised.value.code == "invalid_audio_plan"
@@ -453,7 +470,7 @@ def test_preserves_completed_assets_when_a_later_asset_fails(tmp_path, monkeypat
     script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
     executable = tmp_path / "sa3"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    config = StableAudioConfig(root=tmp_path, executable=executable)
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=False)
     generation_count = 0
 
     def fake_run(command, **kwargs):
@@ -478,3 +495,259 @@ def test_preserves_completed_assets_when_a_later_asset_fails(tmp_path, monkeypat
 
     assert raised.value.code == "stable_audio_generation_failed"
     assert [asset.asset_id for asset in raised.value.partial_assets] == ["scene_001"]
+
+
+def test_cached_asset_without_quality_record_is_checked_without_regenerating(
+    tmp_path,
+    monkeypatch,
+):
+    script_path = tmp_path / "chapter.json"
+    script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
+    executable = tmp_path / "sa3"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    output_directory = tmp_path / "audio-assets"
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        _write_test_wav(_command_output_path(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(stable_audio.subprocess, "run", fake_run)
+    disabled_config = StableAudioConfig(
+        root=tmp_path,
+        executable=executable,
+        quality_enabled=False,
+    )
+    generate_audio_assets(script_path, output_directory, config=disabled_config)
+    call_count_before_validation = len(calls)
+    analyzed: list[Path] = []
+
+    def normal_analysis(path):
+        analyzed.append(Path(path))
+        return _quality_result(Path(path), suspicious=False)
+
+    monkeypatch.setattr(stable_audio, "analyze_audio", normal_analysis)
+    enabled_config = StableAudioConfig(
+        root=tmp_path,
+        executable=executable,
+        quality_enabled=True,
+    )
+    result = generate_audio_assets(script_path, output_directory, config=enabled_config)
+
+    assert len(calls) == call_count_before_validation
+    assert len(analyzed) == 2
+    assert all(asset.cache_hit for asset in result.assets)
+    manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["assets"]["music:scene_001"]["quality"]["status"] == "passed"
+    assert (output_directory / "quality" / "music" / "scene_001.json").is_file()
+
+
+def test_short_sfx_quality_failure_regenerates_only_that_asset(tmp_path, monkeypatch):
+    script_path = tmp_path / "chapter.json"
+    script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
+    executable = tmp_path / "sa3"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=True)
+    output_directory = tmp_path / "audio-assets"
+
+    def fake_run(command, **kwargs):
+        _write_test_wav(_command_output_path(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    quality_calls = 0
+
+    def fake_analyze(path):
+        nonlocal quality_calls
+        quality_calls += 1
+        return _quality_result(Path(path), suspicious=quality_calls == 1)
+
+    regenerated: list[int] = []
+
+    def fake_regenerate(spec, _config, *, signature, attempt):
+        regenerated.append(attempt)
+        remote = tmp_path / f"remote-{attempt}.wav"
+        _write_test_wav(remote)
+        return remote
+
+    monkeypatch.setattr(stable_audio.subprocess, "run", fake_run)
+    monkeypatch.setattr(stable_audio, "analyze_audio", fake_analyze)
+    monkeypatch.setattr(
+        stable_audio,
+        "repair_short_suspicious_intervals",
+        lambda source, output, intervals: AudioQualityRepairResult(
+            "not_eligible", Path(source), None, (), "short_sfx"
+        ),
+    )
+    monkeypatch.setattr(stable_audio, "_request_gradio_regeneration", fake_regenerate)
+
+    result = generate_audio_assets(
+        script_path,
+        output_directory,
+        asset_id="sfx_001",
+        asset_kind="sfx",
+        config=config,
+    )
+
+    assert [asset.asset_id for asset in result.assets] == ["sfx_001"]
+    assert regenerated == [1]
+    assert result.assets[0].quality["source"] == "gradio_regeneration"
+    assert (output_directory / "rejected" / "sfx").is_dir()
+    manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert "sfx:sfx_001" in manifest["assets"]
+    assert "sfx:sfx_001" not in manifest.get("rejectedAssets", {})
+
+
+def test_quality_retries_exhausted_quarantines_asset_without_failing_stage(
+    tmp_path,
+    monkeypatch,
+):
+    script_path = tmp_path / "chapter.json"
+    script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
+    executable = tmp_path / "sa3"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=True)
+    output_directory = tmp_path / "audio-assets"
+
+    def fake_run(command, **kwargs):
+        _write_test_wav(_command_output_path(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    regenerated: list[int] = []
+
+    def fake_regenerate(spec, _config, *, signature, attempt):
+        regenerated.append(attempt)
+        remote = tmp_path / f"remote-{attempt}.wav"
+        _write_test_wav(remote)
+        return remote
+
+    monkeypatch.setattr(stable_audio.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        stable_audio,
+        "analyze_audio",
+        lambda path: _quality_result(Path(path), suspicious=True),
+    )
+    monkeypatch.setattr(
+        stable_audio,
+        "repair_short_suspicious_intervals",
+        lambda source, output, intervals: AudioQualityRepairResult(
+            "not_eligible", Path(source), None, (), "short_sfx"
+        ),
+    )
+    monkeypatch.setattr(stable_audio, "_request_gradio_regeneration", fake_regenerate)
+
+    result = generate_audio_assets(
+        script_path,
+        output_directory,
+        asset_id="sfx_001",
+        asset_kind="sfx",
+        config=config,
+    )
+
+    assert result.assets == []
+    assert regenerated == [1, 2]
+    assert any(warning.startswith("audio_quality_rejected:sfx:sfx_001") for warning in result.warnings)
+    manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert "sfx:sfx_001" not in manifest["assets"]
+    assert manifest["rejectedAssets"]["sfx:sfx_001"]["reason"] == "short_sfx_direct_regeneration"
+    assert (output_directory / "quality" / "sfx" / "sfx_001.json").is_file()
+
+
+def test_short_music_defect_is_repaired_and_rechecked_before_manifest_write(
+    tmp_path,
+    monkeypatch,
+):
+    script_path = tmp_path / "chapter.json"
+    script_path.write_text(json.dumps(_script_payload(), ensure_ascii=False), encoding="utf-8")
+    executable = tmp_path / "sa3"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    config = StableAudioConfig(root=tmp_path, executable=executable, quality_enabled=True)
+    output_directory = tmp_path / "audio-assets"
+
+    def fake_run(command, **kwargs):
+        _write_test_wav(_command_output_path(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    analysis_count = 0
+
+    def fake_analyze(path):
+        nonlocal analysis_count
+        analysis_count += 1
+        return _quality_result(Path(path), suspicious=analysis_count == 1)
+
+    def fake_repair(source, output, intervals):
+        _write_test_wav(Path(output))
+        return AudioQualityRepairResult(
+            "repaired",
+            Path(source),
+            Path(output),
+            ((0.02, 0.08),),
+        )
+
+    monkeypatch.setattr(stable_audio.subprocess, "run", fake_run)
+    monkeypatch.setattr(stable_audio, "analyze_audio", fake_analyze)
+    monkeypatch.setattr(stable_audio, "repair_short_suspicious_intervals", fake_repair)
+    monkeypatch.setattr(
+        stable_audio,
+        "_request_gradio_regeneration",
+        lambda *args, **kwargs: pytest.fail("repaired asset must not be regenerated"),
+    )
+
+    result = generate_audio_assets(
+        script_path,
+        output_directory,
+        asset_id="scene_001",
+        asset_kind="music",
+        config=config,
+    )
+
+    assert [asset.quality["status"] for asset in result.assets] == ["repaired"]
+    assert analysis_count == 2
+    assert list((output_directory / "rejected" / "music").glob("*.wav"))
+
+
+def test_rejected_music_uses_same_scene_then_nearby_approved_fallback():
+    first = stable_audio.AudioAssetSpec(
+        asset_id="scene_001_low",
+        kind="music",
+        scene_id="scene_001",
+        model="sm-music",
+        prompt="low",
+        negative_prompt="",
+        duration_seconds=30,
+    )
+    same_scene = stable_audio.AudioAssetSpec(
+        asset_id="scene_001_medium",
+        kind="music",
+        scene_id="scene_001",
+        model="sm-music",
+        prompt="medium",
+        negative_prompt="",
+        duration_seconds=30,
+    )
+    nearby = stable_audio.AudioAssetSpec(
+        asset_id="scene_002_low",
+        kind="music",
+        scene_id="scene_002",
+        model="sm-music",
+        prompt="nearby",
+        negative_prompt="",
+        duration_seconds=30,
+    )
+    manifest = {
+        "assets": {same_scene.manifest_key: {}, nearby.manifest_key: {}},
+        "rejectedAssets": {first.manifest_key: {}},
+    }
+
+    stable_audio._refresh_quality_music_fallbacks(manifest, [first, same_scene, nearby])
+
+    assert manifest["qualityFallbacks"][first.manifest_key] == {
+        "assetKey": same_scene.manifest_key,
+        "reason": "quality_same_scene_variant",
+    }
+    manifest["assets"].pop(same_scene.manifest_key)
+    stable_audio._refresh_quality_music_fallbacks(manifest, [first, same_scene, nearby])
+    assert manifest["qualityFallbacks"][first.manifest_key] == {
+        "assetKey": nearby.manifest_key,
+        "reason": "quality_nearby_scene",
+    }
