@@ -39,6 +39,8 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -93,6 +95,11 @@ def _lora_dd_choices(dit_name: str) -> list:
     hits = sorted(d.glob("*.safetensors")) if d.is_dir() else []
     return [("--- Choose a LoRA ---", _DD_NONE)] + [(p.name, str(p)) for p in hits]
 MIN_SIGMA = 0.01
+# Keep generated filenames comfortably below macOS' 255-byte component limit.
+# The prompt can contain multibyte characters, so this is deliberately a byte
+# limit rather than a character limit.  The full prompt/negative prompt is
+# still sent to the model; this only affects the output filename.
+MAX_BASENAME_BYTES = 180
 # MP3 (V0) saving needs ffmpeg; without it we save WAV and hide the choice.
 FFMPEG = shutil.which("ffmpeg") is not None
 FORMAT_MP3, FORMAT_WAV = "Save to MP3 (V0)", "Save to WAV"
@@ -146,7 +153,13 @@ def condense_prompt(prompt: str) -> str:
 
 def verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed) -> str:
     """prompt[.neg-…].cfg{scale}[.smx{σ}].{seed} — matches the main repo's
-    gradio 'verbose' file naming (cfg segment only when cfg != 1)."""
+    gradio 'verbose' file naming (cfg segment only when cfg != 1).
+
+    Long prompts used to produce a filename longer than the filesystem limit
+    and make an otherwise successful generation fail while saving the WAV.
+    Keep the legacy name when it fits; otherwise retain the prompt prefix and
+    append a digest of the complete name so different requests do not collide.
+    """
     base = condense_prompt(prompt)
     if negative_prompt and negative_prompt.strip():
         base += ".neg-" + condense_prompt(negative_prompt.strip())
@@ -154,7 +167,18 @@ def verbose_basename(prompt, negative_prompt, cfg, sigma_max, seed) -> str:
         base += f".cfg{cfg:g}"
     if sigma_max != 1.0:
         base += f".smx{sigma_max:g}"
-    return f"{base}.{seed}"
+    full_name = f"{base}.{seed}"
+    if len(full_name.encode("utf-8")) <= MAX_BASENAME_BYTES:
+        return full_name
+
+    digest = hashlib.sha1(full_name.encode("utf-8")).hexdigest()[:10]
+    suffix = f".h{digest}.{seed}"
+    prompt_prefix = condense_prompt(prompt)
+    prefix_budget = max(1, MAX_BASENAME_BYTES - len(suffix.encode("utf-8")))
+    prompt_prefix = prompt_prefix.encode("utf-8")[:prefix_budget].decode(
+        "utf-8", errors="ignore"
+    ).rstrip(".-") or "_"
+    return f"{prompt_prefix}{suffix}"
 
 
 def _save_wav(pcm_int16, out_path):
@@ -164,6 +188,48 @@ def _save_wav(pcm_int16, out_path):
         w.setsampwidth(2)
         w.setframerate(SAMPLE_RATE)
         w.writeframes(pcm_int16.tobytes())
+
+
+def _notify_handoff(handoff, path: Path, mime: str, duration_seconds: float) -> str | None:
+    """Tell the audiobook web server that one prefilled asset is ready.
+
+    The callback is intentionally best-effort: ordinary, manually opened SA3
+    sessions must continue to work when no handoff metadata is present, and a
+    temporary browser/network failure should be visible in the generation notes
+    rather than turning a successfully generated WAV into a failed inference.
+    """
+    if not isinstance(handoff, dict):
+        return None
+    callback_url = str(handoff.get("callbackUrl") or "").strip()
+    handoff_id = str(handoff.get("handoffId") or "").strip()
+    if not callback_url or not handoff_id:
+        return None
+    payload = {
+        "handoffId": handoff_id,
+        "assetId": str(handoff.get("assetId") or ""),
+        "assetKind": str(handoff.get("assetKind") or ""),
+        "path": str(path.resolve()),
+        "mime": mime,
+        "durationSeconds": float(duration_seconds),
+    }
+    request = urllib.request.Request(
+        callback_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status < 200 or response.status >= 300:
+                return f"handoff callback returned HTTP {response.status}"
+            body = response.read()
+            if body:
+                parsed = json.loads(body.decode("utf-8"))
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    return f"handoff callback failed: {parsed['error']}"
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        return f"handoff callback failed: {type(error).__name__}: {error}"
+    return None
 
 
 # ── Model caches (unified memory; ~0.9-2.8 GB per DiT, 0.2-1.7 GB per codec) ──
@@ -1011,17 +1077,47 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         srow_ups = [gr.update(visible=bool(slots[i][0] or slots[i][1] != _DD_NONE))
                     for i in range(3)]
         row_ups = [gr.update(visible=v) for v in nvis]
+        # Do not write the current value back during a model switch unless it
+        # actually exceeds the incoming model's maximum.  On audiobook page
+        # handoff, the load event has already supplied the requested Seconds;
+        # writing `cur_seconds` here can race with that event and restore the
+        # launch default (30s) instead.
+        seconds_update = gr.update(maximum=max_s)
+        try:
+            current_seconds = float(cur_seconds)
+        except (TypeError, ValueError):
+            current_seconds = max_s
+        if current_seconds > max_s:
+            seconds_update = gr.update(maximum=max_s, value=max_s)
         return (gr.update(value=DEFAULT_DECODERS.get(dit_name, "same-s")),
-                gr.update(maximum=max_s, value=min(cur_seconds, max_s)),
+                seconds_update,
                 *dd_ups, *srow_ups, *row_ups,
                 gr.update(visible=not all(nvis)), nvis, dit_name, mem,
                 slots[0][0], slots[1][0], slots[2][0],
                 *(slots[i][j] for i in range(3) for j in (2, 3, 4)))
 
+    def _handoff_ready(handoff) -> bool:
+        return (
+            isinstance(handoff, dict)
+            and bool(str(handoff.get("handoffId") or "").strip())
+            and bool(str(handoff.get("callbackUrl") or "").strip())
+        )
+
+    def _handoff_label(handoff) -> str:
+        return "完成" if isinstance(handoff, dict) and handoff.get("isLast") else "下一个"
+
+    def _handoff_button_update(handoff, *, interactive: bool):
+        active = _handoff_ready(handoff)
+        return gr.update(
+            value=_handoff_label(handoff),
+            visible=active,
+            interactive=active and interactive,
+        )
+
     def _generate_entry(dit_name, decoder_name, prompt, negative_prompt,
                         seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                         a2a_audio, inpaint_audio, inp_start, inp_end,
-                        output_opts, file_format, *lora_vals):
+                        output_opts, file_format, *lora_vals, handoff=None):
         """Run one generation and package it as a history entry.
         Returns (entry, None) or (None, error_message)."""
         prompt = (prompt or "").strip()
@@ -1063,6 +1159,9 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             notes.append("inpaint range ignored — no reference audio uploaded")
 
         opts = output_opts or []
+        if _handoff_ready(handoff) and file_format != FORMAT_WAV:
+            notes.append("有声书导入模式固定使用 WAV")
+            file_format = FORMAT_WAV
         if ("Infinite Radio" in opts and seed_text and seed_text.strip()
                 and seed_text.strip() != "-1"):
             notes.append("Infinite Radio with a fixed seed repeats the same clip — "
@@ -1151,6 +1250,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "lora": _lora_disp(lora_specs),
             "spec_b64": spec_b64,
             "timing": timing_html,
+            "duration_seconds": audio_np.shape[-1] / SAMPLE_RATE,
         }
         return entry, None
 
@@ -1160,6 +1260,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         if state["current"] is not None:
             state["history"].insert(0, state["current"])
         state["current"] = entry
+        state["handoff_committed_key"] = None
         loop = "Loop" in opts
         main = render_player(entry,
                              autoplay=force_autoplay or "Auto-play" in opts,
@@ -1174,28 +1275,52 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def generate(dit_name, decoder_name, prompt, negative_prompt,
                  seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                  a2a_audio, inpaint_audio, inp_start, inp_end,
-                 output_opts, file_format, *lora_and_state):
+                 output_opts, file_format, handoff, *lora_and_state):
         *lora_vals, state = lora_and_state
         entry, err_msg = _generate_entry(
             dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
             seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
             inpaint_audio, inp_start, inp_end, output_opts, file_format,
-            *lora_vals)
+            *lora_vals, handoff=handoff)
         if entry is None:
             return (gr.update(), gr.update(),
                     f"<span style='color:#f88'>{err_msg}</span>",
-                    gr.update(), gr.update(), state)
+                    gr.update(), gr.update(), state,
+                    _handoff_button_update(
+                        handoff,
+                        interactive=isinstance(state, dict) and state.get("current") is not None,
+                    ),
+                    "")
         # a manual Generate makes any queued clip stale (settings may have changed);
         # the chained pregen refills it when Infinite Radio is on
         state["queued"] = None
         opts = output_opts or []
         queued_panel = render_queue_status(generating=True) if "Infinite Radio" in opts else ""
-        return _present(state, entry, opts, queued_panel)
+        if _handoff_ready(handoff) and handoff.get("autoSubmit"):
+            warning = _notify_handoff(
+                handoff,
+                Path(str(entry["path"])),
+                str(entry.get("mime") or "audio/wav"),
+                float(entry.get("duration_seconds") or 0),
+            )
+            if warning is None:
+                state["handoff_committed_key"] = entry.get("key")
+                return (
+                    *_present(state, entry, opts, queued_panel),
+                    gr.update(visible=False, interactive=False),
+                    "已自动提交当前音频，正在进行尖锐声检测…",
+                )
+        return (
+            *_present(state, entry, opts, queued_panel),
+            _handoff_button_update(handoff, interactive=True),
+            "已生成当前音频，请先试听；确认后点击“完成/下一个”。"
+            if _handoff_ready(handoff) else "",
+        )
 
     def promote(dit_name, decoder_name, prompt, negative_prompt,
                 seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                 a2a_audio, inpaint_audio, inp_start, inp_end,
-                output_opts, file_format, *lora_and_state):
+                 output_opts, file_format, handoff, *lora_and_state):
         """Infinite Radio: swap the pre-generated clip in when playback ends.
         Falls back to a full generate if the queue is empty. Either way the
         next track ALWAYS autoplays — Auto-play only governs whether a clip
@@ -1207,7 +1332,7 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
                 seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
                 inpaint_audio, inp_start, inp_end, output_opts, file_format,
-                *lora_vals)
+                *lora_vals, handoff=handoff)
             if entry is None:
                 return (gr.update(), gr.update(),
                         f"<span style='color:#f88'>{err_msg}</span>",
@@ -1220,23 +1345,72 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
     def pregen(dit_name, decoder_name, prompt, negative_prompt,
                seconds, steps, seed_text, cfg, apg, sigma_max, init_noise,
                a2a_audio, inpaint_audio, inp_start, inp_end,
-               output_opts, file_format, *lora_and_state):
+               output_opts, file_format, handoff, *lora_and_state):
         """Chained after generate/promote: pre-generate the NEXT clip while the
         current one plays (Infinite Radio only)."""
         *lora_vals, state = lora_and_state
-        if "Infinite Radio" not in (output_opts or []):
+        # Audiobook handoff sessions are explicitly user-confirmed: never
+        # create another preview automatically after Generate.
+        if _handoff_ready(handoff) or "Infinite Radio" not in (output_opts or []):
             state["queued"] = None
             return "", state
         entry, err_msg = _generate_entry(
             dit_name, decoder_name, prompt, negative_prompt, seconds, steps,
             seed_text, cfg, apg, sigma_max, init_noise, a2a_audio,
             inpaint_audio, inp_start, inp_end, output_opts, file_format,
-            *lora_vals)
+            *lora_vals, handoff=handoff)
         if entry is None:
             return (f"<div style='color:#f88; font-size:0.85em'>queue: {err_msg}</div>",
                     state)
         state["queued"] = entry
         return render_queue_status(entry), state
+
+    def commit_handoff(handoff, state):
+        """Commit only the current preview after the user confirms it."""
+        if not _handoff_ready(handoff):
+            return gr.update(visible=False, interactive=False), "", state
+
+        entry = state.get("current") if isinstance(state, dict) else None
+        label = _handoff_label(handoff)
+        if not isinstance(entry, dict) or not entry.get("path"):
+            return (
+                gr.update(value=label, visible=True, interactive=False),
+                '<span style="color:#f88">请先点击 Generate 生成并试听当前音频。</span>',
+                state,
+            )
+
+        entry_key = entry.get("key")
+        if state.get("handoff_committed_key") == entry_key:
+            return (
+                gr.update(value=label, visible=True, interactive=False),
+                "当前音频已提交，正在返回生成页面…",
+                state,
+            )
+
+        try:
+            duration_seconds = float(entry.get("duration_seconds", 0))
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+        warning = _notify_handoff(
+            handoff,
+            Path(str(entry["path"])),
+            str(entry.get("mime") or "audio/wav"),
+            duration_seconds,
+        )
+        if warning:
+            return (
+                gr.update(value=label, visible=True, interactive=True),
+                f'<span style="color:#f88">提交失败：{html_lib.escape(warning)}</span>',
+                state,
+            )
+
+        state["handoff_committed_key"] = entry_key
+        return (
+            gr.update(value=label, visible=True, interactive=False),
+            "已提交当前音频，正在加载下一个资源…"
+            if not handoff.get("isLast") else "已提交最后一个音频，正在返回生成页面…",
+            state,
+        )
 
     # sa3-promote must stay MOUNTED for the onended click to find it —
     # visible=False would remove it from the DOM entirely, so hide via CSS.
@@ -1251,7 +1425,26 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             "Text-to-audio, CFG + negative prompt, audio-to-audio, inpainting. "
             "First use of a model loads weights, subsequent runs are cached."
         )
-        st = gr.State({"current": None, "queued": None, "history": []})
+        st = gr.State({
+            "current": None,
+            "queued": None,
+            "history": [],
+            "handoff_committed_key": None,
+        })
+        # The audiobook app passes one asset handoff through the URL.  Keeping
+        # it in a Gradio State makes it session-local and lets the normal
+        # Generate button perform the callback without exposing callback data
+        # as another visible control.
+        handoff_state = gr.State({})
+        # Gradio 6 may run a queued Blocks.load event without attaching a
+        # Request object.  Capture the browser's query string on the client
+        # instead, then parse it in the same Python callback as the other
+        # prefill values.  A hidden Textbox is deliberately used here instead
+        # of gr.State: it has a concrete browser-side value, so Gradio's JS
+        # event preprocessing cannot drop the query string before Python sees
+        # it.
+        prefill_query = gr.Textbox(value="", visible=False,
+                                   elem_id="sa3-prefill-query")
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():
@@ -1262,17 +1455,21 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                              value=initial_decoder, scale=1)
                 with gr.Row():
                     prompt = gr.Textbox(label="Prompt", lines=2, scale=6,
+                                        elem_id="sa3-prompt",
                                         placeholder="e.g. 'Impending tribal, epic orchestral buildup'")
                     seed = gr.Textbox(label="Seed (optional)", max_lines=1, value="",
-                                      scale=1, min_width=80)
+                                      elem_id="sa3-seed", scale=1, min_width=80)
                 with gr.Row():
                     seconds = gr.Slider(label="Seconds", minimum=1,
                                         maximum=MAX_SECONDS.get(initial_dit, 120),
-                                        value=default_seconds, step=1)
+                                        value=default_seconds, step=0.5,
+                                        elem_id="sa3-seconds")
                     steps = gr.Slider(label="Steps", minimum=1, maximum=16,
-                                      value=default_steps, step=1)
+                                      value=default_steps, step=1,
+                                      elem_id="sa3-steps")
                     cfg = gr.Slider(label="CFG", minimum=0.0, maximum=10.0,
-                                    value=1.0, step=0.1)
+                                    value=1.0, step=0.1,
+                                    elem_id="sa3-cfg")
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():
@@ -1280,7 +1477,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                                         minimum=0.0, maximum=1.0, value=1.0, step=0.05)
                         sigma_global = gr.Slider(label="sigma_max",
                                                  minimum=0.0, maximum=1.0, value=1.0, step=0.01)
-                    negative_prompt = gr.Textbox(label="Negative prompt", lines=1)
+                    negative_prompt = gr.Textbox(label="Negative prompt", lines=1,
+                                                 elem_id="sa3-negative-prompt")
 
                 with gr.Accordion("LoRA", open=False):
                     _dd0 = _lora_dd_choices(initial_dit)
@@ -1355,6 +1553,14 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             with gr.Column(scale=2, elem_id="sa3-out"):
                 generate_btn = gr.Button("Generate", variant="primary", size="lg",
                                          elem_id="sa3-generate")
+                handoff_action_btn = gr.Button(
+                    "下一个",
+                    variant="secondary",
+                    elem_id="sa3-handoff-next",
+                    visible=False,
+                    interactive=False,
+                )
+                handoff_status = gr.HTML()
                 promote_btn = gr.Button("", elem_id="sa3-promote")   # CSS-hidden, DOM-present
                 gr.Markdown("**Output**")
                 output_player = gr.HTML()
@@ -1362,6 +1568,116 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
                 error_box = gr.HTML()
                 queued_html = gr.HTML()
                 history_html = gr.HTML()
+
+        def _prefill(query_string: str | None):
+            """Apply audiobook handoff query parameters when the page opens."""
+            params = dict(urllib.parse.parse_qsl(
+                str(query_string or "").lstrip("?"),
+                keep_blank_values=True,
+            ))
+
+            def text_value(name: str) -> str | None:
+                value = params.get(name)
+                return str(value) if value is not None and str(value).strip() else None
+
+            def number_value(name: str, default: float, lower: float, upper: float) -> float:
+                try:
+                    value = float(params.get(name, default))
+                except (TypeError, ValueError):
+                    value = default
+                return min(upper, max(lower, value))
+
+            dit_name = text_value("dit")
+            if dit_name not in DIT_CHOICES:
+                dit_name = initial_dit
+            decoder_name = text_value("decoder")
+            if decoder_name not in DECODER_CHOICES:
+                decoder_name = DEFAULT_DECODERS.get(dit_name, initial_decoder)
+            max_seconds = MAX_SECONDS.get(dit_name, 120)
+            seconds_value = number_value("seconds", default_seconds, 1, max_seconds)
+            steps_value = number_value("steps", default_steps, 1, 16)
+            cfg_value = number_value("cfg", 1, 0, 10)
+            handoff = {
+                key: text_value(key)
+                for key in ("handoffId", "callbackUrl", "assetId", "assetKind")
+                if text_value(key) is not None
+            }
+            if "autoSubmit" in params:
+                handoff["autoSubmit"] = str(params.get("autoSubmit") or "").lower() in {
+                    "1", "true", "yes"
+                }
+            if "isLast" in params:
+                handoff["isLast"] = str(params.get("isLast") or "").lower() in {
+                    "1", "true", "yes"
+                }
+            output_format = text_value("format")
+            format_value = FORMAT_WAV if output_format == "wav" else None
+            return [
+                gr.update(value=dit_name),
+                gr.update(value=decoder_name),
+                gr.update(value=text_value("prompt") or ""),
+                gr.update(value=text_value("negativePrompt") or ""),
+                gr.update(maximum=max_seconds, value=seconds_value),
+                gr.update(value=steps_value),
+                gr.update(value=text_value("seed") or ""),
+                gr.update(value=cfg_value),
+                gr.update(),
+                gr.update(value=["Auto-play"]),
+                gr.update(value=format_value) if format_value else gr.update(),
+                handoff,
+            ]
+
+        prefill_event = demo.load(
+            _prefill,
+            inputs=[prefill_query],
+            outputs=[
+                dit_dd, decoder_dd, prompt, negative_prompt, seconds, steps, seed,
+                cfg, sigma_global, output_opts, file_format, handoff_state,
+            ],
+            js="() => [window.location.search]",
+            queue=False,
+        )
+
+        # Form values are controlled by the Gradio frontend.  The Python load
+        # result is the source of truth for normal sessions, but this small
+        # browser-side reconciliation also covers Gradio 6's occasional race
+        # where a load result lands before a component has finished mounting.
+        # In particular, a model change can otherwise put Seconds back at its
+        # default after _prefill has applied the audiobook handoff.
+        _PREFILL_FORM_JS = """async () => {
+            const params = new URLSearchParams(window.location.search);
+            const values = [
+                ["#sa3-prompt", params.get("prompt")],
+                ["#sa3-negative-prompt", params.get("negativePrompt")],
+                ["#sa3-seconds", params.get("seconds")],
+                ["#sa3-steps", params.get("steps")],
+                ["#sa3-seed", params.get("seed")],
+                ["#sa3-cfg", params.get("cfg")],
+            ];
+            const setValue = (root, value) => {
+                const field = root?.matches?.("textarea, input")
+                    ? root
+                    : root?.querySelector("textarea, input");
+                if (!field || value === null) return false;
+                const prototype = field instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+                if (setter) setter.call(field, value);
+                else field.value = value;
+                field.dispatchEvent(new Event("input", {bubbles: true}));
+                field.dispatchEvent(new Event("change", {bubbles: true}));
+                return true;
+            };
+            for (let attempt = 0; attempt < 40; attempt += 1) {
+                const done = values.every(([selector, value]) =>
+                    value === null || setValue(document.querySelector(selector), value));
+                if (done) return [];
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return [];
+        }"""
+        prefill_event.then(None, js=_PREFILL_FORM_JS, queue=False)
 
         def _sync_dd_vis(dit_name):
             """Second batch after any group (re)mount: gradio 6 drops visibility
@@ -1483,7 +1799,8 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
         ctrl_inputs = [dit_dd, decoder_dd, prompt, negative_prompt,
                        seconds, steps, seed, cfg, apg, sigma_global,
                        sigma_slider, a2a_audio, inpaint_audio,
-                       inp_start, inp_end, output_opts, file_format] + lora_inputs
+                       inp_start, inp_end, output_opts, file_format,
+                       handoff_state] + lora_inputs
         main_outputs = [output_player, timing, error_box, queued_html, history_html, st]
 
         # NB: _present returns (player, timing, err, history, queued, state) —
@@ -1495,14 +1812,27 @@ def build_ui(initial_dit: str, initial_decoder: str, *, share: bool,
             wrapped.__name__ = fn.__name__
             return wrapped
 
-        generate_btn.click(_reorder(generate), inputs=ctrl_inputs + [st],
-                           outputs=main_outputs
+        def _reorder_with_handoff(fn):
+            def wrapped(*args):
+                player, tim, err_, hist, queued, state, action, status = fn(*args)
+                return player, tim, err_, queued, hist, state, action, status
+            wrapped.__name__ = fn.__name__
+            return wrapped
+
+        generate_btn.click(
+                           _reorder_with_handoff(generate), inputs=ctrl_inputs + [st],
+                           outputs=main_outputs + [handoff_action_btn, handoff_status]
                            ).then(pregen, inputs=ctrl_inputs + [st],
                                   outputs=[queued_html, st])
         promote_btn.click(_reorder(promote), inputs=ctrl_inputs + [st],
                           outputs=main_outputs
                           ).then(pregen, inputs=ctrl_inputs + [st],
                                  outputs=[queued_html, st])
+        handoff_action_btn.click(
+            commit_handoff,
+            inputs=[handoff_state, st],
+            outputs=[handoff_action_btn, handoff_status, st],
+        )
 
         gr.Markdown(
             "<p style='color:#888; font-size:0.85em'>"
