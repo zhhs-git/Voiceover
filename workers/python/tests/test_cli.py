@@ -456,6 +456,88 @@ def test_synthesize_chapter_audio_reuses_cached_segments_without_loading_backend
     assert cached_wav.stat().st_mtime_ns == original_mtime
 
 
+def test_mimo_cache_rejects_only_the_segment_with_pathological_silence(tmp_path: Path):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script = {
+        "bookId": "book1",
+        "chapterId": "ch01",
+        "segments": [
+            {
+                "id": "seg_0001",
+                "text": "第一段缓存应保持不变。",
+                "voiceId": "narrator_female",
+                "pace": "normal",
+            },
+            {
+                "id": "seg_0002",
+                "text": "嘘。",
+                "voiceId": "narrator_female",
+                "pace": "normal",
+            },
+        ],
+    }
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    audio_dir = tmp_path / "audio"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "mimo",
+                "modelId": "mimo-v2.5-tts-voiceclone",
+                "mergeSegments": False,
+                "cacheSegments": True,
+                "voiceProfileDirectory": str(tmp_path / "voice-profiles"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    calls: list[str] = []
+
+    class FakeMiMoBackend:
+        def prepare_voice_profiles(self, _segments, _profile_directory):
+            return None
+
+        def synthesize_segment(self, segment, output_directory):
+            calls.append(segment["id"])
+            path = Path(output_directory) / f"{segment['id']}.wav"
+            with wave.open(str(path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 24_000, 12_000, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 12_000)
+            return AudioArtifact("segment_audio", path, 0.5)
+
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+    assert calls == ["seg_0001", "seg_0002"]
+    valid_cache = audio_dir / "seg_0001.wav"
+    valid_cache_mtime = valid_cache.stat().st_mtime_ns
+
+    malformed_cache = audio_dir / "seg_0002.wav"
+    with wave.open(str(malformed_cache), "wb") as wav_file:
+        wav_file.setparams((1, 2, 24_000, 240_000, "NONE", "not compressed"))
+        wav_file.writeframes(b"\x00\x08" * 24_000 + b"\x00\x00" * 216_000)
+
+    calls.clear()
+    with patch("audiobook_worker.cli.MiMoTTSBackend", return_value=FakeMiMoBackend()):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert calls == ["seg_0002"]
+    assert result["metadata"]["cachedSegmentCount"] == 1
+    assert result["artifacts"][0]["metadata"]["cacheHit"] is True
+    assert result["artifacts"][1]["metadata"]["cacheHit"] is False
+    assert valid_cache.stat().st_mtime_ns == valid_cache_mtime
+    with wave.open(str(malformed_cache), "rb") as regenerated:
+        assert regenerated.getnframes() == 12_000
+    assert (audio_dir / "seg_0002.wav.json").is_file()
+
+
 def test_mimo_chapter_synthesis_prepares_profiles_then_runs_segments_serially_in_timeline_order(
     tmp_path: Path,
     monkeypatch,

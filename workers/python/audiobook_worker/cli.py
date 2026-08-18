@@ -44,6 +44,10 @@ from audiobook_worker.tts import (
     ParlerTTSBackend,
     voice_options,
 )
+from audiobook_worker.tts_quality import (
+    TtsSegmentAudioQualityError,
+    analyze_tts_segment_wav,
+)
 from audiobook_worker.transcription import (
     DEFAULT_WHISPER_MODEL,
     TranscriptionError,
@@ -491,6 +495,8 @@ def _read_cached_segment_artifact(
     segment: dict[str, Any],
     output_directory: Path,
     expected_signature: str,
+    *,
+    backend_name: str,
 ) -> dict[str, Any] | None:
     audio_path = output_directory / f"{segment['id']}.wav"
     metadata_path = _segment_cache_metadata_path(audio_path)
@@ -504,6 +510,9 @@ def _read_cached_segment_artifact(
         return None
     if metadata.get("signature") != expected_signature:
         return None
+    if not _segment_audio_passes_quality(segment, audio_path, backend_name):
+        _invalidate_segment_cache(audio_path)
+        return None
     return {
         "kind": "segment_audio",
         "path": str(audio_path),
@@ -515,6 +524,31 @@ def _read_cached_segment_artifact(
             "cacheHit": True,
         },
     }
+
+
+def _invalidate_segment_cache(audio_path: Path) -> None:
+    """Remove one unusable cached segment and its sidecar as one logical item."""
+    audio_path.unlink(missing_ok=True)
+    _segment_cache_metadata_path(audio_path).unlink(missing_ok=True)
+
+
+def _segment_audio_passes_quality(
+    segment: dict[str, Any],
+    audio_path: Path,
+    backend_name: str,
+) -> bool:
+    if not _is_readable_wav(audio_path):
+        return False
+    if backend_name != "mimo":
+        return True
+    try:
+        return analyze_tts_segment_wav(
+            audio_path,
+            text=segment.get("text", ""),
+            pace=segment.get("pace", "normal"),
+        ).accepted
+    except TtsSegmentAudioQualityError:
+        return False
 
 
 def _write_segment_cache_metadata(
@@ -717,6 +751,9 @@ def _cached_segment_files_match_expected(
             max_characters=max_characters,
         ):
             return False
+        if not _segment_audio_passes_quality(segment, path, backend_name):
+            _invalidate_segment_cache(path)
+            return False
     return True
 
 
@@ -779,6 +816,8 @@ def _mix_segment_descriptor(
 def _resolve_mix_segment_audio(
     expected_segments: list[dict[str, Any]],
     segment_directory: Path,
+    *,
+    backend_name: str,
 ) -> tuple[list[Path], list[dict[str, Any]], list[str], list[str]]:
     """Resolve the actual cached WAVs used to build the mix timeline.
 
@@ -793,9 +832,11 @@ def _resolve_mix_segment_audio(
     missing_ids: list[str] = []
     for segment in expected_segments:
         path = segment_directory / f"{segment['id']}.wav"
-        if _is_readable_wav(path):
+        if _segment_audio_passes_quality(segment, path, backend_name):
             exact_paths.append(path)
         else:
+            if backend_name == "mimo" and path.is_file():
+                _invalidate_segment_cache(path)
             missing_ids.append(str(segment["id"]))
 
     if not missing_ids:
@@ -837,7 +878,7 @@ def _resolve_mix_segment_audio(
         resolved_segments: list[dict[str, Any]] = []
         for segment in expected_segments:
             path = segment_directory / f"{segment['id']}.wav"
-            if _is_readable_wav(path):
+            if _segment_audio_passes_quality(segment, path, backend_name):
                 resolved_paths.append(path)
                 resolved_segments.append(_mix_segment_descriptor(path, segment, None))
         if not resolved_paths:
@@ -871,6 +912,14 @@ def _resolve_mix_segment_audio(
         expected_match = expected_by_id.get(segment_id)
         if expected_match is not None:
             index, fallback_segment = expected_match
+            if not _segment_audio_passes_quality(
+                fallback_segment,
+                path,
+                backend_name,
+            ):
+                if backend_name == "mimo":
+                    _invalidate_segment_cache(path)
+                continue
             descriptor = _mix_segment_descriptor(path, fallback_segment, metadata)
             selected[path] = (index, descriptor, set(_segment_source_ids(descriptor)))
             continue
@@ -885,6 +934,14 @@ def _resolve_mix_segment_audio(
         if not candidate_indices:
             continue
         fallback_segment = expected_segments[min(candidate_indices)]
+        if not _segment_audio_passes_quality(
+            fallback_segment,
+            path,
+            backend_name,
+        ):
+            if backend_name == "mimo":
+                _invalidate_segment_cache(path)
+            continue
         descriptor = _mix_segment_descriptor(path, fallback_segment, metadata)
         selected[path] = (
             min(candidate_indices),
@@ -1913,6 +1970,7 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                 segment,
                 output_directory,
                 signature,
+                backend_name=backend_name,
             )
             if cached_artifact is not None:
                 artifacts_by_index[index] = cached_artifact
@@ -1920,8 +1978,7 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
 
         # A failed retry must not leave an older artifact at the same path for
         # a later assembly step to mistake for the newly requested audio.
-        expected_audio_path.unlink(missing_ok=True)
-        _segment_cache_metadata_path(expected_audio_path).unlink(missing_ok=True)
+        _invalidate_segment_cache(expected_audio_path)
         pending_segments.append((index, segment, signature))
 
     active_backend = None
@@ -2120,13 +2177,26 @@ def _assemble_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                     "message": str(error),
                 },
             )
+        backend_name = str(request.get("backend") or "mimo")
         segment_paths = [
             segment_directory / f"{segment['id']}.wav" for segment in expected_segments
         ]
+        invalid_segments = [
+            (segment, path)
+            for segment, path in zip(expected_segments, segment_paths)
+            if not _segment_audio_passes_quality(
+                segment,
+                path,
+                backend_name,
+            )
+        ]
+        if backend_name == "mimo":
+            for _, path in invalid_segments:
+                if path.is_file():
+                    _invalidate_segment_cache(path)
         missing_audio = [
             segment["id"]
-            for segment, path in zip(expected_segments, segment_paths)
-            if not _is_readable_wav(path)
+            for segment, _ in invalid_segments
         ]
         if missing_audio:
             finish_assembly("failed", "Cannot assemble the chapter because segment audio is missing or unreadable.")
@@ -2253,7 +2323,11 @@ def _mix_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
         )
         segment_directory = Path(request["segmentAudioDirectory"])
         segment_paths, tts_segments, missing_audio, recovery_warnings = (
-            _resolve_mix_segment_audio(expected_segments, segment_directory)
+            _resolve_mix_segment_audio(
+                expected_segments,
+                segment_directory,
+                backend_name=backend_name,
+            )
         )
         if not segment_paths:
             finish_mix("failed", "Cannot mix the chapter because segment audio is missing or unreadable.")

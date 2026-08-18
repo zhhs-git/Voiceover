@@ -28,6 +28,7 @@ from audiobook_worker.script_builder import (
     is_narrator_voice_id,
     normalize_narrator_voice_id,
 )
+from audiobook_worker.tts_quality import validate_tts_segment_wav
 
 # ---------------------------------------------------------------------------
 # Shared data
@@ -333,6 +334,7 @@ class MiMoTTSBackend:
             )
         self._model_id = model_id
         self._request_audio = request_audio or self._request_audio_from_api
+        self._uses_default_request_audio = request_audio is None
         self._voice_profile_directory = (
             Path(voice_profile_directory) if voice_profile_directory else None
         )
@@ -351,15 +353,29 @@ class MiMoTTSBackend:
         if self._model_id == _MIMO_VOICE_CLONE_MODEL_ID:
             profile_directory = self._voice_profile_directory or directory / ".voice-profiles"
             voice_sample = self._ensure_voice_sample(segment, profile_directory)
-        encoded_audio = self._request_audio(self._build_request(segment, voice_sample))
-        audio_bytes = _decode_mimo_wav(encoded_audio, "MiMo")
-        output_path.write_bytes(audio_bytes)
+        request = self._build_request(segment, voice_sample)
+
+        def validator(encoded_audio: str) -> tuple[bytes, float]:
+            return _decode_and_validate_mimo_segment_wav(encoded_audio, segment)
+
+        if self._uses_default_request_audio:
+            audio_bytes, duration = self._request_audio_from_api(
+                request,
+                response_validator=validator,
+            )
+        else:
+            audio_bytes, duration = validator(self._request_audio(request))
+
+        # A rejected provider response must never overwrite the prior accepted
+        # cache entry. Only atomically replace the path after validation passes.
+        temporary_path = output_path.with_name(
+            f".{output_path.name}.{os.getpid()}.tmp"
+        )
         try:
-            with wave.open(str(output_path), "rb") as wav_file:
-                duration = wav_file.getnframes() / wav_file.getframerate()
-        except (wave.Error, ZeroDivisionError) as error:
-            output_path.unlink(missing_ok=True)
-            raise RuntimeError("MiMo returned an unreadable WAV audio file.") from error
+            temporary_path.write_bytes(audio_bytes)
+            temporary_path.replace(output_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         return AudioArtifact("segment_audio", output_path, duration)
 
     def prepare_voice_profiles(
@@ -565,7 +581,7 @@ class MiMoTTSBackend:
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def _request_audio_from_api(self, payload: dict) -> str:
+    def _request_audio_from_api(self, payload: dict, response_validator=None):
         encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         max_attempts = _mimo_max_attempts()
         last_error: MiMoRequestError | None = None
@@ -590,11 +606,19 @@ class MiMoTTSBackend:
                     with urllib.request.urlopen(request, timeout=180) as response:
                         result = json.loads(response.read().decode("utf-8"))
                     try:
-                        return result["choices"][0]["message"]["audio"]["data"]
+                        encoded_audio = result["choices"][0]["message"]["audio"]["data"]
                     except (KeyError, IndexError, TypeError) as error:
                         raise RuntimeError(
                             "MiMo response did not contain choices[0].message.audio.data."
                         ) from error
+                    if response_validator is not None:
+                        return response_validator(encoded_audio)
+                    return encoded_audio
+                except MiMoRequestError as error:
+                    last_error = error
+                    if not last_error.retryable or attempt >= max_attempts:
+                        raise
+                    retry_delay = _mimo_retry_delay_seconds(attempt)
                 except urllib.error.HTTPError as error:
                     detail = error.read().decode("utf-8", errors="replace")[:500]
                     retry_after = _retry_after_seconds(
@@ -669,6 +693,26 @@ def _decode_mimo_wav(encoded_audio: str, source: str) -> bytes:
     except (wave.Error, EOFError, ZeroDivisionError) as error:
         raise RuntimeError(f"{source} returned an unreadable WAV audio file.") from error
     return audio_bytes
+
+
+def _decode_and_validate_mimo_segment_wav(
+    encoded_audio: str,
+    segment: dict,
+) -> tuple[bytes, float]:
+    """Decode a provider response and convert bad speech audio into a retry."""
+    try:
+        audio_bytes = _decode_mimo_wav(encoded_audio, "MiMo")
+        quality = validate_tts_segment_wav(
+            audio_bytes,
+            text=segment.get("text", ""),
+            pace=segment.get("pace", "normal"),
+        )
+    except RuntimeError as error:
+        raise MiMoRequestError(
+            f"MiMo returned an unusable TTS segment WAV: {error}",
+            retryable=True,
+        ) from error
+    return audio_bytes, quality.duration_seconds
 
 
 def _audio_data_uri(audio_bytes: bytes) -> str:

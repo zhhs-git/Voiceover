@@ -132,6 +132,33 @@ def test_mimo_voiceclone_creates_one_book_profile_and_reuses_it_for_each_segment
     assert next_client.call_args.args[0]["model"] == _MIMO_VOICE_CLONE_MODEL_ID
 
 
+def test_mimo_voice_reference_is_not_checked_as_a_speech_segment(tmp_path: Path):
+    """Voice references keep their own validation contract and short source text."""
+    long_reference = base64.b64encode(_wav_bytes(10.0)).decode("ascii")
+    accepted_segment = base64.b64encode(_wav_bytes(0.1)).decode("ascii")
+    client = MagicMock(side_effect=[long_reference, accepted_segment])
+    profile_directory = tmp_path / "voice-profiles"
+    backend = MiMoTTSBackend(
+        api_key="test-key",
+        model_id=_MIMO_VOICE_CLONE_MODEL_ID,
+        request_audio=client,
+        voice_profile_directory=profile_directory,
+    )
+
+    backend.synthesize_segment(
+        {
+            "id": "seg_clone_reference_boundary",
+            "text": "嘘。",
+            "speakerId": "narrator",
+            "voiceId": "narrator_female",
+        },
+        tmp_path / "chapter_001",
+    )
+
+    assert client.call_count == 2
+    assert (profile_directory / "narrator_female.wav").is_file()
+
+
 def test_mimo_backend_uses_independent_character_design_over_fallback_voice(tmp_path: Path):
     client = MagicMock(return_value=base64.b64encode(_wav_bytes()).decode("ascii"))
     backend = MiMoTTSBackend(
@@ -587,6 +614,80 @@ def test_mimo_network_request_retries_transient_errors_with_bounded_attempts(
     assert backend._request_audio_from_api({"model": "test"}) == "encoded"
     assert len(calls) == 3
     assert all(timeout == 180 for _, timeout in calls)
+
+
+def test_mimo_quality_rejection_retries_the_current_segment_before_cache_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rejected_audio = base64.b64encode(_wav_bytes(10.0)).decode("ascii")
+    accepted_audio = base64.b64encode(_wav_bytes(0.1)).decode("ascii")
+    encoded_responses = [rejected_audio, accepted_audio]
+    calls = 0
+
+    class FakeResponse:
+        def __init__(self, encoded_audio: str) -> None:
+            self._encoded_audio = encoded_audio
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"audio": {"data": self._encoded_audio}}}]}
+            ).encode("utf-8")
+
+    def fake_urlopen(_request, timeout):
+        nonlocal calls
+        assert timeout == 180
+        encoded_audio = encoded_responses[calls]
+        calls += 1
+        return FakeResponse(encoded_audio)
+
+    monkeypatch.setenv("AUDIOBOOK_MIMO_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setenv("AUDIOBOOK_MIMO_RATE_STATE_PATH", str(tmp_path / "mimo-rate-state.json"))
+    monkeypatch.setattr("audiobook_worker.tts.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        tts_module._MiMoRequestRateGate,
+        "wait_for_turn",
+        lambda _self: None,
+    )
+    backend = MiMoTTSBackend(
+        api_key="test-key",
+        model_id=_MIMO_VOICE_DESIGN_MODEL_ID,
+    )
+
+    artifact = backend.synthesize_segment(
+        {"id": "seg_retry", "text": "嘘。", "pace": "normal"},
+        tmp_path,
+    )
+
+    assert calls == 2
+    assert artifact.path.read_bytes() == base64.b64decode(accepted_audio)
+    assert artifact.duration_seconds == pytest.approx(0.1)
+
+
+def test_mimo_quality_rejection_keeps_an_existing_cache_entry(tmp_path: Path):
+    output_path = tmp_path / "seg_existing.wav"
+    output_path.write_bytes(b"prior accepted audio")
+    rejected_audio = base64.b64encode(_wav_bytes(10.0)).decode("ascii")
+    backend = MiMoTTSBackend(
+        api_key="test-key",
+        model_id=_MIMO_VOICE_DESIGN_MODEL_ID,
+        request_audio=lambda _payload: rejected_audio,
+    )
+
+    with pytest.raises(MiMoRequestError, match="unusable TTS segment WAV"):
+        backend.synthesize_segment(
+            {"id": "seg_existing", "text": "嘘。", "pace": "normal"},
+            tmp_path,
+        )
+
+    assert output_path.read_bytes() == b"prior accepted audio"
 
 
 def test_mimo_rate_limited_retry_honors_retry_after_and_applies_a_global_cooldown(
