@@ -25,6 +25,7 @@ import { ChapterPreview } from "./ChapterPreview";
 import { GeneratedAudioAssetList } from "./GeneratedAudioAssetList";
 import { PersistentChapterAudioList } from "./PersistentChapterAudioList";
 import { BatchGenerationStatusList } from "./BatchGenerationStatusList";
+import { FinalAudioDownloadPanel } from "./FinalAudioDownloadPanel";
 import {
   buildVoicePreviewRequest,
   buildVoicePreviewScript,
@@ -1098,6 +1099,12 @@ export function BookDetailView({
             >
               生成
             </button>
+            <button
+              className={`tab-btn ${pipeline.tab === "download" ? "active" : ""}`}
+              onClick={() => pipeline.setTab("download", book.bookId)}
+            >
+              下载
+            </button>
           </nav>
 
           {/* Keep every audio element mounted while switching tabs. Hiding this
@@ -1503,6 +1510,17 @@ export function BookDetailView({
                   停止
                 </button>
               )}
+            </div>
+          )}
+
+          {pipeline.tab === "download" && (
+            <div className="tab-panel">
+              <FinalAudioDownloadPanel
+                bookId={book.bookId}
+                chapters={book.chapters}
+                chapterMixedAudioPaths={pipeline.chapterMixedAudioPaths}
+                generationWorkflows={pipeline.workflows.generation}
+              />
             </div>
           )}
 

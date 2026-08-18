@@ -2508,8 +2508,18 @@ def _convert_to_mp3(request: dict[str, Any]) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return _response("failed", error={"message": "ffmpeg not found in PATH"})
+    bitrate_kbps = request.get("bitrateKbps")
+    codec_options = ["-q:a", "2"]
+    if bitrate_kbps is not None:
+        if isinstance(bitrate_kbps, bool) or not isinstance(bitrate_kbps, int):
+            return _response("failed", error={"message": "invalid MP3 bitrate"})
+        normalized_bitrate = bitrate_kbps
+        if normalized_bitrate not in {128, 192, 256, 320}:
+            return _response("failed", error={"message": "unsupported MP3 bitrate"})
+        # Batch exports intentionally use CBR so the selected bitrate is exact.
+        codec_options = ["-b:a", f"{normalized_bitrate}k"]
     result = subprocess.run(
-        [ffmpeg, "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-q:a", "2", str(out_path)],
+        [ffmpeg, "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", *codec_options, str(out_path)],
         capture_output=True,
     )
     if result.returncode != 0:

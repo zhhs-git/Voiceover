@@ -8,6 +8,8 @@ import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from audiobook_worker import cli as cli_module
+
 
 def run_worker(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -73,6 +75,33 @@ def test_unknown_command_returns_structured_error(tmp_path: Path):
             "message": "Unknown worker command: unknown_command",
         },
     }
+
+
+def test_convert_to_mp3_uses_cbr_only_when_a_supported_export_bitrate_is_requested(
+    tmp_path: Path, monkeypatch
+):
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/ffmpeg" if command == "ffmpeg" else None)
+
+    def fake_run(command: list[str], **_kwargs):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"ID3")
+        return type("Result", (), {"returncode": 0, "stderr": b""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    cbr_result = cli_module._convert_to_mp3(
+        {"wavPath": str(tmp_path / "source.wav"), "outputPath": str(tmp_path / "cbr.mp3"), "bitrateKbps": 128}
+    )
+    vbr_result = cli_module._convert_to_mp3(
+        {"wavPath": str(tmp_path / "source.wav"), "outputPath": str(tmp_path / "vbr.mp3")}
+    )
+
+    assert cbr_result["status"] == "succeeded"
+    assert vbr_result["status"] == "succeeded"
+    assert ["-b:a", "128k"] == commands[0][commands[0].index("-b:a"):commands[0].index("-b:a") + 2]
+    assert ["-q:a", "2"] == commands[1][commands[1].index("-q:a"):commands[1].index("-q:a") + 2]
 
 
 def test_generate_audio_assets_returns_warning_for_empty_plan(tmp_path: Path):

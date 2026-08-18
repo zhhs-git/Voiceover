@@ -8,6 +8,8 @@ from pathlib import Path
 from audiobook_worker.web_server import (
     BatchConcurrencyConfig,
     ExternalAudiobookArchive,
+    FinalAudioArchive,
+    FinalAudioExportError,
     ServerState,
     WebHandler,
     safe_filename,
@@ -433,6 +435,185 @@ def test_external_audiobook_http_endpoint_returns_a_zip_download(tmp_path: Path,
         "narratorVoiceId": "narrator_male",
     }
     state.close()
+
+
+def _seed_final_audio_export(
+    state: ServerState,
+    chapter_ids: tuple[str, ...],
+) -> Path:
+    work_dir = _seed_batch_book(state, chapter_ids)
+    now = time.time()
+    state.db.execute(
+        "INSERT INTO generation_batches "
+        "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
+        "VALUES ('batch_export', 'book_123', 'succeeded', 0, 1, 0, ?, ?)",
+        (now, now),
+    )
+    for position, chapter_id in enumerate(chapter_ids):
+        mixed_path = work_dir / "audio" / f"{chapter_id}_mixed.wav"
+        _write_wav(mixed_path)
+        state.db.execute(
+            "INSERT INTO generation_batch_chapters "
+            "(batch_id, chapter_id, position, status, current_stage, next_stage, stage_state, "
+            "mixed_audio_path, updated_at) "
+            "VALUES ('batch_export', ?, ?, 'succeeded', NULL, 'complete', 'complete', ?, ?)",
+            (chapter_id, position, str(mixed_path), now),
+        )
+    state.db.commit()
+    return work_dir
+
+
+def test_final_audio_archive_packages_selected_mp3s_with_requested_bitrate(
+    tmp_path: Path, monkeypatch
+):
+    state = ServerState(tmp_path)
+    _seed_final_audio_export(state, ("chapter_001", "chapter_002"))
+    conversion_requests: list[dict[str, object]] = []
+
+    def fake_worker(command: str, request: dict[str, object]):
+        assert command == "convert_to_mp3"
+        conversion_requests.append(request)
+        output_path = Path(str(request["outputPath"]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"ID3fake-mp3")
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+
+    archive = state.create_final_audio_archive(
+        book_id="book_123",
+        chapter_ids=["chapter_002", "chapter_001"],
+        output_format="mp3",
+        bitrate_kbps=128,
+    )
+
+    assert archive.chapter_count == 2
+    assert archive.skipped_count == 0
+    assert archive.download_filename == "Shared_Book-final-audio-mp3-128kbps.zip"
+    assert [request["bitrateKbps"] for request in conversion_requests] == [128, 128]
+    with zipfile.ZipFile(archive.archive_path) as zipped:
+        assert zipped.namelist() == ["001-chapter_001.mp3", "002-chapter_002.mp3"]
+        assert zipped.read("001-chapter_001.mp3") == b"ID3fake-mp3"
+    state.close()
+
+
+def test_final_audio_archive_copies_wav_and_skips_a_mix_that_disappears(tmp_path: Path):
+    state = ServerState(tmp_path)
+    work_dir = _seed_final_audio_export(state, ("chapter_001", "chapter_002"))
+    second_mix_path = work_dir / "audio" / "chapter_002_mixed.wav"
+    second_mix_path.unlink()
+
+    archive = state.create_final_audio_archive(
+        book_id="book_123",
+        chapter_ids=["chapter_001", "chapter_002"],
+        output_format="wav",
+        bitrate_kbps=None,
+    )
+
+    assert archive.chapter_count == 1
+    assert archive.skipped_count == 1
+    with zipfile.ZipFile(archive.archive_path) as zipped:
+        assert zipped.namelist() == ["001-chapter_001.wav"]
+        assert zipped.read("001-chapter_001.wav") == (work_dir / "audio" / "chapter_001_mixed.wav").read_bytes()
+    state.close()
+
+
+def test_final_audio_archive_rejects_invalid_selection_and_bitrate(tmp_path: Path):
+    state = ServerState(tmp_path)
+    _seed_final_audio_export(state, ("chapter_001",))
+
+    for request, code in (
+        (
+            {"chapter_ids": [], "output_format": "mp3", "bitrate_kbps": 128},
+            "empty_chapter_selection",
+        ),
+        (
+            {"chapter_ids": ["chapter_001"], "output_format": "mp3", "bitrate_kbps": 96},
+            "invalid_mp3_bitrate",
+        ),
+        (
+            {"chapter_ids": ["chapter_missing"], "output_format": "wav", "bitrate_kbps": None},
+            "unknown_chapter",
+        ),
+        (
+            {"chapter_ids": ["chapter_001"], "output_format": "wav", "bitrate_kbps": 128},
+            "unexpected_wav_bitrate",
+        ),
+    ):
+        try:
+            state.create_final_audio_archive(book_id="book_123", **request)
+        except FinalAudioExportError as error:
+            assert error.code == code
+        else:
+            raise AssertionError(f"expected {code}")
+    state.close()
+
+
+def test_final_audio_http_endpoint_streams_zip_with_export_counts(tmp_path: Path, monkeypatch):
+    state = ServerState(tmp_path)
+    archive_path = tmp_path / "final-audio.zip"
+    archive_path.write_bytes(b"zip")
+    captured: dict[str, object] = {}
+
+    def fake_create_archive(**kwargs):
+        captured.update(kwargs)
+        return FinalAudioArchive(
+            archive_path=archive_path,
+            download_filename="Shared_Book-final-audio-mp3-192kbps.zip",
+            chapter_count=2,
+            skipped_count=1,
+        )
+
+    monkeypatch.setattr(state, "create_final_audio_archive", fake_create_archive)
+    served: dict[str, object] = {}
+
+    class FakeHandler:
+        def __init__(self, handler_state):
+            self.state = handler_state
+
+        def read_json(self):
+            return {
+                "chapterIds": ["chapter_001", "chapter_002"],
+                "format": "mp3",
+                "bitrateKbps": 192,
+            }
+
+        def serve_file(self, path: Path, **kwargs):
+            served["path"] = path
+            served.update(kwargs)
+
+    WebHandler.final_audio_archive(FakeHandler(state), "book_123")
+
+    assert captured == {
+        "book_id": "book_123",
+        "chapter_ids": ["chapter_001", "chapter_002"],
+        "output_format": "mp3",
+        "bitrate_kbps": 192,
+    }
+    assert served["path"] == archive_path
+    assert served["download_filename"] == "Shared_Book-final-audio-mp3-192kbps.zip"
+    assert served["extra_headers"] == {
+        "X-Audiobook-Chapter-Count": "2",
+        "X-Audiobook-Skipped-Chapter-Count": "1",
+    }
+    state.close()
+
+
+def test_post_route_dispatches_to_the_book_scoped_final_audio_export():
+    captured: list[str] = []
+
+    class FakeHandler:
+        path = "/api/books/book_123/final-audio.zip"
+
+        def final_audio_archive(self, book_id: str):
+            captured.append(book_id)
+
+        def send_error_json(self, *_args, **_kwargs):
+            raise AssertionError("the final-audio export route should be recognized")
+
+    WebHandler.do_POST(FakeHandler())
+
+    assert captured == ["book_123"]
 
 
 def test_batch_generation_preserves_each_chapter_stage_order_and_persists_outputs(

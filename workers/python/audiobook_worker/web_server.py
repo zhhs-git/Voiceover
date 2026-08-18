@@ -129,6 +129,10 @@ class ExternalAudiobookError(RuntimeError):
         return {"error": error}
 
 
+class FinalAudioExportError(ExternalAudiobookError):
+    """A client-visible failure while packaging existing final chapter audio."""
+
+
 @dataclass
 class BatchGenerationJob:
     """In-memory handle for a durable SQLite-backed generation batch."""
@@ -145,6 +149,20 @@ class ExternalAudiobookArchive:
     archive_path: Path
     download_filename: str
     chapter_count: int
+
+
+@dataclass(frozen=True)
+class FinalAudioArchive:
+    """A ZIP archive of selected, already completed final chapter mixes."""
+
+    archive_path: Path
+    download_filename: str
+    chapter_count: int
+    skipped_count: int
+
+
+FINAL_AUDIO_EXPORT_FORMATS = frozenset({"mp3", "wav"})
+FINAL_AUDIO_EXPORT_BITRATES = frozenset({128, 192, 256, 320})
 
 
 _BATCH_GENERATION_STAGES = frozenset(
@@ -2030,6 +2048,185 @@ class ServerState:
         directory.mkdir(parents=True, exist_ok=True)
         return directory / "chapters.mp3.zip"
 
+    def create_final_audio_archive(
+        self,
+        *,
+        book_id: str,
+        chapter_ids: object,
+        output_format: object,
+        bitrate_kbps: object | None,
+    ) -> FinalAudioArchive:
+        """Package selected final mixes without changing chapter generation state."""
+
+        if not SAFE_ID_PATTERN.fullmatch(book_id):
+            raise FinalAudioExportError(
+                "invalid_book_id",
+                "invalid book id",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if not isinstance(chapter_ids, list) or not chapter_ids:
+            raise FinalAudioExportError(
+                "empty_chapter_selection",
+                "Select at least one completed chapter.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if not isinstance(output_format, str) or output_format not in FINAL_AUDIO_EXPORT_FORMATS:
+            raise FinalAudioExportError(
+                "invalid_export_format",
+                "format must be mp3 or wav.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        requested_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for raw_chapter_id in chapter_ids:
+            if not isinstance(raw_chapter_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", raw_chapter_id):
+                raise FinalAudioExportError(
+                    "invalid_chapter_id",
+                    "chapterIds must contain valid chapter identifiers.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            if raw_chapter_id not in seen_ids:
+                seen_ids.add(raw_chapter_id)
+                requested_ids.append(raw_chapter_id)
+
+        normalized_bitrate: int | None = None
+        if output_format == "mp3":
+            if isinstance(bitrate_kbps, bool) or not isinstance(bitrate_kbps, int):
+                raise FinalAudioExportError(
+                    "invalid_mp3_bitrate",
+                    "bitrateKbps must be 128, 192, 256, or 320 for MP3 exports.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            normalized_bitrate = bitrate_kbps
+            if normalized_bitrate not in FINAL_AUDIO_EXPORT_BITRATES:
+                raise FinalAudioExportError(
+                    "invalid_mp3_bitrate",
+                    "bitrateKbps must be 128, 192, 256, or 320 for MP3 exports.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+        elif bitrate_kbps is not None:
+            raise FinalAudioExportError(
+                "unexpected_wav_bitrate",
+                "bitrateKbps is only valid for MP3 exports.",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        with self.db_lock:
+            book_row = self.db.execute(
+                "SELECT title, work_dir FROM books WHERE id = ?", (book_id,)
+            ).fetchone()
+            if book_row is None:
+                raise FinalAudioExportError(
+                    "book_not_found",
+                    "book not found",
+                    status=HTTPStatus.NOT_FOUND,
+                )
+            placeholders = ", ".join("?" for _ in requested_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT chapters.id, chapters.title,
+                       (
+                           SELECT generation_batch_chapters.mixed_audio_path
+                           FROM generation_batch_chapters
+                           JOIN generation_batches
+                             ON generation_batches.id = generation_batch_chapters.batch_id
+                           WHERE generation_batches.book_id = chapters.book_id
+                             AND generation_batch_chapters.chapter_id = chapters.id
+                             AND generation_batch_chapters.status = 'succeeded'
+                             AND generation_batch_chapters.mixed_audio_path IS NOT NULL
+                           ORDER BY generation_batch_chapters.updated_at DESC,
+                                    generation_batch_chapters.rowid DESC
+                           LIMIT 1
+                       ) AS mixed_audio_path
+                FROM chapters
+                WHERE chapters.book_id = ? AND chapters.id IN ({placeholders})
+                ORDER BY chapters.id ASC
+                """,
+                (book_id, *requested_ids),
+            ).fetchall()
+
+        found_ids = {str(row["id"]) for row in rows}
+        unknown_ids = [chapter_id for chapter_id in requested_ids if chapter_id not in found_ids]
+        if unknown_ids:
+            raise FinalAudioExportError(
+                "unknown_chapter",
+                "One or more selected chapters do not belong to this book.",
+                details={"chapterIds": unknown_ids},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        work_dir = self.path_in_data(str(book_row["work_dir"]))
+        export_id = uuid.uuid4().hex
+        output_directory = work_dir / "exports" / "final-audio" / export_id
+        output_directory.mkdir(parents=True, exist_ok=True)
+        archive_path = output_directory / "chapters.zip"
+        packaged_count = 0
+        skipped_count = 0
+        try:
+            with zipfile.ZipFile(
+                archive_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                for position, row in enumerate(rows, start=1):
+                    chapter_id = str(row["id"])
+                    chapter_title = str(row["title"] or chapter_id)
+                    stored_path = row["mixed_audio_path"]
+                    candidate_path = (
+                        self.path_in_data(str(stored_path))
+                        if isinstance(stored_path, str) and stored_path
+                        else work_dir / "audio" / f"{chapter_id}_mixed.wav"
+                    )
+                    if not candidate_path.is_file():
+                        skipped_count += 1
+                        continue
+                    archive_name = f"{position:03d}-{safe_filename(f'{chapter_title}.{output_format}')}"
+                    if output_format == "wav":
+                        archive.write(candidate_path, archive_name)
+                    else:
+                        mp3_path = output_directory / "mp3" / f"{chapter_id}.mp3"
+                        result = self.run_worker(
+                            "convert_to_mp3",
+                            {
+                                "wavPath": str(candidate_path),
+                                "outputPath": str(mp3_path),
+                                "bitrateKbps": normalized_bitrate,
+                            },
+                        )
+                        if result.get("status") != "succeeded" or not mp3_path.is_file():
+                            raise FinalAudioExportError(
+                                "mp3_conversion_failed",
+                                self._worker_failure_message(
+                                    result,
+                                    f"Unable to convert chapter to MP3: {chapter_title}",
+                                ),
+                                details={"chapterId": chapter_id, "chapterTitle": chapter_title},
+                            )
+                        archive.write(mp3_path, archive_name)
+                    packaged_count += 1
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+            raise
+
+        if packaged_count == 0:
+            archive_path.unlink(missing_ok=True)
+            raise FinalAudioExportError(
+                "final_audio_unavailable",
+                "None of the selected chapters has a readable final mix.",
+                details={"skippedCount": skipped_count},
+            )
+
+        download_stem = safe_filename(str(book_row["title"] or "audiobook"))
+        bitrate_label = f"-{normalized_bitrate}kbps" if normalized_bitrate is not None else ""
+        return FinalAudioArchive(
+            archive_path=archive_path,
+            download_filename=f"{Path(download_stem).stem}-final-audio-{output_format}{bitrate_label}.zip",
+            chapter_count=packaged_count,
+            skipped_count=skipped_count,
+        )
+
     def create_external_audiobook_archive(
         self,
         *,
@@ -2535,6 +2732,15 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/external/audiobook/chapters.mp3.zip":
                 self.external_audiobook_chapters_mp3()
                 return
+            parts = parsed.path.split("/")
+            if (
+                len(parts) == 5
+                and parts[1] == "api"
+                and parts[2] == "books"
+                and parts[4] == "final-audio.zip"
+            ):
+                self.final_audio_archive(unquote(parts[3]))
+                return
             if parsed.path == "/api/books/import":
                 self.import_book()
                 return
@@ -2675,6 +2881,25 @@ class WebHandler(BaseHTTPRequestHandler):
             extra_headers={
                 "X-Audiobook-Book-Id": archive.book_id,
                 "X-Audiobook-Chapter-Count": str(archive.chapter_count),
+            },
+        )
+
+    def final_audio_archive(self, book_id: str) -> None:
+        """Stream a ZIP of selected existing final mixes for one book."""
+
+        payload = self.read_json()
+        archive = self.state.create_final_audio_archive(
+            book_id=book_id,
+            chapter_ids=payload.get("chapterIds"),
+            output_format=payload.get("format"),
+            bitrate_kbps=payload.get("bitrateKbps"),
+        )
+        self.serve_file(
+            archive.archive_path,
+            download_filename=archive.download_filename,
+            extra_headers={
+                "X-Audiobook-Chapter-Count": str(archive.chapter_count),
+                "X-Audiobook-Skipped-Chapter-Count": str(archive.skipped_count),
             },
         )
 

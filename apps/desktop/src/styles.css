@@ -1859,6 +1859,149 @@ aside.chapter-list .chapter-title {
   min-height: 200px;
 }
 
+/* Batch final-audio download */
+.final-audio-download-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+.final-audio-download-header,
+.final-audio-download-controls,
+.final-audio-download-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.final-audio-download-header {
+  justify-content: space-between;
+}
+
+.final-audio-download-header h2,
+.final-audio-download-header p {
+  margin: 0;
+}
+
+.final-audio-download-header h2 {
+  font-size: 16px;
+}
+
+.final-audio-download-header p {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.final-audio-download-controls {
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-subtle, var(--bg-surface));
+}
+
+.final-audio-format-control {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--r-md);
+}
+
+.final-audio-format-option {
+  min-width: 58px;
+  padding: 7px 12px;
+  border: 0;
+  border-right: 1px solid var(--border-emphasis);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.final-audio-format-option:last-child { border-right: 0; }
+
+.final-audio-format-option.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.final-audio-format-option:disabled { cursor: not-allowed; opacity: 0.55; }
+
+.final-audio-bitrate-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.final-audio-bitrate-control select {
+  min-width: 108px;
+  padding: 7px 8px;
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--r-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.final-audio-download-button {
+  width: auto;
+  margin-left: auto;
+}
+
+.final-audio-download-list {
+  overflow: auto;
+  border-top: 1px solid var(--border);
+}
+
+.final-audio-download-row {
+  display: grid;
+  grid-template-columns: 18px 32px minmax(0, 1fr) auto;
+  min-height: 38px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border-muted);
+  cursor: pointer;
+}
+
+.final-audio-download-row input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.final-audio-download-row.unavailable {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.final-audio-download-position,
+.final-audio-download-status {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.final-audio-download-title {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.final-audio-download-status.ready { color: var(--success); }
+
+.final-audio-download-error,
+.final-audio-download-result {
+  margin: 0;
+  font-size: 12px;
+}
+
+.final-audio-download-error { color: var(--danger); }
+.final-audio-download-result { color: var(--success); }
+
 /* Chapter text preview */
 .chapter-preview {
   flex: 1;
@@ -2841,6 +2984,20 @@ aside.chapter-list .chapter-title {
   .audio-row .btn-secondary,
   .generated-audio-row .btn-secondary {
     flex: 1 1 auto;
+  }
+
+  .final-audio-download-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .final-audio-download-controls {
+    align-items: stretch;
+  }
+
+  .final-audio-download-button {
+    width: 100%;
+    margin-left: 0;
   }
 
   .library-grid {
