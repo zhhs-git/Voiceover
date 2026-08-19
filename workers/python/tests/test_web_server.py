@@ -831,37 +831,55 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
         "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
         "AUDIOBOOK_MIMO_CONCURRENCY",
         "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
         "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
     defaults = BatchConcurrencyConfig.from_environment()
-    assert defaults.chapter_workers == 4
+    assert defaults.chapter_workers == 5
     assert defaults.mimo_total == 1
     assert defaults.mimo_per_process == 1
     assert defaults.mimo_process_slots == 1
     assert defaults.mimo_process_concurrency == 1
     assert defaults.llm_workers == 2
-    assert defaults.mlx_workers == 1
+    assert defaults.local_audio_workers == 4
     assert defaults.mix_workers == 2
+    assert defaults.non_mimo_workers_while_mimo_pending == 4
 
     for name in (
         "AUDIOBOOK_BATCH_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
         "AUDIOBOOK_MIMO_CONCURRENCY",
         "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
         "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
     ):
         monkeypatch.setenv(name, "99")
     capped = BatchConcurrencyConfig.from_environment()
-    assert capped.chapter_workers == 4
+    assert capped.chapter_workers == 5
     assert capped.mimo_total == 1
     assert capped.mimo_per_process == 1
     assert capped.mimo_process_slots == 1
     assert capped.llm_workers == 2
-    assert capped.mlx_workers == 1
+    assert capped.local_audio_workers == 4
     assert capped.mix_workers == 2
+
+    monkeypatch.delenv("AUDIOBOOK_MLX_WORKER_CONCURRENCY", raising=False)
+    monkeypatch.setenv("AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY", "2")
+    new_setting = BatchConcurrencyConfig.from_environment()
+    assert new_setting.local_audio_workers == 2
+
+    monkeypatch.setenv("AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY", "4")
+    monkeypatch.setenv("AUDIOBOOK_MLX_WORKER_CONCURRENCY", "1")
+    legacy_capped = BatchConcurrencyConfig.from_environment()
+    assert legacy_capped.local_audio_workers == 1
+
+    monkeypatch.setenv("AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY", "2")
+    monkeypatch.setenv("AUDIOBOOK_MLX_WORKER_CONCURRENCY", "3")
+    new_setting_wins_when_lower = BatchConcurrencyConfig.from_environment()
+    assert new_setting_wins_when_lower.local_audio_workers == 2
 
     monkeypatch.setenv("AUDIOBOOK_MIMO_TOTAL_CONCURRENCY", "1")
     monkeypatch.setenv("AUDIOBOOK_MIMO_CONCURRENCY", "4")
@@ -925,7 +943,7 @@ def test_batch_stage_admission_keeps_one_worker_slot_for_waiting_mimo(
     )
     state.db.commit()
 
-    entered_three_non_mimo_stages = threading.Event()
+    entered_four_non_mimo_stages = threading.Event()
     release_workers = threading.Event()
     calls: list[tuple[str, str]] = []
     calls_lock = threading.Lock()
@@ -933,30 +951,30 @@ def test_batch_stage_admission_keeps_one_worker_slot_for_waiting_mimo(
     def fake_worker(command: str, request: dict[str, object]):
         with calls_lock:
             calls.append((str(request["chapterId"]), command))
-            if len(calls) == 3:
-                entered_three_non_mimo_stages.set()
+            if len(calls) == 4:
+                entered_four_non_mimo_stages.set()
         release_workers.wait(timeout=2)
         return {"status": "succeeded", "warnings": [], "artifacts": []}
 
     monkeypatch.setattr(state, "run_worker", fake_worker)
     # Model a direct MiMo request already holding the one resource permit.
-    # The queued voice stage must then reserve the fourth worker position
-    # instead of allowing all four later-stage workers to start.
+    # The queued voice stage must then reserve the fifth worker position
+    # instead of allowing a fifth later-stage worker to start.
     assert state.worker_resource_semaphores["mimo"].acquire(blocking=False)
     try:
         with state.batch_generation_lock:
             state._launch_batch_generation_locked("batch_reservation")
-        assert entered_three_non_mimo_stages.wait(timeout=1)
+        assert entered_four_non_mimo_stages.wait(timeout=1)
         time.sleep(0.05)
-        assert len(calls) == 3
+        assert len(calls) == 4
         assert {command for _, command in calls} == {
             "plan_chapter_audio",
             "assemble_chapter_audio",
+            "mix_chapter_audio",
         }
-
+    finally:
         state.cancel_batch_generation("batch_reservation")
         release_workers.set()
-    finally:
         state.worker_resource_semaphores["mimo"].release()
 
     finished = _wait_for_batch(
@@ -968,7 +986,72 @@ def test_batch_stage_admission_keeps_one_worker_slot_for_waiting_mimo(
     state.close()
 
 
-def test_worker_resource_limits_bound_mimo_mlx_llm_and_mix_commands(
+def test_batch_transcription_and_stable_audio_share_four_local_audio_slots(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state = ServerState(tmp_path)
+    chapter_ids = tuple(f"chapter_{index:03d}" for index in range(1, 6))
+    _seed_batch_book(state, chapter_ids)
+    now = time.time()
+    state.db.execute(
+        "INSERT INTO generation_batches "
+        "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
+        "VALUES ('batch_local_audio', 'book_123', 'queued', 0, 1, 0, ?, ?)",
+        (now, now),
+    )
+    state.db.executemany(
+        "INSERT INTO generation_batch_chapters "
+        "(batch_id, chapter_id, position, status, next_stage, stage_state, updated_at) "
+        "VALUES ('batch_local_audio', ?, ?, 'queued', ?, 'ready', ?)",
+        [
+            ("chapter_001", 0, "transcript", now),
+            ("chapter_002", 1, "stable_audio", now),
+            ("chapter_003", 2, "transcript", now),
+            ("chapter_004", 3, "stable_audio", now),
+            ("chapter_005", 4, "transcript", now),
+        ],
+    )
+    state.db.commit()
+
+    entered_four_local_audio_stages = threading.Event()
+    release_workers = threading.Event()
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    def fake_worker(command: str, _request: dict[str, object]):
+        with calls_lock:
+            calls.append(command)
+            if len(calls) == 4:
+                entered_four_local_audio_stages.set()
+        release_workers.wait(timeout=2)
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    try:
+        with state.batch_generation_lock:
+            state._launch_batch_generation_locked("batch_local_audio")
+        assert entered_four_local_audio_stages.wait(timeout=1)
+        time.sleep(0.05)
+        assert len(calls) == 4
+        assert set(calls) == {
+            "transcribe_chapter_audio",
+            "generate_audio_assets",
+        }
+    finally:
+        state.cancel_batch_generation("batch_local_audio")
+        release_workers.set()
+
+    finished = _wait_for_batch(
+        state,
+        "batch_local_audio",
+        lambda response: response["status"] == "cancelled",
+    )
+    assert all(chapter["status"] == "cancelled" for chapter in finished["chapters"])
+    state.close()
+
+
+def test_worker_resource_limits_bound_mimo_local_audio_llm_and_mix_commands(
     tmp_path: Path, monkeypatch
 ):
     for name in (
@@ -976,25 +1059,27 @@ def test_worker_resource_limits_bound_mimo_mlx_llm_and_mix_commands(
         "AUDIOBOOK_MIMO_TOTAL_CONCURRENCY",
         "AUDIOBOOK_MIMO_CONCURRENCY",
         "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
+        "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
         "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
     state = ServerState(tmp_path)
-    active: dict[str, int] = {"mimo": 0, "mlx": 0, "llm": 0, "mix": 0}
-    maximum: dict[str, int] = {"mimo": 0, "mlx": 0, "llm": 0, "mix": 0}
+    active: dict[str, int] = {"mimo": 0, "local_audio": 0, "llm": 0, "mix": 0}
+    maximum: dict[str, int] = {"mimo": 0, "local_audio": 0, "llm": 0, "mix": 0}
     lock = threading.Lock()
     release = threading.Event()
     entered: dict[str, threading.Event] = {
         "mimo": threading.Event(),
-        "mlx": threading.Event(),
+        "local_audio": threading.Event(),
         "llm": threading.Event(),
         "mix": threading.Event(),
     }
     resource_by_command = {
         "synthesize_chapter_audio": "mimo",
         "synthesize_segment_audio": "mimo",
-        "transcribe_chapter_audio": "mlx",
+        "transcribe_chapter_audio": "local_audio",
+        "generate_audio_assets": "local_audio",
         "plan_chapter_audio": "llm",
         "mix_chapter_audio": "mix",
         "convert_to_mp3": "mix",
@@ -1040,6 +1125,8 @@ def test_worker_resource_limits_bound_mimo_mlx_llm_and_mix_commands(
         ("synthesize_segment_audio", {"scriptPath": str(tmp_path / "script.json")}),
         ("transcribe_chapter_audio", {"voiceAudioPath": str(tmp_path / "voice.wav")}),
         ("transcribe_chapter_audio", {"voiceAudioPath": str(tmp_path / "voice.wav")}),
+        ("generate_audio_assets", {"scriptPath": str(tmp_path / "script.json"), "outputDirectory": str(tmp_path / "audio-assets")}),
+        ("generate_audio_assets", {"scriptPath": str(tmp_path / "script.json"), "outputDirectory": str(tmp_path / "audio-assets")}),
         ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
         ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
         ("plan_chapter_audio", {"scriptPath": str(tmp_path / "script.json")}),
@@ -1053,21 +1140,23 @@ def test_worker_resource_limits_bound_mimo_mlx_llm_and_mix_commands(
     ]
     for thread in threads:
         thread.start()
-    assert entered["mimo"].wait(timeout=1)
-    assert entered["mlx"].wait(timeout=1)
-    assert entered["llm"].wait(timeout=1)
-    assert entered["mix"].wait(timeout=1)
-    time.sleep(0.05)
-    assert maximum == {"mimo": 1, "mlx": 1, "llm": 2, "mix": 2}
-    assert mimo_process_concurrencies == ["1"]
-    assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)]
-    release.set()
-    for thread in threads:
-        thread.join(timeout=2)
+    try:
+        assert entered["mimo"].wait(timeout=1)
+        assert entered["local_audio"].wait(timeout=1)
+        assert entered["llm"].wait(timeout=1)
+        assert entered["mix"].wait(timeout=1)
+        time.sleep(0.05)
+        assert maximum == {"mimo": 1, "local_audio": 4, "llm": 2, "mix": 2}
+        assert mimo_process_concurrencies == ["1"]
+        assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)]
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        state.close()
     assert all(not thread.is_alive() for thread in threads)
     assert mimo_process_concurrencies == ["1", "1", "1", "1"]
     assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)] * 4
-    state.close()
 
 
 def test_batch_generation_persists_stage_and_chapter_durations(tmp_path: Path, monkeypatch):

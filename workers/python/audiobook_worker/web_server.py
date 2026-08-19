@@ -200,7 +200,7 @@ _BATCH_STAGE_DEFINITIONS: dict[str, BatchStageDefinition] = {
         "transcript",
         "transcript",
         "transcribe_chapter_audio",
-        "mlx",
+        "local_audio",
         "audio_plan",
     ),
     "audio_plan": BatchStageDefinition(
@@ -214,7 +214,7 @@ _BATCH_STAGE_DEFINITIONS: dict[str, BatchStageDefinition] = {
         "stable_audio",
         "stable_audio",
         "generate_audio_assets",
-        "mlx",
+        "local_audio",
         "mix",
     ),
     "mix": BatchStageDefinition(
@@ -230,10 +230,12 @@ _BATCH_STAGE_DEFINITIONS: dict[str, BatchStageDefinition] = {
 # These are deliberately conservative hard ceilings for the shared Apple
 # Silicon host. Environment variables may reduce a limit for troubleshooting,
 # but never raise it above the ceiling documented here.
-_MAX_BATCH_CHAPTER_WORKERS = 4
+_MAX_BATCH_CHAPTER_WORKERS = 5
 _MAX_MIMO_TOTAL_CONCURRENCY = 1
 _MAX_LLM_WORKERS = 2
-_MAX_MLX_WORKERS = 1
+# Whisper and Stable Audio share unified memory. Four total local model jobs
+# are the highest production limit validated without memory pressure.
+_MAX_LOCAL_AUDIO_WORKERS = 4
 _MAX_MIX_WORKERS = 2
 
 
@@ -247,6 +249,24 @@ def _safe_concurrency_setting(name: str, *, default: int, maximum: int) -> int:
     return max(1, min(maximum, value))
 
 
+def _local_audio_concurrency_setting() -> int:
+    """Read the new local-audio limit while honoring an explicit legacy cap."""
+
+    workers = _safe_concurrency_setting(
+        "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
+        default=_MAX_LOCAL_AUDIO_WORKERS,
+        maximum=_MAX_LOCAL_AUDIO_WORKERS,
+    )
+    if "AUDIOBOOK_MLX_WORKER_CONCURRENCY" not in os.environ:
+        return workers
+    legacy_workers = _safe_concurrency_setting(
+        "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        default=_MAX_LOCAL_AUDIO_WORKERS,
+        maximum=_MAX_LOCAL_AUDIO_WORKERS,
+    )
+    return min(workers, legacy_workers)
+
+
 @dataclass(frozen=True)
 class BatchConcurrencyConfig:
     """Resource limits shared by all durable and ad-hoc worker commands."""
@@ -255,7 +275,7 @@ class BatchConcurrencyConfig:
     mimo_total: int = _MAX_MIMO_TOTAL_CONCURRENCY
     mimo_per_process: int = 1
     llm_workers: int = _MAX_LLM_WORKERS
-    mlx_workers: int = _MAX_MLX_WORKERS
+    local_audio_workers: int = _MAX_LOCAL_AUDIO_WORKERS
     mix_workers: int = _MAX_MIX_WORKERS
 
     @classmethod
@@ -276,11 +296,7 @@ class BatchConcurrencyConfig:
                 default=_MAX_LLM_WORKERS,
                 maximum=_MAX_LLM_WORKERS,
             ),
-            mlx_workers=_safe_concurrency_setting(
-                "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
-                default=_MAX_MLX_WORKERS,
-                maximum=_MAX_MLX_WORKERS,
-            ),
+            local_audio_workers=_local_audio_concurrency_setting(),
             mix_workers=_safe_concurrency_setting(
                 "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
                 default=_MAX_MIX_WORKERS,
@@ -298,6 +314,11 @@ class BatchConcurrencyConfig:
         """A MiMo child process never creates parallel segment requests."""
         return 1
 
+    @property
+    def non_mimo_workers_while_mimo_pending(self) -> int:
+        """Keep a durable host-stage slot available for serialized MiMo."""
+        return max(0, self.chapter_workers - self.mimo_process_slots)
+
 
 _WORKER_RESOURCE_BY_COMMAND = {
     "synthesize_chapter_audio": "mimo",
@@ -306,8 +327,8 @@ _WORKER_RESOURCE_BY_COMMAND = {
     "analyze_chapter": "llm",
     "plan_chapter_audio": "llm",
     "apply_corrections": "llm",
-    "transcribe_chapter_audio": "mlx",
-    "generate_audio_assets": "mlx",
+    "transcribe_chapter_audio": "local_audio",
+    "generate_audio_assets": "local_audio",
     "mix_chapter_audio": "mix",
     "convert_to_mp3": "mix",
 }
@@ -378,7 +399,7 @@ class ServerState:
         self.worker_resource_semaphores = {
             "mimo": threading.BoundedSemaphore(self.concurrency.mimo_process_slots),
             "llm": threading.BoundedSemaphore(self.concurrency.llm_workers),
-            "mlx": threading.BoundedSemaphore(self.concurrency.mlx_workers),
+            "local_audio": threading.BoundedSemaphore(self.concurrency.local_audio_workers),
             "mix": threading.BoundedSemaphore(self.concurrency.mix_workers),
         }
         self._worker_resource_local = threading.local()
@@ -1567,7 +1588,11 @@ class ServerState:
             return False
         if resource != "mimo":
             with self.batch_stage_admission_lock:
-                if reserve_mimo_slot and self._active_non_mimo_stage_workers >= 3:
+                if (
+                    reserve_mimo_slot
+                    and self._active_non_mimo_stage_workers
+                    >= self.concurrency.non_mimo_workers_while_mimo_pending
+                ):
                     self.batch_chapter_slots.release()
                     return False
                 self._active_non_mimo_stage_workers += 1

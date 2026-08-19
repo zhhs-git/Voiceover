@@ -229,24 +229,28 @@ MiMo 是不可提高的**全服务单请求通道**：参考音色、章节片�
 因此旧的 `AUDIOBOOK_MIMO_TOTAL_CONCURRENCY` 和 `AUDIOBOOK_MIMO_CONCURRENCY` 仍可被读取
 以兼容旧启动配置，但无论设置为多少，实际值始终为 `1`。
 
-本机最多运行 4 个批量 worker 子进程。当有 MiMo 配音等待或运行时，最多只允许 3 个
+本机最多运行 5 个批量 worker 子进程。当有 MiMo 配音等待或运行时，最多只允许 4 个
 非 MiMo 阶段运行，以保证下一章不会被后续阶段饿死。LLM 最多 2 个、Whisper 与
-Stable Audio 共用 MLX 最多 1 个、原章节组装/最终混音/MP3 最多 2 个；资源等待不会占用
-批量 worker。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时创建时损坏或漂移。
+Stable Audio 共用最多 4 个本地音频模型进程，且两类任务合计不会超过 4 个；原章节组装/
+最终混音/MP3 最多 2 个。资源等待不会占用批量 worker。该上限来自本机压测的稳定档位，
+而不是曾触发内存压力的 8 路组合。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时
+创建时损坏或漂移。
 
 ```bash
-export AUDIOBOOK_BATCH_WORKER_CONCURRENCY="4"  # 1–4，默认 4：批量阶段 worker 上限
+export AUDIOBOOK_BATCH_WORKER_CONCURRENCY="5"  # 1–5，默认 5：批量阶段 worker 上限
 export AUDIOBOOK_MIMO_TOTAL_CONCURRENCY="1"    # 兼容字段；实际始终强制为 1
 export AUDIOBOOK_MIMO_CONCURRENCY="1"          # 兼容字段；实际始终强制为 1
 export AUDIOBOOK_MIMO_RPM="80"                  # 1–80，默认 80：MiMo 全局请求启动预算
 export AUDIOBOOK_LLM_WORKER_CONCURRENCY="2"    # 1–2，默认 2：分析/音频规划 LLM
-export AUDIOBOOK_MLX_WORKER_CONCURRENCY="1"    # 固定上限 1：Whisper 与 Stable Audio
+export AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY="4"  # 1–4：Whisper + Stable Audio 合计
 export AUDIOBOOK_MIX_WORKER_CONCURRENCY="2"    # 1–2，默认 2：最终混音、转 MP3
 export AUDIOBOOK_MIMO_MAX_ATTEMPTS="3"          # 单个网络请求最多尝试次数，1–5
 export AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS="0.75"  # 重试的指数退避基准秒数
 ```
 
-这些变量只能降低相应的安全上限；MiMo 并发不能被环境变量提高。MiMo 的瞬时网络、
+`AUDIOBOOK_MLX_WORKER_CONCURRENCY` 是已弃用的兼容字段。旧启动配置若显式设置它，
+仍会将本地音频并发进一步压低；删除该旧变量且未另行设置新变量后，使用新的 4 路默认值。
+上述变量只能降低相应的安全上限；MiMo 并发不能被环境变量提高。MiMo 的瞬时网络、
 408、425、429 和服务端错误会在同一条单请求通道内有限重试，已成功片段不会重复生成。
 批量队列会逐章显示“等待 MiMo 串行配音”“MiMo 配音中”或具体的后续阶段；429 冷却时会
 显示剩余等待时间。
