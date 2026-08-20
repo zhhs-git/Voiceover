@@ -8,6 +8,8 @@ import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from audiobook_worker import cli as cli_module
 
 
@@ -975,6 +977,57 @@ def test_segment_cache_signature_changes_with_character_voice_description():
 
     assert father_signature != son_signature
     assert father_signature != fallback_signature
+
+
+def test_voxcpm2_cache_signature_is_prompt_versioned_without_changing_mimo(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import audiobook_worker.cli as cli_module
+
+    segment = {
+        "id": "seg_0001",
+        "text": "The door opened.",
+        "voiceId": "guard_voice",
+        "voiceDesign": "an adult male voice",
+        "emotion": "neutral",
+        "pace": "normal",
+    }
+    mimo_before = cli_module._segment_cache_signature(segment, "mimo", None)
+    voxcpm2_before = cli_module._segment_cache_signature(segment, "voxcpm2", "VoxCPM2")
+
+    monkeypatch.setattr(
+        cli_module,
+        "VOXCPM2_PROMPT_FORMAT_VERSION",
+        cli_module.VOXCPM2_PROMPT_FORMAT_VERSION + 1,
+    )
+
+    assert cli_module._segment_cache_signature(segment, "mimo", None) == mimo_before
+    assert (
+        cli_module._segment_cache_signature(segment, "voxcpm2", "VoxCPM2")
+        != voxcpm2_before
+    )
+
+
+def test_decorated_tts_segments_receive_the_script_language(tmp_path: Path):
+    import audiobook_worker.cli as cli_module
+
+    script_path = tmp_path / "script.json"
+    script = {
+        "chapterId": "ch01",
+        "language": "en",
+        "segments": [
+            {"id": "seg_0001", "text": "The door opened."},
+        ],
+    }
+    script_path.write_text(json.dumps(script), encoding="utf-8")
+
+    decorated = cli_module._decorate_segments_for_voice(
+        script_path,
+        script,
+        [{"id": "seg_0001", "text": "The door opened."}],
+    )
+
+    assert decorated[0]["language"] == "en"
 
 
 def test_synthesize_chapter_audio_splits_long_chinese_segment_and_cleans_old_cache(tmp_path: Path):

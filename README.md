@@ -225,6 +225,9 @@ VoxCPM2 不是仓库依赖自动下载的服务。主机必须提供 `data/voxcp
 每次只允许一个 VoxCPM2 章节占用本地模型资源，模型在章节内加载一次并按源顺序合成
 片段，以控制内存占用和保持稳定参考音色。
 
+VoxCPM2 的固定音色与片段演绎提示词、语言选择和缓存版本详见
+[VoxCPM2 Prompting Contract](docs/design/voxcpm2-prompting.md)。
+
 ## TTS 设备配置
 
 Kokoro 和 Parler 使用 `AUDIOBOOK_TTS_DEVICE`：

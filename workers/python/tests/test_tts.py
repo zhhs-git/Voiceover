@@ -15,6 +15,7 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     MiMoRequestError,
+    VOXCPM2_PROMPT_FORMAT_VERSION,
     VoxCPM2TTSBackend,
     _MIMO_VOICE_CLONE_MODEL_ID,
     _MIMO_VOICE_DESIGN_MODEL_ID,
@@ -23,6 +24,8 @@ from audiobook_worker.tts import (
     mimo_tts_concurrency,
     mimo_tts_rpm,
     _select_torch_device,
+    voxcpm2_profile_control,
+    voxcpm2_reference_text,
     voice_options,
     voice_registry,
 )
@@ -100,6 +103,156 @@ def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
         "seg_0002",
     ]
     assert len(runner_calls[0]["profiles"]) == 1
+
+
+def test_voxcpm2_payload_separates_stable_profile_from_dynamic_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = VoxCPM2TTSBackend(
+        voice_profile_directory=tmp_path / "voice-profiles" / "voxcpm2",
+    )
+    monkeypatch.setattr(backend, "_validate_runtime", lambda: None)
+    runner_calls: list[dict[str, object]] = []
+
+    def fake_runner(payload: dict[str, object]) -> dict[str, object]:
+        runner_calls.append(payload)
+        results = []
+        for item in payload["segments"]:
+            output_path = Path(str(item["outputPath"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 4_800)
+            results.append({"id": item["id"], "path": str(output_path), "durationSeconds": 0.1})
+        return {"status": "succeeded", "device": "mps", "segments": results}
+
+    monkeypatch.setattr(backend, "_run_runner", fake_runner)
+    voice_design = "角色：克制的成年男性，声线低沉浑厚，胸腔共鸣自然，咬字清楚。"
+    long_direction = "方向标记" * 100
+    backend.synthesize_segments(
+        [
+            {
+                "id": "seg_profile_boundary",
+                "text": "现在必须离开。",
+                "speakerId": "guard",
+                "voiceId": "guard_voice",
+                "voiceDesign": voice_design,
+                "voiceDirection": long_direction,
+                "voiceSceneContext": "SCENE_ONLY_should_not_enter_a_control",
+                "emotion": "tense",
+                "pace": "fast",
+                "language": "zh",
+            }
+        ],
+        tmp_path / "segments",
+    )
+
+    payload = runner_calls[0]
+    profile = payload["profiles"][0]
+    segment = payload["segments"][0]
+    assert payload["promptFormatVersion"] == VOXCPM2_PROMPT_FORMAT_VERSION
+    assert profile["voiceDesign"] == voice_design
+    assert profile["promptFormatVersion"] == VOXCPM2_PROMPT_FORMAT_VERSION
+    assert profile["referenceText"] == voxcpm2_reference_text("zh")
+    assert "角色：" not in profile["profileControl"]
+    assert "低沉" in profile["profileControl"]
+    assert "SCENE_ONLY" not in profile["profileControl"]
+    assert voice_design not in segment["delivery"]
+    assert "谨慎克制" in segment["delivery"]
+    assert "语速偏快" in segment["delivery"]
+    assert len(segment["delivery"]) < len(long_direction) + 40
+    assert "SCENE_ONLY" not in segment["delivery"]
+
+
+def test_voxcpm2_uses_english_controls_for_non_chinese_segments(tmp_path: Path, monkeypatch):
+    backend = VoxCPM2TTSBackend(
+        voice_profile_directory=tmp_path / "voice-profiles" / "voxcpm2",
+    )
+    monkeypatch.setattr(backend, "_validate_runtime", lambda: None)
+    calls: list[dict[str, object]] = []
+
+    def fake_runner(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        results = []
+        for item in payload["segments"]:
+            output_path = Path(str(item["outputPath"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 4_800)
+            results.append({"id": item["id"], "path": str(output_path), "durationSeconds": 0.1})
+        return {"status": "succeeded", "segments": results}
+
+    monkeypatch.setattr(backend, "_run_runner", fake_runner)
+    backend.synthesize_segments(
+        [
+            {
+                "id": "seg_english",
+                "text": "The door opened slowly.",
+                "voiceId": "english_guard",
+                "voiceDesign": "Role: an adult male voice, low and clear.",
+                "emotion": "neutral",
+                "pace": "normal",
+                "language": "en",
+            }
+        ],
+        tmp_path / "segments",
+    )
+
+    profile = calls[0]["profiles"][0]
+    segment = calls[0]["segments"][0]
+    assert profile["referenceText"] == voxcpm2_reference_text("en")
+    assert profile["profileControl"] == "an adult male voice, low and clear."
+    assert segment["delivery"] == "natural and restrained, natural conversational pace"
+
+
+def test_voxcpm2_profile_control_has_english_fallback_without_mutating_design():
+    design = "角色：成年男性，声线低沉浑厚，咬字清楚。"
+
+    assert voxcpm2_profile_control(design).startswith("成年男性")
+    english = voxcpm2_profile_control(design, "en")
+    assert "adult male voice" in english
+    assert not any("\u3400" <= character <= "\u9fff" for character in english)
+    assert design.startswith("角色：")
+
+
+def test_voxcpm2_narrator_uses_selected_stable_identity(tmp_path: Path, monkeypatch):
+    backend = VoxCPM2TTSBackend(
+        voice_profile_directory=tmp_path / "voice-profiles" / "voxcpm2",
+    )
+    monkeypatch.setattr(backend, "_validate_runtime", lambda: None)
+    calls: list[dict[str, object]] = []
+
+    def fake_runner(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        results = []
+        for item in payload["segments"]:
+            output_path = Path(str(item["outputPath"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 4_800)
+            results.append({"id": item["id"], "path": str(output_path), "durationSeconds": 0.1})
+        return {"status": "succeeded", "segments": results}
+
+    monkeypatch.setattr(backend, "_run_runner", fake_runner)
+    backend.synthesize_segments(
+        [
+            {
+                "id": "seg_narrator",
+                "text": "他走进了雨夜。",
+                "speakerId": "narrator",
+                "voiceId": "narrator_male",
+                "voiceDesign": "角色：成年女性，明亮甜美。",
+            }
+        ],
+        tmp_path / "segments",
+    )
+
+    profile = calls[0]["profiles"][0]
+    assert "成年男性" in profile["voiceDesign"]
+    assert "成年女性" not in profile["voiceDesign"]
 
 
 def test_mimo_backend_sends_voice_design_prompt_and_text_as_assistant(tmp_path: Path):

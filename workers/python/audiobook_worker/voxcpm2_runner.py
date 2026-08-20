@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 
-PROFILE_VERSION = 1
+PROMPT_FORMAT_VERSION = 2
+PROFILE_VERSION = PROMPT_FORMAT_VERSION
 
 
 class VoxCPM2RunnerError(RuntimeError):
@@ -93,6 +94,7 @@ def _profile_is_usable(
     return (
         isinstance(metadata, dict)
         and metadata.get("version") == PROFILE_VERSION
+        and metadata.get("promptFormatVersion") == PROMPT_FORMAT_VERSION
         and metadata.get("signature") == signature
     )
 
@@ -142,14 +144,35 @@ def _controlled_text(instruction: str, text: str) -> str:
     return f"({normalized_instruction}){text}" if normalized_instruction else text
 
 
+def _prompt_format_version(value: object, *, name: str) -> int:
+    try:
+        version = int(value)
+    except (TypeError, ValueError) as error:
+        raise VoxCPM2RunnerError(f"{name} must be {PROMPT_FORMAT_VERSION}.") from error
+    if version != PROMPT_FORMAT_VERSION:
+        raise VoxCPM2RunnerError(
+            f"{name} must be {PROMPT_FORMAT_VERSION}, got {version}."
+        )
+    return version
+
+
 def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[str, Any]:
     voice_id = _required_text(item.get("voiceId"), name="profile voiceId")
     profile_path = Path(_required_text(item.get("profilePath"), name="profilePath"))
     metadata_path = Path(_required_text(item.get("metadataPath"), name="metadataPath"))
     lock_path = Path(_required_text(item.get("lockPath"), name="lockPath"))
     signature = _required_text(item.get("signature"), name="profile signature")
-    description = _required_text(item.get("voiceDescription"), name="voiceDescription")
+    voice_design = _required_text(item.get("voiceDesign"), name="voiceDesign")
+    profile_control = _required_text(
+        item.get("profileControl"),
+        name="profileControl",
+    )
     reference_text = _required_text(item.get("referenceText"), name="referenceText")
+    language = _required_text(item.get("language"), name="profile language")
+    prompt_format_version = _prompt_format_version(
+        item.get("promptFormatVersion"),
+        name="profile promptFormatVersion",
+    )
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
@@ -160,7 +183,7 @@ def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[
 
             _seed_from(signature)
             waveform = model.generate(
-                text=_controlled_text(description, reference_text),
+                text=_controlled_text(profile_control, reference_text),
                 cfg_value=2.0,
                 inference_timesteps=10,
                 max_len=4096,
@@ -170,10 +193,13 @@ def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[
                 metadata_path,
                 {
                     "version": PROFILE_VERSION,
+                    "promptFormatVersion": prompt_format_version,
                     "signature": signature,
                     "voiceId": voice_id,
-                    "voiceDescription": description,
+                    "voiceDesign": voice_design,
+                    "profileControl": profile_control,
                     "referenceText": reference_text,
+                    "language": language,
                     "backend": "voxcpm2",
                     "modelId": "VoxCPM2",
                 },
@@ -193,7 +219,12 @@ def _synthesize_segment(model: Any, item: dict[str, Any], sample_rate: int) -> d
             f"VoxCPM2 reference WAV is unavailable for segment {segment_id}: {reference_path}"
         )
     delivery = str(item.get("delivery") or "").strip()
-    _seed_from(f"{segment_id}:{text}:{reference_path}")
+    _prompt_format_version(
+        item.get("promptFormatVersion"),
+        name=f"segment promptFormatVersion for {segment_id}",
+    )
+    _required_text(item.get("language"), name=f"segment language for {segment_id}")
+    _seed_from(f"{segment_id}:{text}:{delivery}:{reference_path}")
     waveform = model.generate(
         text=_controlled_text(delivery, text),
         reference_wav_path=str(reference_path),
@@ -213,6 +244,10 @@ def _synthesize_segment(model: Any, item: dict[str, Any], sample_rate: int) -> d
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
+    _prompt_format_version(
+        payload.get("promptFormatVersion"),
+        name="request promptFormatVersion",
+    )
     model_path = Path(_required_text(payload.get("modelPath"), name="modelPath"))
     if not model_path.is_dir():
         raise VoxCPM2RunnerError(f"VoxCPM2 model directory is missing: {model_path}")

@@ -1410,6 +1410,17 @@ def test_split_prompts_reuse_legacy_rules_by_stage():
     assert "pace" in _DELIVERY_PROMPTS["en"]
 
 
+def test_voice_design_prompt_is_backend_neutral_and_stable_only():
+    from audiobook_worker.llm_stages import _VOICE_DESIGN_PROMPTS
+
+    for prompt in _VOICE_DESIGN_PROMPTS.values():
+        assert "MiMo V2.5" not in prompt
+        assert "voiceDesign" in prompt
+        assert "temporary" in prompt.lower() or "临时" in prompt
+        assert "post-processing" in prompt or "后期处理" in prompt
+        assert "prompt syntax" in prompt or "提示词语法" in prompt
+
+
 def test_english_analysis_keeps_english_system_prompt():
     calls = []
 

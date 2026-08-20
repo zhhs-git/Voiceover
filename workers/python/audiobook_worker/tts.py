@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from audiobook_worker.dialogue import resolve_text_language
 from audiobook_worker.model_settings import (
     VOXCPM2_MODEL_ID,
     voxcpm2_paths,
@@ -83,11 +84,14 @@ _MIMO_REFERENCE_TEXT = (
 _MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
 _MIMO_SAFE_RPM = 80
 _MIMO_RATE_STATE_ENV = "AUDIOBOOK_MIMO_RATE_STATE_PATH"
-_VOXCPM2_VOICE_PROFILE_VERSION = 1
-_VOXCPM2_REFERENCE_TEXT = (
-    "这是一段固定的基础音色参考。请自然、清晰、平稳地朗读，"
-    "保持声线统一，不加入明显情绪、角色表演或后期效果。"
-)
+VOXCPM2_PROMPT_FORMAT_VERSION = 2
+_VOXCPM2_VOICE_PROFILE_VERSION = VOXCPM2_PROMPT_FORMAT_VERSION
+_VOXCPM2_REFERENCE_TEXTS = {
+    "zh": "清晨的风穿过窗边，屋里很安静。",
+    "en": "The morning light falls softly across the quiet room.",
+}
+_VOXCPM2_PROFILE_CONTROL_MAX_CHARACTERS = 180
+_VOXCPM2_DIRECTION_MAX_CHARACTERS = 120
 _VOXCPM2_RUNNER_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -342,6 +346,127 @@ def _voice_context_for_segment(segment: dict) -> tuple[str, bool, str]:
             )
         )
     return str(voice_id), is_narrator, str(description).strip()
+
+
+def voxcpm2_language_for_segment(segment: dict) -> str:
+    """Resolve the language used by VoxCPM2's prompt controls."""
+
+    return resolve_text_language(
+        str(segment.get("text") or ""),
+        str(segment.get("language") or "").strip() or None,
+    )
+
+
+def _bounded_prompt_text(value: object, limit: int) -> str:
+    """Normalize a prompt fragment and trim it at a readable boundary."""
+
+    normalized = " ".join(str(value or "").split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    candidate = normalized[:limit]
+    boundary = max(
+        candidate.rfind(mark)
+        for mark in ("。", "！", "？", ".", "!", "?", "；", ";", "，", ",", " ")
+    )
+    if boundary >= max(20, int(limit * 0.55)):
+        candidate = candidate[:boundary]
+    return candidate.rstrip(" ，,；;:：")
+
+
+_VOXCPM2_ENGLISH_PROFILE_HINTS: tuple[tuple[str, str], ...] = (
+    ("专业中文有声书旁白", "professional audiobook narrator"),
+    ("有声书旁白", "audiobook narrator"),
+    ("固定为同一位成年女性", "consistent adult female voice"),
+    ("固定为同一位成年男性", "consistent adult male voice"),
+    ("成年女性", "adult female voice"),
+    ("成年男性", "adult male voice"),
+    ("年轻女性", "young female voice"),
+    ("年轻男性", "young male voice"),
+    ("成熟女性", "mature female voice"),
+    ("成熟男性", "mature male voice"),
+    ("中年女性", "middle-aged female voice"),
+    ("中年男性", "middle-aged male voice"),
+    ("女性", "female voice"),
+    ("男性", "male voice"),
+    ("洪亮", "projecting"),
+    ("饱满", "full"),
+    ("温暖", "warm"),
+    ("柔和", "soft"),
+    ("清晰", "clear"),
+    ("清亮", "bright"),
+    ("明亮", "bright"),
+    ("低沉", "low-pitched"),
+    ("浑厚", "rich"),
+    ("醇厚", "smooth and rich"),
+    ("沉稳", "steady"),
+    ("坚定", "firm"),
+    ("威严", "authoritative"),
+    ("柔软", "soft"),
+    ("细腻", "delicate"),
+    ("咬字清楚", "clear diction"),
+    ("咬字利落", "crisp diction"),
+    ("气息稳定", "steady breath"),
+    ("胸腔共鸣自然", "natural chest resonance"),
+    ("声线连贯耐听", "consistent and listenable delivery"),
+)
+
+
+def _english_profile_control_from_chinese(description: str) -> str:
+    """Make a small deterministic English fallback for Chinese role designs.
+
+    The canonical design remains untouched.  This fallback only keeps the
+    audible identity anchors that can be translated safely without adding a
+    second model call.
+    """
+
+    hints: list[str] = []
+    for source, target in _VOXCPM2_ENGLISH_PROFILE_HINTS:
+        if target in {
+            "audiobook narrator",
+            "adult female voice",
+            "adult male voice",
+            "female voice",
+            "male voice",
+        } and any(target in existing for existing in hints):
+            continue
+        if source in description and target not in hints:
+            hints.append(target)
+    if not hints:
+        hints.append("natural clear diction")
+    if not any("audiobook narrator" in hint for hint in hints):
+        hints.insert(0, "stable audiobook voice")
+    else:
+        hints.insert(0, "stable voice")
+    return ", ".join(hints)
+
+
+def _voxcpm2_language_key(language: object) -> str:
+    return "zh" if str(language or "").strip().lower().split("-", 1)[0] == "zh" else "en"
+
+
+def voxcpm2_profile_control(description: object, language: str = "zh") -> str:
+    """Project the canonical role design into stable VoxCPM2 syntax."""
+
+    normalized = " ".join(str(description or "").split()).strip()
+    normalized = re.sub(
+        r"^(?:角色|role|voice)\s*[:：-]\s*",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if _voxcpm2_language_key(language) != "zh":
+        if re.search(r"[\u3400-\u9fff]", normalized):
+            normalized = _english_profile_control_from_chinese(normalized)
+    return _bounded_prompt_text(
+        normalized,
+        _VOXCPM2_PROFILE_CONTROL_MAX_CHARACTERS,
+    )
+
+
+def voxcpm2_reference_text(language: str) -> str:
+    """Return the fixed neutral sentence used to create a local profile."""
+
+    return _VOXCPM2_REFERENCE_TEXTS[_voxcpm2_language_key(language)]
 
 
 # ---------------------------------------------------------------------------
@@ -741,11 +866,17 @@ class VoxCPM2TTSBackend:
             if not segment_id:
                 raise RuntimeError("VoxCPM2 cannot synthesize a segment without an id.")
             voice_id, _, description = _voice_context_for_segment(segment)
-            profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
+            language = voxcpm2_language_for_segment(segment)
+            profile_control = voxcpm2_profile_control(description, language)
+            reference_text = voxcpm2_reference_text(language)
+            profile_path = profile_directory / (
+                f"{_safe_voice_profile_name(voice_id)}_{language}.wav"
+            )
             metadata_path = profile_path.with_suffix(".json")
             signature = _voxcpm2_voice_profile_signature(
                 voice_id=voice_id,
                 description=description,
+                language=language,
             )
             profile_key = (profile_path, signature)
             if (
@@ -764,8 +895,11 @@ class VoxCPM2TTSBackend:
                         "metadataPath": str(metadata_path),
                         "lockPath": str(profile_path.with_suffix(".lock")),
                         "signature": signature,
-                        "voiceDescription": description,
-                        "referenceText": _VOXCPM2_REFERENCE_TEXT,
+                        "voiceDesign": description,
+                        "profileControl": profile_control,
+                        "referenceText": reference_text,
+                        "language": language,
+                        "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
                     }
                 )
             output_path = directory / f"{segment_id}.wav"
@@ -775,12 +909,20 @@ class VoxCPM2TTSBackend:
                     "id": segment_id,
                     "text": str(segment.get("text") or ""),
                     "delivery": self._delivery_instruction(segment),
+                    "language": language,
+                    "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
                     "referenceWavPath": str(profile_path),
                     "outputPath": str(output_path),
                 }
             )
 
-        response = self._run_runner({"profiles": profiles, "segments": runner_segments})
+        response = self._run_runner(
+            {
+                "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
+                "profiles": profiles,
+                "segments": runner_segments,
+            }
+        )
         device = response.get("device")
         self._device = str(device) if isinstance(device, str) and device else None
         raw_results = response.get("segments")
@@ -831,25 +973,34 @@ class VoxCPM2TTSBackend:
             raise RuntimeError(f"VoxCPM2 runner is missing: {self._runner_path}")
 
     def _delivery_instruction(self, segment: dict) -> str:
-        emotion = _VOXCPM2_EMOTION_DIRECTIONS.get(
+        language = voxcpm2_language_for_segment(segment)
+        emotion_directions = (
+            _VOXCPM2_EMOTION_DIRECTIONS_ZH
+            if language == "zh"
+            else _VOXCPM2_EMOTION_DIRECTIONS_EN
+        )
+        pace_directions = (
+            _VOXCPM2_PACE_DIRECTIONS_ZH
+            if language == "zh"
+            else _VOXCPM2_PACE_DIRECTIONS_EN
+        )
+        emotion = emotion_directions.get(
             str(segment.get("emotion") or "neutral").strip().lower(),
-            _VOXCPM2_EMOTION_DIRECTIONS["neutral"],
+            emotion_directions["neutral"],
         )
-        pace = _VOXCPM2_PACE_DIRECTIONS.get(
+        pace = pace_directions.get(
             str(segment.get("pace") or "normal").strip().lower(),
-            _VOXCPM2_PACE_DIRECTIONS["normal"],
+            pace_directions["normal"],
         )
-        direction = " ".join(str(segment.get("voiceDirection") or "").split())
-        if len(direction) > 220:
-            direction = direction[:220].rstrip() + "。"
-        parts = [
-            "严格保持参考音频中的固定基础音色，不改变说话者身份",
-            emotion,
-            pace,
-        ]
+        direction = _bounded_prompt_text(
+            segment.get("voiceDirection"),
+            _VOXCPM2_DIRECTION_MAX_CHARACTERS,
+        )
+        parts = [emotion, pace]
         if direction:
-            parts.append(f"演绎细节：{direction}")
-        return "；".join(parts)
+            parts.append(direction)
+        separator = "，" if language == "zh" else ", "
+        return separator.join(parts)
 
     def _run_runner(self, payload: dict[str, object]) -> dict[str, object]:
         request = {
@@ -857,6 +1008,7 @@ class VoxCPM2TTSBackend:
             "device": str(os.environ.get("AUDIOBOOK_VOXCPM2_DEVICE", "auto")).strip()
             or "auto",
             **payload,
+            "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
         }
         try:
             configured_timeout = int(
@@ -938,7 +1090,12 @@ def _voice_profile_signature(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _voxcpm2_voice_profile_signature(*, voice_id: str, description: str) -> str:
+def _voxcpm2_voice_profile_signature(
+    *,
+    voice_id: str,
+    description: str,
+    language: str = "zh",
+) -> str:
     """Return the identity-cache key for a VoxCPM2 reference WAV.
 
     MiMo references are generated by a cloud voice-design model, whereas
@@ -953,7 +1110,11 @@ def _voxcpm2_voice_profile_signature(*, voice_id: str, description: str) -> str:
         "modelId": VOXCPM2_MODEL_ID,
         "voiceId": voice_id,
         "voiceDescription": description,
-        "referenceText": _VOXCPM2_REFERENCE_TEXT,
+        "voiceDesign": description,
+        "profileControl": voxcpm2_profile_control(description, language),
+        "language": _voxcpm2_language_key(language),
+        "referenceText": voxcpm2_reference_text(language),
+        "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
     }
     encoded = json.dumps(
         payload,
@@ -983,6 +1144,7 @@ def _voxcpm2_profile_is_usable(
         and metadata.get("version") == _VOXCPM2_VOICE_PROFILE_VERSION
         and metadata.get("backend") == "voxcpm2"
         and metadata.get("modelId") == VOXCPM2_MODEL_ID
+        and metadata.get("promptFormatVersion") == VOXCPM2_PROMPT_FORMAT_VERSION
         and metadata.get("signature") == signature
     )
 
@@ -1072,7 +1234,7 @@ _MIMO_PACE_DIRECTIONS = {
     "fast": "语速偏快，节奏紧凑",
 }
 
-_VOXCPM2_EMOTION_DIRECTIONS = {
+_VOXCPM2_EMOTION_DIRECTIONS_ZH = {
     "neutral": "情绪自然克制",
     "happy": "真诚温暖，带轻微愉悦",
     "sad": "低沉哀伤，克制收束",
@@ -1095,11 +1257,45 @@ _VOXCPM2_EMOTION_DIRECTIONS = {
     "bitter": "苦涩压抑，带不甘",
 }
 
-_VOXCPM2_PACE_DIRECTIONS = {
+_VOXCPM2_PACE_DIRECTIONS_ZH = {
     "slow": "语速舒缓，保留自然停顿",
     "normal": "语速自然适中",
     "fast": "语速偏快但字音清楚",
 }
+
+_VOXCPM2_EMOTION_DIRECTIONS_EN = {
+    "neutral": "natural and restrained",
+    "happy": "warm and lightly cheerful",
+    "sad": "subdued and sorrowful",
+    "angry": "controlled but forceful anger",
+    "afraid": "tense and slightly trembling",
+    "tense": "guarded and quietly pressured",
+    "teasing": "playfully mocking, with a sly edge",
+    "whispering": "a clear, intimate whisper",
+    "excited": "energized but controlled",
+    "tired": "weary, with heavier breath",
+    "grief": "deep grief without losing control",
+    "cold": "detached and emotionally cold",
+    "pleading": "urgent and vulnerable",
+    "surprised": "genuinely startled, briefly rising",
+    "gentle": "soft, tender, and comforting",
+    "resolute": "firm and unwavering",
+    "nervous": "uneasy, with slightly longer pauses",
+    "contemptuous": "coldly contemptuous, without humor",
+    "solemn": "grave, measured, and ceremonial",
+    "bitter": "quietly bitter and resentful",
+}
+
+_VOXCPM2_PACE_DIRECTIONS_EN = {
+    "slow": "slow and measured",
+    "normal": "natural conversational pace",
+    "fast": "quick but clearly articulated",
+}
+
+# Keep the old private names as aliases for callers that imported them during
+# the initial local-backend rollout. New code selects the language explicitly.
+_VOXCPM2_EMOTION_DIRECTIONS = _VOXCPM2_EMOTION_DIRECTIONS_ZH
+_VOXCPM2_PACE_DIRECTIONS = _VOXCPM2_PACE_DIRECTIONS_ZH
 
 
 def _load_mimo_api_key() -> str | None:

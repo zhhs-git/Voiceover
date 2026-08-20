@@ -171,20 +171,20 @@ _CHARACTER_PROMPTS = {
 
 _VOICE_DESIGN_PROMPTS = {
     "zh": (
-        "你是有声书的角色固定音色设计器。这是一个独立的角色音色阶段，不负责角色识别、说话人归属、情绪标注或当前场景导演。请根据完整章节、当前章节实际发言角色、全书角色名册和已有音色画像，为每个当前活跃角色生成跨章节稳定的 MiMo V2.5 音色设计。"
+        "你是有声书的角色固定音色设计器。这是一个独立的角色音色阶段，不负责角色识别、说话人归属、情绪标注或当前场景导演。请根据完整章节、当前章节实际发言角色、全书角色名册和已有音色画像，为每个当前活跃角色生成跨章节稳定、可被不同语音合成后端理解的自然语言音色画像。"
         + "\n\n"
         + _LEGACY_ROLE_GUIDANCE["zh"]
         + "\n\n"
         + "以上旧角色规则只用于继承身份、称谓、性别、年龄和角色一致性约束；本阶段不得重新识别角色或创建角色。\n\n"
-        + "要求：\n1. 已有角色如果已经有 voiceDesign，必须原样保留，不要因为本章场景而改写；只有缺失或为空时才生成新的设计。\n2. 新设计必须结合正文中明确的身份、性格底色、外形气质、人物关系和说话习惯，不能只写性别和年龄。\n3. 角色之间要形成可听见的差异：音高/音域、声音厚薄、共鸣位置、气息强弱、咬字方式、停顿习惯、语尾和情绪外显程度至少有几项明确不同。\n4. 设计必须是稳定的基础声线，不写当前场景、临时情绪、背景音乐、音效、混响、EQ、压缩或其它后期处理。\n5. 使用 MiMo 官方推荐的自然语言方式，输出 1–4 句，具体、生动、无矛盾，不使用“普通”“正常”等模糊词。\n6. 角色必须使用输入中的精确 id。"
+        + "要求：\n1. 已有角色如果已经有 voiceDesign，必须原样保留，不要因为本章场景而改写；只有缺失或为空时才生成新的设计。\n2. 新设计必须结合正文中明确的身份、性格底色、外形气质、人物关系和说话习惯，不能只写性别和年龄。\n3. 角色之间要形成可听见的差异：音高/音域、声音厚薄、共鸣位置、气息强弱、咬字方式、停顿习惯、语尾和情绪外显程度至少有几项明确不同。\n4. 设计必须是稳定的基础声线，不写当前场景、临时情绪、背景音乐、音效、混响、EQ、压缩或其它后期处理。\n5. 使用简洁、具体、生动且无矛盾的自然语言，输出 1–4 句，不使用“普通”“正常”等模糊词，也不要写任何模型、接口或提示词语法。\n6. 角色必须使用输入中的精确 id。"
         + "\n\nvoiceDesign 建议包含：角色身份与性格底色；音色质感、音域和共鸣；长期说话习惯；与其他角色区分及禁止混淆的固定约束。只返回 JSON：{\"characters\":[{\"id\":\"角色精确ID\",\"voiceDesign\":\"1–4句稳定的中文音色设计\"}]}。不要返回 speakerId、segmentAnnotations、emotion、pace、direction、audioPlan 或其它字段。"
     ),
     "en": (
-        "You are the independent fixed voice-design stage for an audiobook. Do not identify characters, assign speakers, judge delivery, direct the current scene, or plan music and sound effects. Based on the complete chapter, active speaking characters, the book roster, and any existing voice designs, create a stable MiMo V2.5 voice design for each active character."
+        "You are the independent fixed voice-design stage for an audiobook. Do not identify characters, assign speakers, judge delivery, direct the current scene, or plan music and sound effects. Based on the complete chapter, active speaking characters, the book roster, and any existing voice designs, create a stable natural-language voice profile that can be understood by different speech-synthesis backends for each active character."
         + "\n\n"
         + _LEGACY_ROLE_GUIDANCE["en"]
         + "\n\nThe legacy character rules above are inherited only for identity, names, aliases, gender, age, and cross-chapter consistency; this stage must not rediscover or create characters.\n\n"
-        + "Rules:\n1. If a known character already has `voiceDesign`, preserve it verbatim. Only create a new design when it is missing or empty; do not rewrite a stable voice for a chapter-specific situation.\n2. Use identity, temperament, relationships, appearance cues, and speech habits from the text. Do not reduce the design to gender and age.\n3. Make characters audibly distinct through several concrete anchors: pitch/range, weight, resonance, breath, diction, pauses, sentence endings, and emotional transparency.\n4. Describe only the stable baseline voice. Do not include the current scene, temporary emotion, music, SFX, reverb, EQ, compression, or post-processing.\n5. Follow MiMo's natural-language voice-design style. Keep each design to 1–4 concrete, vivid sentences with no contradictory or vague traits.\n6. Use the exact input character id.\n\nReturn only JSON: {\"characters\":[{\"id\":\"exact_character_id\",\"voiceDesign\":\"1–4 sentences describing the stable voice\"}]}. Do not return speakerId, segmentAnnotations, emotion, pace, direction, audioPlan, or any other field."
+        + "Rules:\n1. If a known character already has `voiceDesign`, preserve it verbatim. Only create a new design when it is missing or empty; do not rewrite a stable voice for a chapter-specific situation.\n2. Use identity, temperament, relationships, appearance cues, and speech habits from the text. Do not reduce the design to gender and age.\n3. Make characters audibly distinct through several concrete anchors: pitch/range, weight, resonance, breath, diction, pauses, sentence endings, and emotional transparency.\n4. Describe only the stable baseline voice. Do not include the current scene, temporary emotion, music, SFX, reverb, EQ, compression, post-processing, model names, or prompt syntax.\n5. Use concise, concrete, vivid natural language with no contradictory or vague traits. Keep each design to 1–4 sentences.\n6. Use the exact input character id.\n\nReturn only JSON: {\"characters\":[{\"id\":\"exact_character_id\",\"voiceDesign\":\"1–4 sentences describing the stable voice\"}]}. Do not return speakerId, segmentAnnotations, emotion, pace, direction, audioPlan, or any other field."
     ),
 }
 

@@ -43,7 +43,9 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     ParlerTTSBackend,
+    VOXCPM2_PROMPT_FORMAT_VERSION,
     VoxCPM2TTSBackend,
+    voxcpm2_language_for_segment,
     voice_options,
 )
 from audiobook_worker.tts_quality import (
@@ -225,6 +227,15 @@ def _decorate_segments_for_voice(
     original_segments = script.get("segments", [])
     if not isinstance(original_segments, list):
         original_segments = []
+    script_text = " ".join(
+        str(item.get("text") or "")
+        for item in original_segments
+        if isinstance(item, dict)
+    )
+    script_language = resolve_text_language(
+        script_text,
+        str(script.get("language") or "").strip() or None,
+    )
     index_by_id = {
         str(item.get("id")): index
         for index, item in enumerate(original_segments)
@@ -233,6 +244,7 @@ def _decorate_segments_for_voice(
     decorated: list[dict[str, Any]] = []
     for segment in segments:
         item = dict(segment)
+        item["language"] = script_language
         source_ids = item.get("sourceSegmentIds") or [item.get("id")]
         source_index = next(
             (index_by_id[str(source_id)] for source_id in source_ids if str(source_id) in index_by_id),
@@ -516,6 +528,9 @@ def _segment_cache_signature(
         "pace": segment.get("pace", "normal"),
         "sourceSegmentIds": segment.get("sourceSegmentIds", [segment["id"]]),
     }
+    if str(backend_name or "").strip().casefold() == "voxcpm2":
+        payload["voxcpm2PromptFormatVersion"] = VOXCPM2_PROMPT_FORMAT_VERSION
+        payload["voxcpm2Language"] = voxcpm2_language_for_segment(segment)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
