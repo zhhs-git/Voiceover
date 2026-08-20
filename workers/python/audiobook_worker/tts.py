@@ -22,6 +22,10 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from audiobook_worker.model_settings import (
+    VOXCPM2_MODEL_ID,
+    voxcpm2_paths,
+)
 from audiobook_worker.script_builder import (
     DEFAULT_NARRATOR_VOICE_ID,
     VOICE_REGISTRY,
@@ -79,6 +83,12 @@ _MIMO_REFERENCE_TEXT = (
 _MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
 _MIMO_SAFE_RPM = 80
 _MIMO_RATE_STATE_ENV = "AUDIOBOOK_MIMO_RATE_STATE_PATH"
+_VOXCPM2_VOICE_PROFILE_VERSION = 1
+_VOXCPM2_REFERENCE_TEXT = (
+    "这是一段固定的基础音色参考。请自然、清晰、平稳地朗读，"
+    "保持声线统一，不加入明显情绪、角色表演或后期效果。"
+)
+_VOXCPM2_RUNNER_TIMEOUT_SECONDS = 60 * 60
 
 
 class MiMoRequestError(RuntimeError):
@@ -309,6 +319,31 @@ class MockTTSBackend:
         )
 
 
+def _voice_context_for_segment(segment: dict) -> tuple[str, bool, str]:
+    """Resolve the stable identity description shared by clone backends."""
+
+    voice_id = segment.get("voiceId", "narrator_default")
+    is_narrator = (
+        str(segment.get("speakerId") or "").strip() == "narrator"
+        or is_narrator_voice_id(voice_id)
+    )
+    if is_narrator or is_narrator_voice_id(voice_id):
+        voice_id = normalize_narrator_voice_id(voice_id)
+        # A per-segment direction can change delivery, never the narrator's
+        # base identity. Both MiMo and VoxCPM2 use this same invariant.
+        description = _MIMO_VOICE_DESIGNS[voice_id]
+    else:
+        description = (
+            segment.get("voiceDesign")
+            or segment.get("voiceDescription")
+            or _MIMO_VOICE_DESIGNS.get(
+                voice_id,
+                _MIMO_VOICE_DESIGNS[DEFAULT_NARRATOR_VOICE_ID],
+            )
+        )
+    return str(voice_id), is_narrator, str(description).strip()
+
+
 # ---------------------------------------------------------------------------
 # Xiaomi MiMo TTS backend (cloud voice-design / voice-clone models)
 # ---------------------------------------------------------------------------
@@ -408,21 +443,7 @@ class MiMoTTSBackend:
             self._ensure_voice_sample(segment, directory)
 
     def _voice_context(self, segment: dict) -> tuple[str, bool, str]:
-        voice_id = segment.get("voiceId", "narrator_default")
-        is_narrator = (
-            str(segment.get("speakerId") or "").strip() == "narrator"
-            or is_narrator_voice_id(voice_id)
-        )
-        if is_narrator or is_narrator_voice_id(voice_id):
-            voice_id = normalize_narrator_voice_id(voice_id)
-            # Narrator identity is never taken from a per-segment design. The
-            # segment may change delivery, but not the book's base voice.
-            description = _MIMO_VOICE_DESIGNS[voice_id]
-        else:
-            description = segment.get("voiceDesign") or segment.get("voiceDescription") or _MIMO_VOICE_DESIGNS.get(
-                voice_id, _MIMO_VOICE_DESIGNS[DEFAULT_NARRATOR_VOICE_ID]
-            )
-        return str(voice_id), is_narrator, str(description).strip()
+        return _voice_context_for_segment(segment)
 
     def _build_request(self, segment: dict, voice_sample: str | None = None) -> dict:
         _, is_narrator, description = self._voice_context(segment)
@@ -652,6 +673,244 @@ class MiMoTTSBackend:
         raise last_error or RuntimeError("MiMo API request failed.")
 
 
+# ---------------------------------------------------------------------------
+# VoxCPM2 backend (isolated local model process)
+# ---------------------------------------------------------------------------
+
+class VoxCPM2TTSBackend:
+    """Adapter for the locally installed VoxCPM2 reference-cloning workflow.
+
+    The model lives in ``data/voxcpm2/.venv`` and must never be imported by
+    this worker interpreter.  A chapter passes all uncached segments to the
+    runner together, allowing the isolated process to load the 2B model once.
+    """
+
+    backend_id = "voxcpm2"
+
+    def __init__(
+        self,
+        model_id: str = VOXCPM2_MODEL_ID,
+        *,
+        voice_profile_directory: Path | str | None = None,
+        runner_python: Path | str | None = None,
+        model_path: Path | str | None = None,
+        runner_path: Path | str | None = None,
+    ) -> None:
+        paths = voxcpm2_paths()
+        self._model_id = str(model_id or VOXCPM2_MODEL_ID)
+        self._runner_python = Path(runner_python) if runner_python else paths["python"]
+        self._model_path = Path(model_path) if model_path else paths["model"]
+        self._runner_path = (
+            Path(runner_path)
+            if runner_path
+            else Path(__file__).with_name("voxcpm2_runner.py")
+        )
+        self._voice_profile_directory = (
+            Path(voice_profile_directory) if voice_profile_directory else None
+        )
+        self._device: str | None = None
+
+    def synthesize_segment(
+        self,
+        segment: dict,
+        output_directory: Path | str,
+    ) -> AudioArtifact:
+        return self.synthesize_segments([segment], output_directory)[0]
+
+    def synthesize_segments(
+        self,
+        segments: list[dict],
+        output_directory: Path | str,
+    ) -> list[AudioArtifact]:
+        """Synthesize source-order segments with one isolated model load."""
+
+        if not segments:
+            return []
+        self._validate_runtime()
+        directory = Path(output_directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        profile_directory = self._voice_profile_directory or directory / ".voice-profiles"
+        profile_directory.mkdir(parents=True, exist_ok=True)
+
+        profiles: list[dict[str, object]] = []
+        profile_request_keys: set[tuple[Path, str]] = set()
+        runner_segments: list[dict[str, object]] = []
+        expected_paths: dict[str, Path] = {}
+        for segment in segments:
+            segment_id = str(segment.get("id") or "").strip()
+            if not segment_id:
+                raise RuntimeError("VoxCPM2 cannot synthesize a segment without an id.")
+            voice_id, _, description = _voice_context_for_segment(segment)
+            profile_path = profile_directory / f"{_safe_voice_profile_name(voice_id)}.wav"
+            metadata_path = profile_path.with_suffix(".json")
+            signature = _voxcpm2_voice_profile_signature(
+                voice_id=voice_id,
+                description=description,
+            )
+            profile_key = (profile_path, signature)
+            if (
+                not _voxcpm2_profile_is_usable(
+                    profile_path,
+                    metadata_path,
+                    signature=signature,
+                )
+                and profile_key not in profile_request_keys
+            ):
+                profile_request_keys.add(profile_key)
+                profiles.append(
+                    {
+                        "voiceId": voice_id,
+                        "profilePath": str(profile_path),
+                        "metadataPath": str(metadata_path),
+                        "lockPath": str(profile_path.with_suffix(".lock")),
+                        "signature": signature,
+                        "voiceDescription": description,
+                        "referenceText": _VOXCPM2_REFERENCE_TEXT,
+                    }
+                )
+            output_path = directory / f"{segment_id}.wav"
+            expected_paths[segment_id] = output_path
+            runner_segments.append(
+                {
+                    "id": segment_id,
+                    "text": str(segment.get("text") or ""),
+                    "delivery": self._delivery_instruction(segment),
+                    "referenceWavPath": str(profile_path),
+                    "outputPath": str(output_path),
+                }
+            )
+
+        response = self._run_runner({"profiles": profiles, "segments": runner_segments})
+        device = response.get("device")
+        self._device = str(device) if isinstance(device, str) and device else None
+        raw_results = response.get("segments")
+        if not isinstance(raw_results, list):
+            raise RuntimeError("VoxCPM2 runner did not return segment results.")
+        results_by_id = {
+            str(item.get("id")): item
+            for item in raw_results
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        artifacts: list[AudioArtifact] = []
+        for segment in segments:
+            segment_id = str(segment["id"])
+            result = results_by_id.get(segment_id)
+            expected_path = expected_paths[segment_id]
+            if result is None:
+                raise RuntimeError(f"VoxCPM2 runner did not return segment {segment_id}.")
+            result_path = Path(str(result.get("path") or ""))
+            if result_path.resolve() != expected_path.resolve() or not _is_readable_wav(
+                expected_path
+            ):
+                raise RuntimeError(
+                    f"VoxCPM2 runner did not create a readable WAV for segment {segment_id}."
+                )
+            try:
+                duration = float(result.get("durationSeconds"))
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"VoxCPM2 runner returned an invalid duration for segment {segment_id}."
+                ) from error
+            if not math.isfinite(duration) or duration <= 0:
+                raise RuntimeError(
+                    f"VoxCPM2 runner returned a non-positive duration for segment {segment_id}."
+                )
+            artifacts.append(AudioArtifact("segment_audio", expected_path, duration))
+        return artifacts
+
+    def _validate_runtime(self) -> None:
+        if self._model_id != VOXCPM2_MODEL_ID:
+            raise RuntimeError(f"Unsupported VoxCPM2 model: {self._model_id}")
+        if not self._runner_python.is_file():
+            raise RuntimeError(
+                f"VoxCPM2 isolated Python is missing: {self._runner_python}"
+            )
+        if not self._model_path.is_dir():
+            raise RuntimeError(f"VoxCPM2 model directory is missing: {self._model_path}")
+        if not self._runner_path.is_file():
+            raise RuntimeError(f"VoxCPM2 runner is missing: {self._runner_path}")
+
+    def _delivery_instruction(self, segment: dict) -> str:
+        emotion = _VOXCPM2_EMOTION_DIRECTIONS.get(
+            str(segment.get("emotion") or "neutral").strip().lower(),
+            _VOXCPM2_EMOTION_DIRECTIONS["neutral"],
+        )
+        pace = _VOXCPM2_PACE_DIRECTIONS.get(
+            str(segment.get("pace") or "normal").strip().lower(),
+            _VOXCPM2_PACE_DIRECTIONS["normal"],
+        )
+        direction = " ".join(str(segment.get("voiceDirection") or "").split())
+        if len(direction) > 220:
+            direction = direction[:220].rstrip() + "。"
+        parts = [
+            "严格保持参考音频中的固定基础音色，不改变说话者身份",
+            emotion,
+            pace,
+        ]
+        if direction:
+            parts.append(f"演绎细节：{direction}")
+        return "；".join(parts)
+
+    def _run_runner(self, payload: dict[str, object]) -> dict[str, object]:
+        request = {
+            "modelPath": str(self._model_path),
+            "device": str(os.environ.get("AUDIOBOOK_VOXCPM2_DEVICE", "auto")).strip()
+            or "auto",
+            **payload,
+        }
+        try:
+            configured_timeout = int(
+                os.environ.get(
+                    "AUDIOBOOK_VOXCPM2_RUNNER_TIMEOUT_SECONDS",
+                    str(_VOXCPM2_RUNNER_TIMEOUT_SECONDS),
+                )
+            )
+        except ValueError:
+            configured_timeout = _VOXCPM2_RUNNER_TIMEOUT_SECONDS
+        timeout = max(60, min(_VOXCPM2_RUNNER_TIMEOUT_SECONDS, configured_timeout))
+        with tempfile.TemporaryDirectory(prefix="audiobook-voxcpm2-") as temporary_directory:
+            temporary = Path(temporary_directory)
+            input_path = temporary / "input.json"
+            output_path = temporary / "output.json"
+            input_path.write_text(
+                json.dumps(request, ensure_ascii=False), encoding="utf-8"
+            )
+            try:
+                completed = subprocess.run(
+                    [
+                        str(self._runner_python),
+                        str(self._runner_path),
+                        str(input_path),
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    f"VoxCPM2 chapter synthesis timed out after {timeout} seconds."
+                ) from error
+            try:
+                response = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                response = None
+            if isinstance(response, dict) and response.get("status") == "succeeded":
+                return response
+            if isinstance(response, dict):
+                error = response.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    raise RuntimeError(f"VoxCPM2 synthesis failed: {error['message']}")
+            detail = (completed.stderr or completed.stdout or "").strip()
+            if detail:
+                detail = detail.splitlines()[-1]
+            raise RuntimeError(
+                "VoxCPM2 runner failed"
+                + (f": {detail}" if detail else f" (exit {completed.returncode})")
+            )
+
+
 def _safe_voice_profile_name(voice_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(voice_id)).strip("._")
     return normalized or "voice"
@@ -677,6 +936,55 @@ def _voice_profile_signature(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _voxcpm2_voice_profile_signature(*, voice_id: str, description: str) -> str:
+    """Return the identity-cache key for a VoxCPM2 reference WAV.
+
+    MiMo references are generated by a cloud voice-design model, whereas
+    VoxCPM2 creates a local reference WAV.  Keeping the version and backend
+    in a separate signature prevents either profile format from being reused
+    after a backend switch, even when the voice id happens to match.
+    """
+
+    payload = {
+        "version": _VOXCPM2_VOICE_PROFILE_VERSION,
+        "backend": "voxcpm2",
+        "modelId": VOXCPM2_MODEL_ID,
+        "voiceId": voice_id,
+        "voiceDescription": description,
+        "referenceText": _VOXCPM2_REFERENCE_TEXT,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _voxcpm2_profile_is_usable(
+    profile_path: Path,
+    metadata_path: Path,
+    *,
+    signature: str,
+) -> bool:
+    """Return whether a local reference WAV matches the current backend key."""
+
+    if not _is_readable_wav(profile_path):
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("version") == _VOXCPM2_VOICE_PROFILE_VERSION
+        and metadata.get("backend") == "voxcpm2"
+        and metadata.get("modelId") == VOXCPM2_MODEL_ID
+        and metadata.get("signature") == signature
+    )
 
 
 def _decode_mimo_wav(encoded_audio: str, source: str) -> bytes:
@@ -762,6 +1070,35 @@ _MIMO_PACE_DIRECTIONS = {
     "slow": "语速舒缓，停顿自然",
     "normal": "语速适中",
     "fast": "语速偏快，节奏紧凑",
+}
+
+_VOXCPM2_EMOTION_DIRECTIONS = {
+    "neutral": "情绪自然克制",
+    "happy": "真诚温暖，带轻微愉悦",
+    "sad": "低沉哀伤，克制收束",
+    "angry": "压抑而有力的愤怒",
+    "afraid": "紧绷不安，带轻微颤抖",
+    "tense": "谨慎克制，暗含压迫感",
+    "teasing": "带戏谑和轻微嘲弄",
+    "whispering": "压低为清晰耳语，保留可懂度",
+    "excited": "情绪高涨而不夸张",
+    "tired": "略显疲惫，气息偏重",
+    "grief": "深切悲恸，但不要失控尖叫",
+    "cold": "冷淡疏离，保持克制",
+    "pleading": "恳切急迫，带无助感",
+    "surprised": "真实错愕，语调短促上扬",
+    "gentle": "轻柔温存，带安抚感",
+    "resolute": "坚定有力，落字清晰",
+    "nervous": "忐忑不安，停顿略多",
+    "contemptuous": "冷蔑疏离，不带笑意",
+    "solemn": "庄严肃穆，稳重郑重",
+    "bitter": "苦涩压抑，带不甘",
+}
+
+_VOXCPM2_PACE_DIRECTIONS = {
+    "slow": "语速舒缓，保留自然停顿",
+    "normal": "语速自然适中",
+    "fast": "语速偏快但字音清楚",
 }
 
 

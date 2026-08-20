@@ -7,6 +7,7 @@ import {
   GenerateAudioAssetsRequestSchema,
   MixChapterAudioRequestSchema,
   PlanChapterAudioRequestSchema,
+  SynthesizeChapterAudioRequestSchema,
   SynthesizeSegmentAudioRequestSchema,
   TranscribeChapterAudioRequestSchema,
   WorkerResponseSchema
@@ -87,6 +88,24 @@ describe("worker protocol schemas", () => {
     expect(parsed.segmentId).toBe("seg_0001");
     expect(parsed.modelId).toBe("mimo-v2.5-tts-voiceclone");
     expect(parsed.voiceProfileDirectory).toBe("/tmp/book/voice-profiles");
+  });
+
+  test("accepts whole-chapter TTS requests with an explicit backend cache key", () => {
+    const parsed = SynthesizeChapterAudioRequestSchema.parse({
+      command: "synthesize_chapter_audio",
+      bookId: "book_123",
+      chapterId: "chapter_001",
+      scriptPath: "/tmp/book/scripts/chapter_001.json",
+      outputDirectory: "/tmp/book/segments/chapter_001/voxcpm2",
+      backend: "voxcpm2",
+      modelId: "VoxCPM2",
+      voiceProfileDirectory: "/tmp/book/voice-profiles/voxcpm2",
+      cacheSegments: true,
+      mergeSegments: true,
+    });
+
+    expect(parsed.backend).toBe("voxcpm2");
+    expect(parsed.modelId).toBe("VoxCPM2");
   });
 
   test("accepts assemble chapter audio requests", () => {

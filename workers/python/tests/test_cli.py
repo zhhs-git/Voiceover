@@ -360,6 +360,14 @@ def test_synthesize_segment_audio_uses_mimo_voiceclone_and_profile_directory(tmp
         path=tmp_path / "audio" / "seg_0001.wav",
         duration_seconds=1.5,
     )
+    import wave
+
+    fake_artifact.path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(fake_artifact.path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(b"\x00\x00" * 2400)
     with patch("audiobook_worker.cli.MiMoTTSBackend") as backend_class:
         backend_class.return_value.synthesize_segment.return_value = fake_artifact
         exit_code = main(["synthesize_segment_audio", str(input_path), str(output_path)])
@@ -737,6 +745,151 @@ def test_mimo_chapter_synthesis_does_not_write_timeline_when_a_serial_segment_fa
     assert calls.count("seg_0001") == 1
     assert calls.count("seg_0002") == 1
     assert not (audio_dir / "timeline.json").exists()
+
+
+def test_voxcpm2_chapter_synthesis_uses_one_runner_request_for_all_uncached_segments(
+    tmp_path: Path,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book1",
+                "chapterId": "ch01",
+                "segments": [
+                    {
+                        "id": "seg_0001",
+                        "text": "第一句。",
+                        "voiceId": "narrator_female",
+                        "emotion": "neutral",
+                        "pace": "normal",
+                    },
+                    {
+                        "id": "seg_0002",
+                        "text": "第二句。",
+                        "voiceId": "narrator_female",
+                        "emotion": "tense",
+                        "pace": "fast",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audio_dir = tmp_path / "segments" / "voxcpm2"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "voxcpm2",
+                "modelId": "VoxCPM2",
+                "voiceProfileDirectory": str(tmp_path / "voice-profiles" / "voxcpm2"),
+                "mergeSegments": False,
+                "cacheSegments": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    runner_calls: list[list[str]] = []
+
+    class FakeVoxCPM2Backend:
+        _device = "mps"
+
+        def synthesize_segments(self, segments, output_directory):
+            runner_calls.append([segment["id"] for segment in segments])
+            artifacts = []
+            for segment in segments:
+                path = Path(output_directory) / f"{segment['id']}.wav"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with wave.open(str(path), "wb") as wav_file:
+                    wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                    wav_file.writeframes(b"\x00\x08" * 4_800)
+                artifacts.append(AudioArtifact("segment_audio", path, 0.1))
+            return artifacts
+
+    with patch(
+        "audiobook_worker.cli.VoxCPM2TTSBackend",
+        return_value=FakeVoxCPM2Backend(),
+    ):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 0
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["status"] == "succeeded"
+    assert runner_calls == [["seg_0001", "seg_0002"]]
+    assert (audio_dir / "timeline.json").is_file()
+    assert all((audio_dir / f"seg_000{index}.wav.json").is_file() for index in (1, 2))
+
+
+def test_voxcpm2_chapter_synthesis_does_not_write_a_timeline_when_runner_fails(
+    tmp_path: Path,
+):
+    from audiobook_worker.cli import main
+
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book1",
+                "chapterId": "ch01",
+                "segments": [
+                    {"id": "seg_0001", "text": "第一句。", "voiceId": "narrator_female"},
+                    {"id": "seg_0002", "text": "第二句。", "voiceId": "narrator_female"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audio_dir = tmp_path / "segments" / "voxcpm2"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "voxcpm2",
+                "modelId": "VoxCPM2",
+                "mergeSegments": False,
+                "cacheSegments": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+
+    class FailingVoxCPM2Backend:
+        _device = "mps"
+
+        def synthesize_segments(self, segments, output_directory):
+            # A runner may already have written a temporary partial WAV when it
+            # fails. The outer worker must not add cache metadata or a timeline.
+            partial = Path(output_directory) / f"{segments[-1]['id']}.wav"
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(partial), "wb") as wav_file:
+                wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 4_800)
+            raise RuntimeError("local runner failed")
+
+    with patch(
+        "audiobook_worker.cli.VoxCPM2TTSBackend",
+        return_value=FailingVoxCPM2Backend(),
+    ):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 1
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"] == {"segmentId": "seg_0001"}
+    assert not (audio_dir / "timeline.json").exists()
+    assert not list(audio_dir.glob("*.wav.json"))
 
 
 def test_mimo_chapter_synthesis_does_not_retry_a_permanent_mimo_request_error(

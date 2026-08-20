@@ -17,6 +17,10 @@ vi.mock("../lib/batchGeneration", () => ({
       ? "voice"
       : chapter.nextStage ?? null;
   },
+  batchTtsBackend: (batch: { modelSettings?: { ttsBackend?: string } }) =>
+    batch.modelSettings?.ttsBackend === "voxcpm2" ? "voxcpm2" : "mimo",
+  batchTtsBackendLabel: (backend: string) =>
+    backend === "voxcpm2" ? "VoxCPM2" : "MiMo Voice Clone",
   batchErrorMessage: () => "批量生成失败。",
   cancelBatchGeneration: batchGeneration.cancelBatchGeneration,
   getActiveBatchGeneration: batchGeneration.getActiveBatchGeneration,
@@ -27,7 +31,7 @@ vi.mock("../lib/batchGeneration", () => ({
     stageState?: string | null;
   }) => chapter.stageState === "running"
     || (chapter.stageState == null && chapter.status === "running" && Boolean(chapter.currentStage)),
-  isBatchChapterWaitingForMiMo: (chapter: {
+  isBatchChapterWaitingForTts: (chapter: {
     status: string;
     nextStage?: string | null;
     stageState?: string | null;

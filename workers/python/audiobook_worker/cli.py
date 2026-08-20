@@ -24,6 +24,7 @@ from audiobook_worker.llm import (
     ensure_audio_music_coverage,
     select_active_audio_characters,
 )
+from audiobook_worker.model_settings import DEFAULT_TTS_MODEL_ID, VOXCPM2_MODEL_ID
 from audiobook_worker.segment_merge import (
     DEFAULT_MAX_TTS_CHARACTERS,
     DEFAULT_MAX_TTS_WORDS,
@@ -42,6 +43,7 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     ParlerTTSBackend,
+    VoxCPM2TTSBackend,
     voice_options,
 )
 from audiobook_worker.tts_quality import (
@@ -456,6 +458,37 @@ def _clear_analysis_stage_state(state: dict[str, Any]) -> None:
         state.pop(key, None)
 
 
+def _voice_identity_strategy(backend_name: str) -> str:
+    """Name the stable-voice mechanism used in a segment cache signature."""
+
+    backend = str(backend_name or "").strip().casefold()
+    if backend == "mimo":
+        return "mimo-reference-audio-voiceclone-v1"
+    if backend == "voxcpm2":
+        return "voxcpm2-local-reference-wav-v1"
+    return f"{backend or 'default'}-native-voice-v1"
+
+
+def _backend_requires_segment_quality(backend_name: str) -> bool:
+    """Keep cloud and local clone WAVs behind the same speech quality gate."""
+
+    return str(backend_name or "").strip().casefold() in {"mimo", "voxcpm2"}
+
+
+def _tts_model_id_for_request(request: dict[str, Any]) -> str | None:
+    """Resolve a stable model id so all stages sign the same backend cache."""
+
+    configured = str(request.get("modelId") or "").strip()
+    if configured:
+        return configured
+    backend = str(request.get("backend") or "mimo").strip().casefold()
+    if backend == "mimo":
+        return DEFAULT_TTS_MODEL_ID
+    if backend == "voxcpm2":
+        return VOXCPM2_MODEL_ID
+    return None
+
+
 def _segment_cache_signature(
     segment: dict[str, Any],
     backend_name: str,
@@ -466,7 +499,7 @@ def _segment_cache_signature(
 ) -> str:
     payload = {
         "ttsSegmentationVersion": _TTS_SEGMENTATION_VERSION,
-        "voiceIdentityStrategy": "mimo-reference-audio-voiceclone-v1",
+        "voiceIdentityStrategy": _voice_identity_strategy(backend_name),
         "backend": backend_name,
         "modelId": model_id or "default",
         "maxWords": max_words,
@@ -539,7 +572,7 @@ def _segment_audio_passes_quality(
 ) -> bool:
     if not _is_readable_wav(audio_path):
         return False
-    if backend_name != "mimo":
+    if not _backend_requires_segment_quality(backend_name):
         return True
     try:
         return analyze_tts_segment_wav(
@@ -835,7 +868,7 @@ def _resolve_mix_segment_audio(
         if _segment_audio_passes_quality(segment, path, backend_name):
             exact_paths.append(path)
         else:
-            if backend_name == "mimo" and path.is_file():
+            if _backend_requires_segment_quality(backend_name) and path.is_file():
                 _invalidate_segment_cache(path)
             missing_ids.append(str(segment["id"]))
 
@@ -917,7 +950,7 @@ def _resolve_mix_segment_audio(
                 path,
                 backend_name,
             ):
-                if backend_name == "mimo":
+                if _backend_requires_segment_quality(backend_name):
                     _invalidate_segment_cache(path)
                 continue
             descriptor = _mix_segment_descriptor(path, fallback_segment, metadata)
@@ -939,7 +972,7 @@ def _resolve_mix_segment_audio(
             path,
             backend_name,
         ):
-            if backend_name == "mimo":
+            if _backend_requires_segment_quality(backend_name):
                 _invalidate_segment_cache(path)
             continue
         descriptor = _mix_segment_descriptor(path, fallback_segment, metadata)
@@ -1062,9 +1095,14 @@ def _segment_artifact_payload(
     if artifact_path.resolve() != expected_audio_path.resolve() or not _is_readable_wav(
         expected_audio_path
     ):
-        expected_audio_path.unlink(missing_ok=True)
+        _invalidate_segment_cache(expected_audio_path)
         raise ValueError(
             f"TTS did not create a readable WAV for segment {segment['id']}."
+        )
+    if not _segment_audio_passes_quality(segment, expected_audio_path, backend_name):
+        _invalidate_segment_cache(expected_audio_path)
+        raise ValueError(
+            f"TTS generated an unusable WAV for segment {segment['id']}."
         )
 
     source_segment_ids = segment.get("sourceSegmentIds", [segment["id"]])
@@ -1308,7 +1346,9 @@ def _analyze_chapter(request: dict[str, Any]) -> dict[str, Any]:
             title=request.get("title", chapter_id),
             text=chapter_text,
             language=language,
-            analyzer=MockLLMAnalyzer() if request.get("mockLlm") else default_analyzer(),
+            analyzer=MockLLMAnalyzer()
+            if request.get("mockLlm")
+            else default_analyzer(str(request.get("llmModelId") or "") or None),
             known_characters=request.get("knownCharacters"),
             analysis_stage_callback=publish_stage,
             analysis_cached_stages=cached_stages,
@@ -1529,7 +1569,11 @@ def _plan_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
             error={"code": "invalid_transcript", "message": "Whisper 转录结果为空。"},
         )
 
-    analyzer = MockLLMAnalyzer() if request.get("mockLlm") else default_analyzer()
+    analyzer = (
+        MockLLMAnalyzer()
+        if request.get("mockLlm")
+        else default_analyzer(str(request.get("llmModelId") or "") or None)
+    )
     language = str(script.get("language") or "")
     planner_segments = [
         {
@@ -1743,6 +1787,38 @@ def _plan_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _tts_backend_for_request(request: dict[str, Any]):
+    """Build the requested TTS backend for direct and chapter synthesis.
+
+    Keeping this in one place ensures direct voice previews, single-segment
+    regeneration, and whole-chapter synthesis use exactly the same backend
+    and reference-profile configuration.
+    """
+
+    backend_name = str(request.get("backend") or "mimo").strip().casefold()
+    model_id = _tts_model_id_for_request(request)
+    voice_profile_directory = request.get("voiceProfileDirectory")
+    if backend_name == "parler":
+        return ParlerTTSBackend(model_id) if model_id else ParlerTTSBackend()
+    if backend_name == "mimo":
+        mimo_kwargs: dict[str, Any] = {
+            "model_id": model_id or DEFAULT_TTS_MODEL_ID
+        }
+        if isinstance(voice_profile_directory, str) and voice_profile_directory:
+            mimo_kwargs["voice_profile_directory"] = voice_profile_directory
+        return MiMoTTSBackend(**mimo_kwargs)
+    if backend_name == "voxcpm2":
+        voxcpm2_kwargs: dict[str, Any] = {
+            "model_id": model_id or VOXCPM2_MODEL_ID
+        }
+        if isinstance(voice_profile_directory, str) and voice_profile_directory:
+            voxcpm2_kwargs["voice_profile_directory"] = voice_profile_directory
+        return VoxCPM2TTSBackend(**voxcpm2_kwargs)
+    if backend_name == "kokoro":
+        return KokoroTTSBackend()
+    return MockTTSBackend()
+
+
 def _synthesize_segment_audio(request: dict[str, Any]) -> dict[str, Any]:
     script_path = Path(request["scriptPath"])
     script = apply_narrator_voice(
@@ -1753,21 +1829,19 @@ def _synthesize_segment_audio(request: dict[str, Any]) -> dict[str, Any]:
         item for item in script["segments"] if item["id"] == request["segmentId"]
     )
     segment = _decorate_segments_for_voice(script_path, script, [segment])[0]
-    backend_name = request.get("backend", "mimo")
-    if backend_name == "parler":
-        backend = ParlerTTSBackend()
-    elif backend_name == "mimo":
-        mimo_kwargs: dict[str, Any] = {
-            "model_id": request.get("modelId") or "mimo-v2.5-tts-voiceclone"
-        }
-        if request.get("voiceProfileDirectory"):
-            mimo_kwargs["voice_profile_directory"] = request["voiceProfileDirectory"]
-        backend = MiMoTTSBackend(**mimo_kwargs)
-    elif backend_name == "kokoro":
-        backend = KokoroTTSBackend()
-    else:
-        backend = MockTTSBackend()
+    backend_name = str(request.get("backend") or "mimo").strip().casefold()
+    backend = _tts_backend_for_request(request)
     artifact = backend.synthesize_segment(segment, Path(request["outputDirectory"]))
+    if not _segment_audio_passes_quality(segment, artifact.path, backend_name):
+        _invalidate_segment_cache(artifact.path)
+        return _response(
+            "failed",
+            error={
+                "code": "invalid_segment_audio",
+                "message": f"TTS generated an unusable WAV for segment {segment['id']}.",
+                "details": {"segmentId": segment["id"]},
+            },
+        )
     return _response(
         "succeeded",
         artifacts=[
@@ -1924,8 +1998,8 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
     # Do not leave a manifest from a previous segmentation run available if
     # this retry fails before the new cache is complete.
     _tts_timeline_manifest_path(output_directory).unlink(missing_ok=True)
-    backend_name = request.get("backend", "mimo")
-    model_id = request.get("modelId")
+    backend_name = str(request.get("backend") or "mimo").strip().casefold()
+    model_id = _tts_model_id_for_request(request)
     cache_segments = request.get("cacheSegments", True)
     max_words = int(request.get("maxMergedSegmentWords", DEFAULT_MAX_TTS_WORDS))
     max_characters = int(
@@ -1936,21 +2010,7 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
     def get_backend():
         nonlocal backend
         if backend is None:
-            if backend_name == "parler":
-                backend = ParlerTTSBackend(model_id) if model_id else ParlerTTSBackend()
-            elif backend_name == "mimo":
-                mimo_kwargs: dict[str, Any] = {
-                    "model_id": model_id or "mimo-v2.5-tts-voiceclone"
-                }
-                if request.get("voiceProfileDirectory"):
-                    mimo_kwargs["voice_profile_directory"] = request[
-                        "voiceProfileDirectory"
-                    ]
-                backend = MiMoTTSBackend(**mimo_kwargs)
-            elif backend_name == "kokoro":
-                backend = KokoroTTSBackend()
-            else:
-                backend = MockTTSBackend()
+            backend = _tts_backend_for_request(request)
         return backend
 
     artifacts_by_index: dict[int, dict[str, Any]] = {}
@@ -2008,32 +2068,53 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                     },
                 )
 
-        def synthesize_pending(
-            item: tuple[int, dict[str, Any], str],
-        ) -> tuple[int, Any]:
-            index, segment, _ = item
-            return index, active_backend.synthesize_segment(segment, output_directory)
-
-        # MiMo applies an account-wide rate/concurrency limit. Process every
-        # segment in source order, even when the worker is invoked directly;
-        # the backend additionally serializes the actual HTTP boundary across
-        # all child processes.
         results: dict[int, Any] = {}
         failures: dict[int, Exception] = {}
-        for item in pending_segments:
-            index = item[0]
+        if backend_name == "voxcpm2":
+            # VoxCPM2 must receive the whole missing subset in one request.
+            # The isolated runner loads the 2B model once and synthesizes these
+            # entries sequentially, while cache hits never pay a model-load cost.
             try:
-                result_index, artifact = synthesize_pending(item)
-                results[result_index] = artifact
+                synthesized = active_backend.synthesize_segments(
+                    [segment for _, segment, _ in pending_segments],
+                    output_directory,
+                )
             except Exception as error:
-                failures[index] = error
-                break
+                failures[pending_segments[0][0]] = error
+            else:
+                if len(synthesized) != len(pending_segments):
+                    failures[pending_segments[0][0]] = RuntimeError(
+                        "VoxCPM2 did not return every requested segment."
+                    )
+                else:
+                    results = {
+                        index: artifact
+                        for (index, _, _), artifact in zip(
+                            pending_segments,
+                            synthesized,
+                            strict=True,
+                        )
+                    }
+        else:
+            # MiMo applies an account-wide rate/concurrency limit. Process every
+            # segment in source order, even when the worker is invoked directly;
+            # the backend additionally serializes the actual HTTP boundary across
+            # all child processes.
+            for index, segment, _ in pending_segments:
+                try:
+                    results[index] = active_backend.synthesize_segment(
+                        segment,
+                        output_directory,
+                    )
+                except Exception as error:
+                    failures[index] = error
+                    break
 
         if failures:
             failed_index = min(failures)
             failed_segment = segments[failed_index]
             expected_audio_path = output_directory / f"{failed_segment['id']}.wav"
-            expected_audio_path.unlink(missing_ok=True)
+            _invalidate_segment_cache(expected_audio_path)
             finish_voice("failed", str(failures[failed_index]))
             return _response(
                 "failed",
@@ -2177,7 +2258,7 @@ def _assemble_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                     "message": str(error),
                 },
             )
-        backend_name = str(request.get("backend") or "mimo")
+        backend_name = str(request.get("backend") or "mimo").strip().casefold()
         segment_paths = [
             segment_directory / f"{segment['id']}.wav" for segment in expected_segments
         ]
@@ -2190,7 +2271,7 @@ def _assemble_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                 backend_name,
             )
         ]
-        if backend_name == "mimo":
+        if _backend_requires_segment_quality(backend_name):
             for _, path in invalid_segments:
                 if path.is_file():
                     _invalidate_segment_cache(path)
@@ -2233,11 +2314,7 @@ def _assemble_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
             segment_directory,
             expected_segments,
             backend_name=str(request.get("backend") or "mimo"),
-            model_id=(
-                str(request.get("modelId"))
-                if request.get("modelId")
-                else "mimo-v2.5-tts-voiceclone"
-            ),
+            model_id=_tts_model_id_for_request(request),
             max_words=int(
                 request.get("maxMergedSegmentWords", DEFAULT_MAX_TTS_WORDS)
             ),
@@ -2307,12 +2384,8 @@ def _mix_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
             request,
             _protected_audio_source_segment_ids(script),
         )
-        backend_name = str(request.get("backend") or "mimo")
-        model_id = (
-            str(request.get("modelId"))
-            if request.get("modelId")
-            else "mimo-v2.5-tts-voiceclone"
-        )
+        backend_name = str(request.get("backend") or "mimo").strip().casefold()
+        model_id = _tts_model_id_for_request(request)
         max_words = int(
             request.get("maxMergedSegmentWords", DEFAULT_MAX_TTS_WORDS)
         )
@@ -2479,7 +2552,11 @@ def _apply_corrections(request: dict[str, Any]) -> dict[str, Any]:
     output_directory = Path(request["outputDirectory"])
     output_directory.mkdir(parents=True, exist_ok=True)
     corrections = request.get("corrections", {})
-    analyzer = MockLLMAnalyzer() if request.get("mockLlm") else default_analyzer()
+    analyzer = (
+        MockLLMAnalyzer()
+        if request.get("mockLlm")
+        else default_analyzer(str(request.get("llmModelId") or "") or None)
+    )
 
     artifacts = []
     for chapter in request["chapters"]:

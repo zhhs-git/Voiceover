@@ -1859,6 +1859,115 @@ aside.chapter-list .chapter-title {
   min-height: 200px;
 }
 
+/* Model selection is a durable server setting, so keep its controls compact
+   and make unavailable local backends explain their prerequisite clearly. */
+.model-settings-panel {
+  width: min(720px, 100%);
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-surface);
+}
+
+.model-settings-header,
+.model-settings-actions,
+.model-settings-field {
+  display: flex;
+}
+
+.model-settings-header {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.model-settings-header h2,
+.model-settings-header p {
+  margin: 0;
+}
+
+.model-settings-header h2 {
+  font-size: 16px;
+}
+
+.model-settings-header p {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.model-settings-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.model-settings-field {
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.model-settings-field select {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  font-weight: 400;
+}
+
+.model-settings-diagnostics {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warning);
+  background: var(--warning-dim);
+}
+
+.model-settings-unavailable,
+.model-settings-error,
+.model-settings-saved {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.model-settings-unavailable {
+  color: var(--warning);
+  font-weight: 400;
+}
+
+.model-settings-unavailable strong {
+  font-weight: 600;
+}
+
+.model-settings-actions {
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.model-settings-save {
+  width: auto;
+}
+
+.model-settings-saved {
+  color: var(--success);
+}
+
+.model-settings-error {
+  margin-top: 12px;
+  color: var(--danger);
+}
+
 /* Batch final-audio download */
 .final-audio-download-panel {
   display: flex;
@@ -2668,6 +2777,15 @@ aside.chapter-list .chapter-title {
   gap: 4px 12px;
 }
 
+.batch-generation-model-settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 .batch-generation-chapter-list {
   max-height: min(42vh, 430px);
   margin-top: 9px;
@@ -2989,6 +3107,19 @@ aside.chapter-list .chapter-title {
   .final-audio-download-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .model-settings-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .model-settings-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-settings-save {
+    width: 100%;
   }
 
   .final-audio-download-controls {

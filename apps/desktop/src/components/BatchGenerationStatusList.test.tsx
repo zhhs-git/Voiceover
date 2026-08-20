@@ -79,6 +79,46 @@ describe("BatchGenerationStatusList", () => {
     expect(screen.getByText("等待背景音/音效规划")).toBeInTheDocument();
   });
 
+  it("shows the frozen VoxCPM2 snapshot and its capacity-one chapter lane", () => {
+    render(
+      <BatchGenerationStatusList
+        batch={{
+          batchId: "batch_voxcpm2",
+          status: "running",
+          modelSettings: {
+            llmModelId: "openai/gpt-5.6-terra",
+            ttsBackend: "voxcpm2",
+            ttsModelId: "VoxCPM2",
+          },
+          chapters: [
+            {
+              chapterId: "chapter_001",
+              title: "第一章",
+              position: 0,
+              status: "running",
+              nextStage: "voice_synthesize",
+              stageState: "running",
+            },
+            {
+              chapterId: "chapter_002",
+              title: "第二章",
+              position: 1,
+              status: "queued",
+              nextStage: "voice_synthesize",
+              stageState: "ready",
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("LLM：openai/gpt-5.6-terra")).toBeInTheDocument();
+    expect(screen.getByText("配音：VoxCPM2")).toBeInTheDocument();
+    expect(screen.getByText("VoxCPM2 配音中")).toBeInTheDocument();
+    expect(screen.getByText("等待 VoxCPM2")).toBeInTheDocument();
+    expect(screen.getByText("正在原章节配音（VoxCPM2 本地章节串行）")).toBeInTheDocument();
+  });
+
   it("shows total elapsed time from submission and refreshes it while the batch is active", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-12T02:00:03.000Z"));

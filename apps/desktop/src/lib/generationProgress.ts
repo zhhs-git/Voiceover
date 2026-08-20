@@ -22,7 +22,7 @@ export function generationProgressDetails({
   const remaining = Math.round(avgPerSeg * Math.max(totalSegments - doneSegments, 0));
 
   return [
-    { label: "后端", value: "MiMo V2.5 TTS 音色设计" },
+    { label: "配音模型", value: "按当前模型配置" },
     { label: "章节", value: `第 ${chapterIndex} / ${chapterCount} 章` },
     { label: "片段", value: String(segmentCount) },
     { label: "已用时", value: `${elapsed} 秒` },

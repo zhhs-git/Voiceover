@@ -15,6 +15,7 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     MiMoRequestError,
+    VoxCPM2TTSBackend,
     _MIMO_VOICE_CLONE_MODEL_ID,
     _MIMO_VOICE_DESIGN_MODEL_ID,
     _mimo_max_attempts,
@@ -36,6 +37,69 @@ def _wav_bytes(duration_seconds: float = 0.1, sample_rate: int = 24_000) -> byte
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(b"\x00\x00" * int(duration_seconds * sample_rate))
     return buffer.getvalue()
+
+
+def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = VoxCPM2TTSBackend(
+        voice_profile_directory=tmp_path / "voice-profiles" / "voxcpm2",
+    )
+    monkeypatch.setattr(backend, "_validate_runtime", lambda: None)
+    runner_calls: list[dict[str, object]] = []
+
+    def fake_runner(payload: dict[str, object]) -> dict[str, object]:
+        runner_calls.append(payload)
+        raw_segments = payload["segments"]
+        assert isinstance(raw_segments, list)
+        results = []
+        for item in raw_segments:
+            assert isinstance(item, dict)
+            output_path = Path(str(item["outputPath"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 48_000, 4_800, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * 4_800)
+            results.append(
+                {
+                    "id": item["id"],
+                    "path": str(output_path),
+                    "durationSeconds": 0.1,
+                }
+            )
+        return {"status": "succeeded", "device": "mps", "segments": results}
+
+    monkeypatch.setattr(backend, "_run_runner", fake_runner)
+    artifacts = backend.synthesize_segments(
+        [
+            {
+                "id": "seg_0001",
+                "text": "第一句。",
+                "speakerId": "narrator",
+                "voiceId": "narrator_female",
+            },
+            {
+                "id": "seg_0002",
+                "text": "第二句。",
+                "speakerId": "narrator",
+                "voiceId": "narrator_female",
+                "emotion": "tense",
+            },
+        ],
+        tmp_path / "segments",
+    )
+
+    assert [artifact.path.name for artifact in artifacts] == [
+        "seg_0001.wav",
+        "seg_0002.wav",
+    ]
+    assert len(runner_calls) == 1
+    assert [item["id"] for item in runner_calls[0]["segments"]] == [
+        "seg_0001",
+        "seg_0002",
+    ]
+    assert len(runner_calls[0]["profiles"]) == 1
 
 
 def test_mimo_backend_sends_voice_design_prompt_and_text_as_assistant(tmp_path: Path):

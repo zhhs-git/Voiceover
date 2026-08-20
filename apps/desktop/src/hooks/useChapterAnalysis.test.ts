@@ -6,6 +6,32 @@ import { workerCall } from "../lib/workerCall";
 import { watchChapterWorkflow } from "../lib/workflowStatus";
 import { useChapterAnalysis } from "./useChapterAnalysis";
 
+vi.mock("../lib/modelSettings", () => ({
+  getModelSettings: vi.fn(async () => ({
+    version: 1,
+    current: {
+      llmModelId: "mock",
+      ttsBackend: "mimo",
+      ttsModelId: "mimo-v2.5-tts-voiceclone",
+    },
+    llmOptions: [{
+      id: "mock",
+      provider: "local",
+      displayName: "Mock",
+      family: "mock",
+      available: true,
+    }],
+    ttsOptions: [{
+      id: "mimo",
+      modelId: "mimo-v2.5-tts-voiceclone",
+      displayName: "MiMo",
+      available: true,
+      reason: "",
+    }],
+  })),
+  llmDisplayName: vi.fn(() => "Mock"),
+}));
+
 vi.mock("../lib/platform", () => ({
   invoke: vi.fn(),
 }));

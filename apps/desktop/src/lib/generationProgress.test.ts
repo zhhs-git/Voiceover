@@ -18,7 +18,7 @@ describe("generationProgressDetails", () => {
     expect(details).toContainEqual({ label: "预计剩余", value: "约 14 秒" });
   });
 
-  it("keeps the configured MiMo backend visible after progress refreshes", () => {
+  it("does not hardcode a TTS backend in progress details", () => {
     const details = generationProgressDetails({
       now: 5_000,
       startTime: 1_000,
@@ -29,8 +29,8 @@ describe("generationProgressDetails", () => {
       segmentCount: 3,
     });
 
-    expect(details.find((detail) => detail.label === "后端")?.value).toBe(
-      "MiMo V2.5 TTS 音色设计",
+    expect(details.find((detail) => detail.label === "配音模型")?.value).toBe(
+      "按当前模型配置",
     );
   });
 });

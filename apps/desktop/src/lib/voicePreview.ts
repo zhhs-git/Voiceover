@@ -1,5 +1,5 @@
-export const VOICE_PREVIEW_BACKEND = "mimo";
-export const VOICE_PREVIEW_MODEL_ID = "mimo-v2.5-tts-voiceclone";
+import type { ModelSettings } from "./modelSettings";
+
 export const VOICE_PREVIEW_TEXT = "你好，这是一段音色预览。";
 
 function isNarratorVoice(voiceId: string): boolean {
@@ -43,15 +43,19 @@ export function buildVoicePreviewRequest(
   scriptPath: string,
   outputDirectory: string,
   segmentId: string,
-  voiceProfileDirectory?: string,
+  tts: Pick<ModelSettings, "ttsBackend" | "ttsModelId"> & {
+    voiceProfileDirectory?: string;
+  },
 ) {
   const request = {
     scriptPath,
     segmentId,
     outputDirectory,
-    backend: VOICE_PREVIEW_BACKEND,
-    modelId: VOICE_PREVIEW_MODEL_ID,
-    ...(voiceProfileDirectory ? { voiceProfileDirectory } : {}),
+    backend: tts.ttsBackend,
+    modelId: tts.ttsModelId,
+    ...(tts.voiceProfileDirectory
+      ? { voiceProfileDirectory: tts.voiceProfileDirectory }
+      : {}),
   };
   return request;
 }

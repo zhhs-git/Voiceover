@@ -42,6 +42,7 @@ Voiceover 是一个运行在局域网内的网页应用，可以将 EPUB、PDF �
 - 按章节分析旁白、对话、说话人、情绪和语速
 - 维护整本书范围内的角色注册表，并使用系统生成的稳定角色 ID
 - 审阅角色身份、别名和声音分配
+- 在“模型配置”页签选择分析 LLM 和配音模型，并持久化主机设置
 - 在浏览器中生成和播放章节音频
 - 无需账号即可让可信局域网用户共同使用同一个书库
 
@@ -155,10 +156,12 @@ ln -s "$(git rev-parse --show-toplevel)/scripts/Audiobook-Generator.command" "$H
 
 - 如果 OpenAI 兼容 LLM 的 `baseUrl` 指向远程服务，章节正文和分析提示词可能会
   发送到该服务
-- 当前网页生成流程默认使用 Xiaomi MiMo V2.5 voice-clone TTS；首次为角色或
-  旁白建立稳定参考音色时会使用 voice-design 模型，后续片段复用该参考样本
-- Python 处理程序仍保留 Kokoro 和 Parler 后端，用于本地或其他工作流；当前浏览器
-  生成辅助函数明确调用 MiMo
+- 网页生成流程的配音模型由“模型配置”页签选择：默认是 Xiaomi MiMo V2.5
+  voice-clone，也可以选择已检测可用的本地 VoxCPM2。MiMo 首次为角色或旁白建立
+  稳定参考音色时会使用 voice-design 模型，后续片段复用该参考样本；VoxCPM2 使用
+  独立的本地参考 WAV 和缓存目录
+- Python 处理程序仍保留 Kokoro 和 Parler 后端，用于本地或其他工作流；网页可选项
+  当前只开放 MiMo voice-clone 和 VoxCPM2
 
 只有在 LLM 和 TTS 后端都配置为本地运行时，才可以称为“完全离线部署”。
 
@@ -205,6 +208,23 @@ export AUDIOBOOK_LLM_MODEL="deepseek/deepseek-v4-flash"
 
 仓库中只应出现环境变量名称和 `test-key` 之类的测试占位值，不能包含真实凭据。
 
+### 网页模型配置
+
+打开书籍详情页，在“下载”旁进入“模型配置”页签即可选择：
+
+- 分析 LLM：来自主机现有的 OpenAI 兼容模型配置。浏览器只收到模型的安全显示元数据，
+  不会收到 API Key、完整密钥、provider URL 或密钥环境变量名
+- 配音模型：MiMo voice-clone，或本机已通过环境、包导入和模型文件检查的 VoxCPM2
+
+设置保存到主机 SQLite。创建批量任务时会冻结 LLM/TTS 配置快照，因此任务运行期间
+修改全局设置不会让同一批次中途切换模型。切换配音模型后，片段、时间线和参考音色
+缓存按后端和模型隔离，不会混用旧模型产物。
+
+VoxCPM2 不是仓库依赖自动下载的服务。主机必须提供 `data/voxcpm2/.venv` 和
+`data/voxcpm2/models/VoxCPM2`；这些模型权重和虚拟环境被 Git 忽略，不应提交到仓库。
+每次只允许一个 VoxCPM2 章节占用本地模型资源，模型在章节内加载一次并按源顺序合成
+片段，以控制内存占用和保持稳定参考音色。
+
 ## TTS 设备配置
 
 Kokoro 和 Parler 使用 `AUDIOBOOK_TTS_DEVICE`：
@@ -213,8 +233,9 @@ Kokoro 和 Parler 使用 `AUDIOBOOK_TTS_DEVICE`：
 export AUDIOBOOK_TTS_DEVICE="auto"  # auto、mps、cuda 或 cpu
 ```
 
-当前浏览器生成流程使用 MiMo，因此浏览器生成音频需要配置 `MIMO_API_KEY`。
-设备变量只适用于基于 PyTorch 的本地 TTS 后端。
+选择 MiMo 时，网页生成音频需要配置 `MIMO_API_KEY`；选择 VoxCPM2 时，需要上面所述
+的独立 Python 环境和本地模型文件。`AUDIOBOOK_TTS_DEVICE` 只适用于基于 PyTorch
+的 Kokoro、Parler 等本地 TTS 后端。
 
 ### 批量生成安全并发
 
@@ -233,7 +254,8 @@ MiMo 是不可提高的**全服务单请求通道**：参考音色、章节片�
 非 MiMo 阶段运行，以保证下一章不会被后续阶段饿死。LLM 最多 2 个、Whisper 与
 Stable Audio 共用最多 4 个本地音频模型进程，且两类任务合计不会超过 4 个；原章节组装/
 最终混音/MP3 最多 2 个。资源等待不会占用批量 worker。该上限来自本机压测的稳定档位，
-而不是曾触发内存压力的 8 路组合。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时
+而不是曾触发内存压力的 8 路组合。VoxCPM2 另有容量为 1 的独占本地模型资源位，不能
+与另一个 VoxCPM2 章节并发。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时
 创建时损坏或漂移。
 
 ```bash

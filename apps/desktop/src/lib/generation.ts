@@ -1,4 +1,5 @@
 import { workerCall } from "./workerCall";
+import type { ModelSettings } from "./modelSettings";
 
 import type { WorkerResponse } from "@audiobook-generator/shared";
 
@@ -14,6 +15,7 @@ interface SynthesizeChapterInput {
   voiceProfileDirectory?: string;
   narratorVoiceId?: "narrator_female" | "narrator_male" | "narrator_default";
   cacheSegments?: boolean;
+  tts: Pick<ModelSettings, "ttsBackend" | "ttsModelId">;
   worker?: WorkerCall;
 }
 
@@ -27,6 +29,7 @@ interface MixChapterAudioInput {
   outputPath: string;
   narratorVoiceId?: "narrator_female" | "narrator_male" | "narrator_default";
   voiceGain?: number;
+  tts: Pick<ModelSettings, "ttsBackend" | "ttsModelId">;
   worker?: WorkerCall;
 }
 
@@ -37,13 +40,14 @@ export async function synthesizeChapter({
   voiceProfileDirectory,
   narratorVoiceId,
   cacheSegments = true,
+  tts,
   worker = workerCall,
 }: SynthesizeChapterInput): Promise<Record<string, unknown>> {
   const input: Record<string, unknown> = {
     scriptPath,
     outputDirectory: segmentAudioDirectory,
-    backend: "mimo",
-    modelId: "mimo-v2.5-tts-voiceclone",
+    backend: tts.ttsBackend,
+    modelId: tts.ttsModelId,
     mergeSegments: true,
     cacheSegments,
     mixedOutputPath: outputPath.replace(/\.wav$/i, "_mixed.wav"),
@@ -60,8 +64,8 @@ export async function synthesizeChapter({
     scriptPath,
     segmentAudioDirectory,
     outputPath,
-    backend: "mimo",
-    modelId: "mimo-v2.5-tts-voiceclone",
+    backend: tts.ttsBackend,
+    modelId: tts.ttsModelId,
     mergeSegments: true,
   };
   if (narratorVoiceId) assemblyInput.narratorVoiceId = narratorVoiceId;
@@ -78,6 +82,7 @@ export async function mixChapterAudio({
   outputPath,
   narratorVoiceId,
   voiceGain,
+  tts,
   worker = workerCall,
 }: MixChapterAudioInput): Promise<Record<string, unknown>> {
   const input: Record<string, unknown> = {
@@ -89,6 +94,8 @@ export async function mixChapterAudio({
     audioAssetsDirectory,
     outputPath,
     mergeSegments: true,
+    backend: tts.ttsBackend,
+    modelId: tts.ttsModelId,
   };
   if (narratorVoiceId) input.narratorVoiceId = narratorVoiceId;
   if (voiceGain !== undefined) input.voiceGain = voiceGain;

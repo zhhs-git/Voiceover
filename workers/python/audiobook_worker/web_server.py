@@ -33,6 +33,14 @@ from typing import BinaryIO
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from audiobook_worker.script_builder import normalize_narrator_voice_id
+from audiobook_worker.model_settings import (
+    DEFAULT_TTS_BACKEND,
+    DEFAULT_TTS_MODEL_ID,
+    ModelSettings,
+    effective_settings,
+    normalize_settings,
+    settings_payload,
+)
 
 
 MAX_UPLOAD_BYTES = int(os.environ.get("AUDIOBOOK_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
@@ -277,6 +285,7 @@ class BatchConcurrencyConfig:
     llm_workers: int = _MAX_LLM_WORKERS
     local_audio_workers: int = _MAX_LOCAL_AUDIO_WORKERS
     mix_workers: int = _MAX_MIX_WORKERS
+    voxcpm_workers: int = 1
 
     @classmethod
     def from_environment(cls) -> "BatchConcurrencyConfig":
@@ -302,6 +311,9 @@ class BatchConcurrencyConfig:
                 default=_MAX_MIX_WORKERS,
                 maximum=_MAX_MIX_WORKERS,
             ),
+            # VoxCPM2 keeps a multi-gigabyte model resident.  It is always a
+            # single host resource, regardless of user environment settings.
+            voxcpm_workers=1,
         )
 
     @property
@@ -332,6 +344,13 @@ _WORKER_RESOURCE_BY_COMMAND = {
     "mix_chapter_audio": "mix",
     "convert_to_mp3": "mix",
 }
+
+
+def _tts_resource_for_request(command: str, request: dict[str, object]) -> str | None:
+    """Resolve TTS resource ownership from the actual backend in the payload."""
+    if command in {"synthesize_chapter_audio", "synthesize_segment_audio"}:
+        return "voxcpm" if str(request.get("backend") or "mimo").casefold() == "voxcpm2" else "mimo"
+    return _WORKER_RESOURCE_BY_COMMAND.get(command)
 
 
 def is_generic_character_key(value: object) -> bool:
@@ -398,6 +417,7 @@ class ServerState:
         self.concurrency = BatchConcurrencyConfig.from_environment()
         self.worker_resource_semaphores = {
             "mimo": threading.BoundedSemaphore(self.concurrency.mimo_process_slots),
+            "voxcpm": threading.BoundedSemaphore(self.concurrency.voxcpm_workers),
             "llm": threading.BoundedSemaphore(self.concurrency.llm_workers),
             "local_audio": threading.BoundedSemaphore(self.concurrency.local_audio_workers),
             "mix": threading.BoundedSemaphore(self.concurrency.mix_workers),
@@ -476,6 +496,11 @@ class ServerState:
                 CREATE INDEX IF NOT EXISTS idx_character_aliases_lookup
                     ON character_aliases(book_id, alias_key);
                 CREATE INDEX IF NOT EXISTS idx_chapters_book_id ON chapters(book_id);
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS generation_batches (
                     id TEXT PRIMARY KEY,
                     book_id TEXT NOT NULL,
@@ -488,7 +513,8 @@ class ServerState:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     completed_at REAL,
-                    error TEXT
+                    error TEXT,
+                    model_settings_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS generation_batch_chapters (
                     batch_id TEXT NOT NULL,
@@ -544,6 +570,12 @@ class ServerState:
                     "stage_state": "TEXT",
                 },
             )
+            self._ensure_columns(
+                "generation_batches",
+                {
+                    "model_settings_json": "TEXT",
+                },
+            )
             self.db.execute(
                 """
                 UPDATE generation_batch_chapters
@@ -571,6 +603,94 @@ class ServerState:
                 """
             )
             self.db.commit()
+
+    def _stored_model_settings_value(self) -> object:
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT value_json FROM app_settings WHERE key = 'model_settings'"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(str(row["value_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def current_model_settings(self) -> ModelSettings:
+        """Return the effective setting, preserving legacy defaults if needed."""
+        return effective_settings(
+            self._stored_model_settings_value(),
+            root=Path(__file__).resolve().parents[3],
+        )
+
+    def model_settings_payload(self) -> dict[str, object]:
+        return settings_payload(
+            self.current_model_settings(),
+            root=Path(__file__).resolve().parents[3],
+        )
+
+    def update_model_settings(self, value: dict[str, object]) -> dict[str, object]:
+        """Validate the complete update before atomically replacing the record."""
+        normalized = normalize_settings(
+            value,
+            root=Path(__file__).resolve().parents[3],
+        )
+        now = time.time()
+        with self.db_lock:
+            self.db.execute(
+                "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+                "updated_at = excluded.updated_at",
+                (
+                    "model_settings",
+                    json.dumps(normalized.to_dict(), ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            self.db.commit()
+        return self.model_settings_payload()
+
+    def _model_settings_from_snapshot(self, value: object) -> ModelSettings:
+        """Decode a persisted batch snapshot without revalidating its host probe.
+
+        New snapshots are validated before insertion.  This narrower decoder is
+        used by the scheduler, where repeatedly spawning a VoxCPM2 import probe
+        for every checkpoint would be unnecessary and would delay dispatch.
+        """
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+        except json.JSONDecodeError:
+            parsed = None
+        settings = ModelSettings.from_value(parsed)
+        if settings is not None and (
+            (settings.tts_backend == DEFAULT_TTS_BACKEND and settings.tts_model_id == DEFAULT_TTS_MODEL_ID)
+            or (settings.tts_backend == "voxcpm2" and settings.tts_model_id == "VoxCPM2")
+        ):
+            return settings
+        return self.current_model_settings()
+
+    def _batch_model_settings(self, batch_id: str) -> ModelSettings:
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT model_settings_json FROM generation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        return self._model_settings_from_snapshot(
+            row["model_settings_json"] if row is not None else None
+        )
+
+    def _batch_stage_resource(
+        self,
+        batch_id: str,
+        definition: BatchStageDefinition,
+    ) -> str | None:
+        if definition.name != "voice_synthesize":
+            return definition.resource
+        return (
+            "voxcpm"
+            if self._batch_model_settings(batch_id).tts_backend == "voxcpm2"
+            else "mimo"
+        )
 
     def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
         existing = {
@@ -943,7 +1063,7 @@ class ServerState:
         if command not in allowed:
             return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "unknown_command", "message": command}}
         self.validate_request_paths(request)
-        with self._worker_resource(command):
+        with self._worker_resource(command, request):
             with tempfile.TemporaryDirectory(prefix="audiobook-web-", dir=self.data_directory) as temp:
                 input_path = Path(temp) / "input.json"
                 output_path = Path(temp) / "output.json"
@@ -951,7 +1071,7 @@ class ServerState:
                 environment = os.environ.copy()
                 environment.setdefault("AUDIOBOOK_TTS_DEVICE", "auto")
                 environment.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-                if _WORKER_RESOURCE_BY_COMMAND.get(command) == "mimo":
+                if _tts_resource_for_request(command, request) == "mimo":
                     # These settings are deliberately hard-coded. The child
                     # also uses a file-backed gate at the real HTTP boundary,
                     # which covers every process spawned by this web service.
@@ -980,10 +1100,10 @@ class ServerState:
                 return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "worker_exit_failed", "message": message}}
 
     @contextmanager
-    def _worker_resource(self, command: str):
+    def _worker_resource(self, command: str, request: dict[str, object] | None = None):
         """Acquire only the scarce resource used by one worker command."""
 
-        resource = _WORKER_RESOURCE_BY_COMMAND.get(command)
+        resource = _tts_resource_for_request(command, request or {})
         if resource and resource == getattr(
             self._worker_resource_local, "reserved_resource", None
         ):
@@ -1118,6 +1238,7 @@ class ServerState:
             "cancelledCount": cancelled_count,
             "completedCount": succeeded_count + failed_count + cancelled_count,
             "mimoCooldownSeconds": self._mimo_cooldown_seconds(),
+            "modelSettings": self._model_settings_from_snapshot(batch["model_settings_json"]).to_dict(),
             "chapters": chapters,
         }
 
@@ -1210,6 +1331,9 @@ class ServerState:
 
         force = request.get("force") is True
         cache_segments = request.get("cacheSegments") is not False
+        # Freeze model selection at submission time.  The stage scheduler must
+        # never observe a later settings-tab change for this batch.
+        model_settings = self.current_model_settings()
         now = time.time()
         with self.db_lock:
             book = self.db.execute(
@@ -1242,9 +1366,17 @@ class ServerState:
             batch_id = uuid.uuid4().hex
             self.db.execute(
                 "INSERT INTO generation_batches "
-                "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at) "
-                "VALUES (?, ?, 'queued', ?, ?, 0, ?, ?)",
-                (batch_id, book_id, int(force), int(cache_segments), now, now),
+                "(id, book_id, status, force, cache_segments, cancel_requested, created_at, updated_at, model_settings_json) "
+                "VALUES (?, ?, 'queued', ?, ?, 0, ?, ?, ?)",
+                (
+                    batch_id,
+                    book_id,
+                    int(force),
+                    int(cache_segments),
+                    now,
+                    now,
+                    json.dumps(model_settings.to_dict(), ensure_ascii=False, sort_keys=True),
+                ),
             )
             self.db.executemany(
                 "INSERT INTO generation_batch_chapters "
@@ -1418,7 +1550,8 @@ class ServerState:
                 (chapter_id, batch_id),
             ).fetchone()
             batch = self.db.execute(
-                "SELECT book_id, force, cache_segments FROM generation_batches WHERE id = ?",
+                "SELECT book_id, force, cache_segments, model_settings_json "
+                "FROM generation_batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
         if row is None or batch is None:
@@ -1430,11 +1563,22 @@ class ServerState:
         if not script_path.is_file():
             raise BatchGenerationStageError("voice", f"Chapter script is missing: {script_path}")
         work_dir = self.path_in_data(str(row["work_dir"]))
+        model_settings = self._model_settings_from_snapshot(batch["model_settings_json"])
+        backend_directory = (
+            work_dir / "segments" / chapter_id / model_settings.tts_backend
+            if model_settings.tts_backend == "voxcpm2"
+            else work_dir / "segments" / chapter_id
+        )
+        profile_directory = (
+            work_dir / "voice-profiles" / "voxcpm2"
+            if model_settings.tts_backend == "voxcpm2"
+            else work_dir / "voice-profiles"
+        )
         context: dict[str, object] = {
             "bookId": str(batch["book_id"]),
             "chapterId": chapter_id,
             "scriptPath": str(script_path),
-            "segmentAudioDirectory": str(work_dir / "segments" / chapter_id),
+            "segmentAudioDirectory": str(backend_directory),
             "voiceAudioPath": str(work_dir / "audio" / f"{chapter_id}.wav"),
             "analysisDirectory": str(work_dir / "analysis" / chapter_id),
             "audioAssetsDirectory": str(work_dir / "audio-assets" / chapter_id),
@@ -1443,7 +1587,8 @@ class ServerState:
             "narratorVoiceId": row["narrator_voice_id"] or "narrator_female",
             "force": bool(batch["force"]),
             "cacheSegments": bool(batch["cache_segments"]),
-            "voiceProfileDirectory": str(work_dir / "voice-profiles"),
+            "voiceProfileDirectory": str(profile_directory),
+            "modelSettings": model_settings.to_dict(),
         }
         return context
 
@@ -1467,12 +1612,15 @@ class ServerState:
         context = self._batch_chapter_inputs(batch_id, chapter_id)
         force = bool(context["force"])
         cache_segments = bool(context["cacheSegments"]) and not force
+        model_settings = ModelSettings.from_value(context.get("modelSettings"))
+        if model_settings is None:
+            model_settings = self.current_model_settings()
         common_tts: dict[str, object] = {
             "bookId": context["bookId"],
             "chapterId": chapter_id,
             "scriptPath": context["scriptPath"],
-            "backend": "mimo",
-            "modelId": "mimo-v2.5-tts-voiceclone",
+            "backend": model_settings.tts_backend,
+            "modelId": model_settings.tts_model_id,
             "mergeSegments": True,
             "narratorVoiceId": context["narratorVoiceId"],
         }
@@ -1508,6 +1656,7 @@ class ServerState:
                 ),
                 "chapterTextPath": context["chapterTextPath"],
                 "analysisDirectory": context["analysisDirectory"],
+                "llmModelId": model_settings.llm_model_id,
             }
         if definition.name == "stable_audio":
             return context, {
@@ -1529,6 +1678,8 @@ class ServerState:
                 "outputPath": context["mixedAudioPath"],
                 "mergeSegments": True,
                 "narratorVoiceId": context["narratorVoiceId"],
+                "backend": model_settings.tts_backend,
+                "modelId": model_settings.tts_model_id,
             }
         raise BatchGenerationStageError(
             definition.display_stage,
@@ -1562,9 +1713,9 @@ class ServerState:
     def _has_pending_mimo_stage(self) -> bool:
         """Reserve one worker position when any chapter needs serialized voice."""
         with self.db_lock:
-            row = self.db.execute(
+            rows = self.db.execute(
                 """
-                SELECT 1
+                SELECT b.model_settings_json
                 FROM generation_batch_chapters AS bc
                 JOIN generation_batches AS b ON b.id = bc.batch_id
                 WHERE b.cancel_requested = 0
@@ -1572,10 +1723,13 @@ class ServerState:
                   AND bc.status IN ('queued', 'running')
                   AND bc.next_stage = 'voice_synthesize'
                   AND bc.stage_state IN ('ready', 'running')
-                LIMIT 1
                 """
-            ).fetchone()
-        return row is not None
+            ).fetchall()
+        return any(
+            self._model_settings_from_snapshot(row["model_settings_json"]).tts_backend
+            == DEFAULT_TTS_BACKEND
+            for row in rows
+        )
 
     def _try_acquire_batch_stage_slot(
         self,
@@ -1789,9 +1943,13 @@ class ServerState:
         batch_id: str,
         chapter_id: str,
         definition: BatchStageDefinition,
+        resource: str | None = None,
     ) -> None:
         """Run one admitted checkpoint and always release its reservations."""
         started_at = time.monotonic()
+        actual_resource = resource if resource is not None else self._batch_stage_resource(
+            batch_id, definition
+        )
         try:
             if self._batch_is_cancel_requested(batch_id):
                 raise InterruptedError("batch generation was cancelled")
@@ -1800,7 +1958,7 @@ class ServerState:
                 chapter_id,
                 definition,
             )
-            with self._reserved_worker_resource(definition.resource):
+            with self._reserved_worker_resource(actual_resource):
                 result = self.run_worker(definition.command, request)
             if result.get("status") != "succeeded":
                 raise BatchGenerationStageError(
@@ -1842,10 +2000,10 @@ class ServerState:
                 definition.display_stage,
                 time.monotonic() - started_at,
             )
-            semaphore = self.worker_resource_semaphores.get(definition.resource)
+            semaphore = self.worker_resource_semaphores.get(actual_resource)
             if semaphore is not None:
                 semaphore.release()
-            self._release_batch_stage_slot(definition.resource)
+            self._release_batch_stage_slot(actual_resource)
 
     def _try_dispatch_batch_stage(
         self,
@@ -1859,19 +2017,20 @@ class ServerState:
                 definition = self._batch_stage_definition(next_stage)
             except BatchGenerationStageError:
                 continue
+            resource = self._batch_stage_resource(batch_id, definition)
             if not self._try_acquire_batch_stage_slot(
-                definition.resource,
+                resource,
                 reserve_mimo_slot=reserve_mimo_slot,
             ):
                 return False
-            semaphore = self.worker_resource_semaphores.get(definition.resource)
+            semaphore = self.worker_resource_semaphores.get(resource)
             if semaphore is not None and not semaphore.acquire(blocking=False):
-                self._release_batch_stage_slot(definition.resource)
+                self._release_batch_stage_slot(resource)
                 continue
             if not self._claim_ready_batch_stage(batch_id, chapter_id, definition):
                 if semaphore is not None:
                     semaphore.release()
-                self._release_batch_stage_slot(definition.resource)
+                self._release_batch_stage_slot(resource)
                 continue
             try:
                 future = self.batch_chapter_executor.submit(
@@ -1879,12 +2038,13 @@ class ServerState:
                     batch_id,
                     chapter_id,
                     definition,
+                    resource,
                 )
             except Exception:
                 self._return_batch_stage_to_ready(batch_id, chapter_id, definition)
                 if semaphore is not None:
                     semaphore.release()
-                self._release_batch_stage_slot(definition.resource)
+                self._release_batch_stage_slot(resource)
                 raise
             futures.add(future)
             return True
@@ -2350,6 +2510,10 @@ class ServerState:
                         "chapterTextPath": chapter_text_path,
                         "outputDirectory": str(work_dir / "scripts"),
                         "narratorVoiceId": narrator_voice_id,
+                        # The external automation endpoint has no separate
+                        # model selector. It must still honor the same active
+                        # server setting as browser analysis and audio plans.
+                        "llmModelId": self.current_model_settings().llm_model_id,
                         "knownCharacters": list(known_characters_by_id.values()) or None,
                     },
                     error_code="chapter_analysis_failed",
@@ -3104,6 +3268,10 @@ class WebHandler(BaseHTTPRequestHandler):
             return self.state.active_batch_generation(str(args.get("bookId") or ""))
         if command == "batch_generation_cancel":
             return self.state.cancel_batch_generation(str(args.get("batchId") or ""))
+        if command == "model_settings_get":
+            return self.state.model_settings_payload()
+        if command == "model_settings_update":
+            return self.state.update_model_settings(args)
         if command == "stable_audio_start":
             return self.state.start_stable_audio_assets(args)
         if command == "stable_audio_status":

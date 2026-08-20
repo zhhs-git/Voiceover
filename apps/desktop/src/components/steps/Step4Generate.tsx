@@ -40,7 +40,7 @@ export function Step4Generate({
         <p className="eyebrow">第 4 步，共 4 步</p>
         <h2>生成音频</h2>
         <p className="step-desc">
-          使用 MiMo V2.5 TTS 音色设计合成选中的章节。
+          使用当前模型配置合成选中的章节。
         </p>
       </header>
 
@@ -51,8 +51,8 @@ export function Step4Generate({
             <span className="result-value">{chaptersReady.length} 章</span>
           </div>
           <div className="result-row">
-            <span className="result-label">后端</span>
-            <span className="result-value">MiMo V2.5 TTS 音色设计</span>
+            <span className="result-label">配音模型</span>
+            <span className="result-value">按当前模型配置</span>
           </div>
           {correctionDirty && (
             <div className="result-row">

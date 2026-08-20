@@ -9,7 +9,13 @@ import type {
 import type { BatchGenerationResponse } from "../lib/batchGeneration";
 import type { WorkflowKind } from "../lib/workflowStatus";
 
-export type DetailTab = "preview" | "analyze" | "review" | "generate" | "download";
+export type DetailTab =
+  | "preview"
+  | "analyze"
+  | "review"
+  | "generate"
+  | "download"
+  | "model-settings";
 
 type BookOwner = string | undefined;
 

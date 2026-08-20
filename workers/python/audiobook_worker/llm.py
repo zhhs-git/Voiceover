@@ -770,8 +770,9 @@ def _decode_model_json(content: Any) -> dict[str, Any]:
     return parsed
 
 
-def default_analyzer():
-    model_override = os.environ.get("AUDIOBOOK_LLM_MODEL")
+def default_analyzer(model_id: str | None = None):
+    """Build the configured analyzer, optionally overriding the process default."""
+    model_override = model_id or os.environ.get("AUDIOBOOK_LLM_MODEL")
     if model_override == "mock":
         return MockLLMAnalyzer()
     resolved = resolve_model(model_override)

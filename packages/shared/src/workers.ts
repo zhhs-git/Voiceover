@@ -22,6 +22,9 @@ export const AnalyzeChapterRequestSchema = BaseWorkerRequestSchema.extend({
   chapterTextPath: z.string().min(1),
   characterBiblePath: z.string().min(1).optional(),
   outputDirectory: z.string().min(1),
+  narratorVoiceId: z.string().min(1).optional(),
+  llmModelId: z.string().min(1).optional(),
+  knownCharacters: z.array(z.record(z.unknown())).optional(),
   resumeFromStage: z.enum([
     "characters",
     "voice_design",
@@ -44,6 +47,28 @@ export const SynthesizeSegmentAudioRequestSchema = BaseWorkerRequestSchema.exten
   voiceProfileDirectory: z.string().min(1).optional()
 });
 
+/**
+ * Generate every missing speech segment for one chapter before the separate
+ * assembly command creates its chapter-level WAV.  Backend/model are explicit
+ * so a request can never silently reuse a different TTS cache.
+ */
+export const SynthesizeChapterAudioRequestSchema = BaseWorkerRequestSchema.extend({
+  command: z.literal("synthesize_chapter_audio"),
+  chapterId: z.string().min(1),
+  scriptPath: z.string().min(1),
+  outputDirectory: z.string().min(1),
+  backend: z.string().min(1).optional(),
+  modelId: z.string().min(1).optional(),
+  narratorVoiceId: z.string().min(1).optional(),
+  voiceProfileDirectory: z.string().min(1).optional(),
+  mergeSegments: z.boolean().optional(),
+  cacheSegments: z.boolean().optional(),
+  mixedOutputPath: z.string().min(1).optional(),
+  maxMergedSegmentWords: z.number().int().positive().optional(),
+  maxMergedSegmentCharacters: z.number().int().positive().optional(),
+  gapSeconds: z.number().nonnegative().optional()
+});
+
 export const TranscribeChapterAudioRequestSchema = BaseWorkerRequestSchema.extend({
   command: z.literal("transcribe_chapter_audio"),
   chapterId: z.string().min(1),
@@ -60,7 +85,8 @@ export const PlanChapterAudioRequestSchema = BaseWorkerRequestSchema.extend({
   scriptPath: z.string().min(1),
   transcriptPath: z.string().min(1),
   chapterTextPath: z.string().min(1).optional(),
-  analysisDirectory: z.string().min(1).optional()
+  analysisDirectory: z.string().min(1).optional(),
+  llmModelId: z.string().min(1).optional()
 });
 
 export const GenerateAudioAssetsRequestSchema = BaseWorkerRequestSchema.extend({
@@ -78,7 +104,12 @@ export const AssembleChapterAudioRequestSchema = BaseWorkerRequestSchema.extend(
   command: z.literal("assemble_chapter_audio"),
   chapterId: z.string().min(1),
   segmentAudioDirectory: z.string().min(1),
-  outputPath: z.string().min(1)
+  outputPath: z.string().min(1),
+  backend: z.string().min(1).optional(),
+  modelId: z.string().min(1).optional(),
+  narratorVoiceId: z.string().min(1).optional(),
+  mergeSegments: z.boolean().optional(),
+  gapSeconds: z.number().nonnegative().optional()
 });
 
 export const MixChapterAudioRequestSchema = BaseWorkerRequestSchema.extend({
@@ -89,6 +120,9 @@ export const MixChapterAudioRequestSchema = BaseWorkerRequestSchema.extend({
   voiceAudioPath: z.string().min(1),
   audioAssetsDirectory: z.string().min(1),
   outputPath: z.string().min(1),
+  backend: z.string().min(1).optional(),
+  modelId: z.string().min(1).optional(),
+  narratorVoiceId: z.string().min(1).optional(),
   mergeSegments: z.boolean().optional(),
   maxMergedSegmentWords: z.number().int().positive().optional(),
   maxMergedSegmentCharacters: z.number().int().positive().optional(),
@@ -104,6 +138,7 @@ export const WorkerRequestSchema = z.discriminatedUnion("command", [
   TranscribeChapterAudioRequestSchema,
   PlanChapterAudioRequestSchema,
   SynthesizeSegmentAudioRequestSchema,
+  SynthesizeChapterAudioRequestSchema,
   GenerateAudioAssetsRequestSchema,
   AssembleChapterAudioRequestSchema,
   MixChapterAudioRequestSchema
@@ -150,6 +185,7 @@ export type AnalyzeChapterRequest = z.infer<typeof AnalyzeChapterRequestSchema>;
 export type TranscribeChapterAudioRequest = z.infer<typeof TranscribeChapterAudioRequestSchema>;
 export type PlanChapterAudioRequest = z.infer<typeof PlanChapterAudioRequestSchema>;
 export type SynthesizeSegmentAudioRequest = z.infer<typeof SynthesizeSegmentAudioRequestSchema>;
+export type SynthesizeChapterAudioRequest = z.infer<typeof SynthesizeChapterAudioRequestSchema>;
 export type GenerateAudioAssetsRequest = z.infer<typeof GenerateAudioAssetsRequestSchema>;
 export type AssembleChapterAudioRequest = z.infer<typeof AssembleChapterAudioRequestSchema>;
 export type MixChapterAudioRequest = z.infer<typeof MixChapterAudioRequestSchema>;

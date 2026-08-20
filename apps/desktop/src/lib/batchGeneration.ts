@@ -28,6 +28,15 @@ export type BatchGenerationNextStage =
 /** Ownership state for `nextStage`; terminal rows use `complete`. */
 export type BatchGenerationStageState = "ready" | "running" | "complete";
 
+/** Safe model snapshot frozen by the server when a batch is submitted. */
+export interface BatchGenerationModelSettings {
+  llmModelId: string;
+  ttsBackend: "mimo" | "voxcpm2";
+  ttsModelId: string;
+}
+
+export type BatchTtsBackend = BatchGenerationModelSettings["ttsBackend"];
+
 export interface BatchGenerationChapter {
   chapterId: string;
   title: string;
@@ -66,6 +75,8 @@ export interface BatchGenerationResponse {
   cancelledCount?: number;
   /** Remaining shared MiMo cooldown, when a recent 429 has rate-limited it. */
   mimoCooldownSeconds?: number | null;
+  /** Immutable model selection captured when this batch was submitted. */
+  modelSettings?: BatchGenerationModelSettings;
   chapters: BatchGenerationChapter[];
   reused?: boolean;
 }
@@ -92,7 +103,18 @@ export function batchChapterDisplayStage(
   return chapter.nextStage ? DISPLAY_STAGE_BY_NEXT_STAGE[chapter.nextStage] : null;
 }
 
-export function isBatchChapterWaitingForMiMo(
+/** Legacy rows have no snapshot and therefore retain their MiMo behavior. */
+export function batchTtsBackend(
+  batch: Pick<BatchGenerationResponse, "modelSettings">,
+): BatchTtsBackend {
+  return batch.modelSettings?.ttsBackend === "voxcpm2" ? "voxcpm2" : "mimo";
+}
+
+export function batchTtsBackendLabel(backend: BatchTtsBackend): string {
+  return backend === "voxcpm2" ? "VoxCPM2" : "MiMo Voice Clone";
+}
+
+export function isBatchChapterWaitingForTts(
   chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState" | "status">,
 ): boolean {
   return chapter.status !== "succeeded"
@@ -102,10 +124,24 @@ export function isBatchChapterWaitingForMiMo(
     && chapter.stageState === "ready";
 }
 
-export function isBatchChapterMiMoInProgress(
+export function isBatchChapterTtsInProgress(
   chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState">,
 ): boolean {
   return chapter.nextStage === "voice_synthesize" && chapter.stageState === "running";
+}
+
+export function isBatchChapterWaitingForMiMo(
+  chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState" | "status">,
+  backend: BatchTtsBackend = "mimo",
+): boolean {
+  return backend === "mimo" && isBatchChapterWaitingForTts(chapter);
+}
+
+export function isBatchChapterMiMoInProgress(
+  chapter: Pick<BatchGenerationChapter, "nextStage" | "stageState">,
+  backend: BatchTtsBackend = "mimo",
+): boolean {
+  return backend === "mimo" && isBatchChapterTtsInProgress(chapter);
 }
 
 export function isBatchChapterStageInProgress(

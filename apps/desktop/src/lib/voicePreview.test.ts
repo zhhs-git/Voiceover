@@ -2,26 +2,27 @@ import { describe, expect, test } from "vitest";
 import {
   buildVoicePreviewRequest,
   buildVoicePreviewScript,
-  VOICE_PREVIEW_BACKEND,
-  VOICE_PREVIEW_MODEL_ID,
 } from "./voicePreview";
 
 describe("voice preview", () => {
-  test("uses the active MiMo backend instead of Kokoro", () => {
+  test("uses the selected TTS backend and model", () => {
     expect(
       buildVoicePreviewRequest(
         "/tmp/preview.json",
         "/tmp/previews",
         "preview_female_adult_01",
+        {
+          ttsBackend: "mimo",
+          ttsModelId: "mimo-v2.5-tts-voiceclone",
+        },
       ),
     ).toEqual({
       scriptPath: "/tmp/preview.json",
       segmentId: "preview_female_adult_01",
       outputDirectory: "/tmp/previews",
-      backend: VOICE_PREVIEW_BACKEND,
-      modelId: VOICE_PREVIEW_MODEL_ID,
+      backend: "mimo",
+      modelId: "mimo-v2.5-tts-voiceclone",
     });
-    expect(VOICE_PREVIEW_BACKEND).toBe("mimo");
   });
 
   test("uses a Chinese preview phrase and preserves narrator identity", () => {

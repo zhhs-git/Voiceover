@@ -26,10 +26,17 @@ import { GeneratedAudioAssetList } from "./GeneratedAudioAssetList";
 import { PersistentChapterAudioList } from "./PersistentChapterAudioList";
 import { BatchGenerationStatusList } from "./BatchGenerationStatusList";
 import { FinalAudioDownloadPanel } from "./FinalAudioDownloadPanel";
+import { ModelSettingsPanel } from "./ModelSettingsPanel";
 import {
   buildVoicePreviewRequest,
   buildVoicePreviewScript,
 } from "../lib/voicePreview";
+import {
+  backendScopedVoicePreviewDirectory,
+  backendScopedVoiceProfileDirectory,
+  getModelSettings,
+  type ModelSettingsPayload,
+} from "../lib/modelSettings";
 import {
   emptyChapterWorkflow,
   readChapterWorkflow,
@@ -202,6 +209,7 @@ export function BookDetailView({
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const selectionWasChangedRef = useRef(false);
   const [providerVoices, setProviderVoices] = useState<VoiceMeta[]>([]);
+  const [modelSettings, setModelSettings] = useState<ModelSettingsPayload | null>(null);
 
   const voiceOptions: VoiceOption[] = useMemo(
     () =>
@@ -329,6 +337,22 @@ export function BookDetailView({
 
   useEffect(() => {
     selectionWasChangedRef.current = false;
+  }, [book.bookId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getModelSettings()
+      .then((settings) => {
+        if (!cancelled) setModelSettings(settings);
+      })
+      .catch(() => {
+        // Direct analysis and preview calls re-read settings before running,
+        // so a transient initial fetch must not prevent the book from opening.
+        if (!cancelled) setModelSettings(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [book.bookId]);
 
   useEffect(() => {
@@ -557,8 +581,10 @@ export function BookDetailView({
   }, [book.bookId, book.workDir, book.chapters]);
 
   useEffect(() => {
+    const backend = modelSettings?.current.ttsBackend;
+    if (!backend) return;
     let cancelled = false;
-    workerCall("list_voices", { backend: "mimo" })
+    workerCall("list_voices", { backend })
       .then((result) => {
         if (!cancelled && Array.isArray(result.voices)) {
           setProviderVoices(result.voices as VoiceMeta[]);
@@ -570,7 +596,7 @@ export function BookDetailView({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [modelSettings?.current.ttsBackend]);
 
   function toggleChapter(chapterId: string) {
     selectionWasChangedRef.current = true;
@@ -780,9 +806,11 @@ export function BookDetailView({
     pipeline.setError(null, book.bookId);
     pipeline.setSavedMessage(null, book.bookId);
     try {
+      const settings = await getModelSettings();
       const result = await workerCall("apply_corrections", {
         bookId: book.bookId,
         narratorVoiceId,
+        llmModelId: settings.current.llmModelId,
         chapters: book.chapters.map((c) => ({
           chapterId: c.id,
           textPath: c.textPath,
@@ -944,11 +972,13 @@ export function BookDetailView({
   ) {
     if (!book) return;
     try {
+      const settings = await getModelSettings();
+      const { ttsBackend, ttsModelId } = settings.current;
       pipeline.setSavedMessage(
         `正在生成 ${voiceId} 的试听音频…`,
         book.bookId,
       );
-      const previewDir = `${book.workDir}/voice-previews`;
+      const previewDir = backendScopedVoicePreviewDirectory(book.workDir, ttsBackend);
       const scriptPath = `${previewDir}/${voiceId}.json`;
       await workerCall("_write_file", {
         path: scriptPath,
@@ -964,7 +994,14 @@ export function BookDetailView({
           scriptPath,
           previewDir,
           segmentId,
-          `${book.workDir}/voice-profiles`,
+          {
+            ttsBackend,
+            ttsModelId,
+            voiceProfileDirectory: backendScopedVoiceProfileDirectory(
+              book.workDir,
+              ttsBackend,
+            ),
+          },
         ),
       );
       if (result.status !== "succeeded")
@@ -1021,27 +1058,29 @@ export function BookDetailView({
         <button className="btn-secondary" onClick={handleRegenerateAll}>
           全部重新生成
         </button>
-        <button
-          className="btn-primary"
-          onClick={() => {
-            if (pipeline.tab === "preview") pipeline.setTab("analyze", book.bookId);
-            else if (pipeline.tab === "analyze") handleAnalyze();
-            else if (pipeline.tab === "review") handleSaveCorrections();
-            else handleGenerate();
-          }}
-          disabled={
-            isBusy ||
-            (pipeline.tab !== "preview" && pipeline.selectedChapters.size === 0)
-          }
-        >
-          {pipeline.tab === "preview"
-            ? "进入分析"
-            : pipeline.tab === "analyze"
-            ? `分析（${pipeline.selectedChapters.size}）`
-            : pipeline.tab === "review"
-              ? "保存修改"
-              : `生成（${pipeline.selectedChapters.size}）`}
-        </button>
+        {pipeline.tab !== "download" && pipeline.tab !== "model-settings" && (
+          <button
+            className="btn-primary"
+            onClick={() => {
+              if (pipeline.tab === "preview") pipeline.setTab("analyze", book.bookId);
+              else if (pipeline.tab === "analyze") handleAnalyze();
+              else if (pipeline.tab === "review") handleSaveCorrections();
+              else handleGenerate();
+            }}
+            disabled={
+              isBusy ||
+              (pipeline.tab !== "preview" && pipeline.selectedChapters.size === 0)
+            }
+          >
+            {pipeline.tab === "preview"
+              ? "进入分析"
+              : pipeline.tab === "analyze"
+              ? `分析（${pipeline.selectedChapters.size}）`
+              : pipeline.tab === "review"
+                ? "保存修改"
+                : `生成（${pipeline.selectedChapters.size}）`}
+          </button>
+        )}
       </header>
 
       <div className="detail-body">
@@ -1104,6 +1143,12 @@ export function BookDetailView({
               onClick={() => pipeline.setTab("download", book.bookId)}
             >
               下载
+            </button>
+            <button
+              className={`tab-btn ${pipeline.tab === "model-settings" ? "active" : ""}`}
+              onClick={() => pipeline.setTab("model-settings", book.bookId)}
+            >
+              模型配置
             </button>
           </nav>
 
@@ -1297,7 +1342,7 @@ export function BookDetailView({
                 <thead>
                   <tr>
                     <th>角色</th>
-                    <th>MiMo 音色设计</th>
+                    <th>音色设计</th>
                     <th>性别</th>
                     <th>年龄</th>
                     <th>音色</th>
@@ -1350,7 +1395,7 @@ export function BookDetailView({
                       </td>
                       <td>
                         <textarea
-                          aria-label={`${c.canonicalName} 的 MiMo 音色设计`}
+                          aria-label={`${c.canonicalName} 的音色设计`}
                           value={c.voiceDesign ?? ""}
                           rows={4}
                           onChange={(e) =>
@@ -1521,6 +1566,12 @@ export function BookDetailView({
                 chapterMixedAudioPaths={pipeline.chapterMixedAudioPaths}
                 generationWorkflows={pipeline.workflows.generation}
               />
+            </div>
+          )}
+
+          {pipeline.tab === "model-settings" && (
+            <div className="tab-panel">
+              <ModelSettingsPanel onSaved={setModelSettings} />
             </div>
           )}
 

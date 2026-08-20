@@ -13,12 +13,14 @@ import type {
 import { audioAssetsFromArtifacts } from "../lib/audioAssets";
 import {
   batchErrorMessage,
+  batchTtsBackend,
+  batchTtsBackendLabel,
   cancelBatchGeneration,
   batchChapterDisplayStage,
   getActiveBatchGeneration,
   getBatchGenerationStatus,
   isBatchChapterStageInProgress,
-  isBatchChapterWaitingForMiMo,
+  isBatchChapterWaitingForTts,
   isActiveBatchGeneration,
   startBatchGeneration,
   type BatchGenerationResponse,
@@ -126,22 +128,34 @@ export function useGeneration(deps: UseGenerationDeps) {
     const completed = response.completedCount ?? response.chapters.filter((chapter) =>
       ["succeeded", "failed", "cancelled"].includes(chapter.status),
     ).length;
+    const ttsBackend = batchTtsBackend(response);
+    const ttsLabel = batchTtsBackendLabel(ttsBackend);
     const current = response.chapters.find(isBatchChapterStageInProgress)
-      ?? response.chapters.find(isBatchChapterWaitingForMiMo)
+      ?? response.chapters.find(isBatchChapterWaitingForTts)
       ?? response.chapters.find((chapter) => chapter.status === "running");
     const title = current?.title || response.chapters.find((chapter) => chapter.chapterId === response.currentChapterId)?.title;
-    const waitingForMiMo = current ? isBatchChapterWaitingForMiMo(current) : false;
+    const waitingForTts = current ? isBatchChapterWaitingForTts(current) : false;
     const stage = current ? batchChapterDisplayStage(current) : response.currentStage;
     const cooldownSeconds = response.mimoCooldownSeconds;
-    const stageProgress = waitingForMiMo
-      ? typeof cooldownSeconds === "number" && Number.isFinite(cooldownSeconds) && cooldownSeconds > 0
+    const stageProgress = waitingForTts
+      ? ttsBackend === "mimo"
+        && typeof cooldownSeconds === "number"
+        && Number.isFinite(cooldownSeconds)
+        && cooldownSeconds > 0
         ? `MiMo 限流冷却中（约 ${Math.ceil(cooldownSeconds)} 秒）`
-        : "等待 MiMo 串行配音"
+        : ttsBackend === "voxcpm2"
+          ? "等待 VoxCPM2 本地章节配音"
+          : "等待 MiMo 串行配音"
       : stageLabel(stage);
 
     setProgress(total > 0 ? Math.round((completed / total) * 100) : 0, owner);
     setProgressDetail([
-      { label: "执行方式", value: "MiMo 全局串行（80 RPM），后续阶段最多 4 个 worker 并行" },
+      {
+        label: "配音资源",
+        value: ttsBackend === "voxcpm2"
+          ? `${ttsLabel} 本地章节串行（独占模型资源）`
+          : "MiMo 全局串行（80 RPM）",
+      },
       { label: "进度", value: `${completed} / ${total} 章` },
       { label: "当前章节", value: title || "等待队列" },
       { label: "当前阶段", value: stageProgress },

@@ -1,6 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 import { mixChapterAudio, synthesizeChapter } from "./generation";
 
+const mimoTts = {
+  ttsBackend: "mimo" as const,
+  ttsModelId: "mimo-v2.5-tts-voiceclone",
+};
+
 describe("synthesizeChapter", () => {
   test("synthesizes a whole chapter in one worker call before assembling", async () => {
     const worker = vi.fn(async (command: string) => {
@@ -18,6 +23,7 @@ describe("synthesizeChapter", () => {
       segmentAudioDirectory: "/tmp/book/segments/chapter_001",
       outputPath: "/tmp/book/audio/chapter_001.wav",
       voiceProfileDirectory: "/tmp/book/voice-profiles",
+      tts: mimoTts,
       worker,
     });
 
@@ -60,6 +66,7 @@ describe("synthesizeChapter", () => {
       scriptPath: "/tmp/book/scripts/chapter_001.json",
       segmentAudioDirectory: "/tmp/book/segments/chapter_001",
       outputPath: "/tmp/book/audio/chapter_001.wav",
+      tts: mimoTts,
       worker,
     });
 
@@ -86,6 +93,7 @@ describe("mixChapterAudio", () => {
       voiceAudioPath: "/tmp/book/audio/chapter_001.wav",
       audioAssetsDirectory: "/tmp/book/audio-assets/chapter_001",
       outputPath: "/tmp/book/audio/chapter_001_mixed.wav",
+      tts: mimoTts,
       worker,
     });
 
@@ -98,6 +106,8 @@ describe("mixChapterAudio", () => {
       audioAssetsDirectory: "/tmp/book/audio-assets/chapter_001",
       outputPath: "/tmp/book/audio/chapter_001_mixed.wav",
       mergeSegments: true,
+      backend: "mimo",
+      modelId: "mimo-v2.5-tts-voiceclone",
     });
   });
 
@@ -118,6 +128,7 @@ describe("mixChapterAudio", () => {
       audioAssetsDirectory: "/tmp/book/audio-assets/chapter_001",
       outputPath: "/tmp/book/audio/chapter_001_mixed.wav",
       voiceGain: 1.0,
+      tts: mimoTts,
       worker,
     });
 

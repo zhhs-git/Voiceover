@@ -11,6 +11,11 @@ import type {
   WorkspaceStep,
 } from "../types";
 import { workerCall } from "../lib/workerCall";
+import {
+  getModelSettings,
+  llmDisplayName,
+  type ModelSettingsPayload,
+} from "../lib/modelSettings";
 import type { DetailTab } from "../state/pipelineStore";
 import { watchChapterWorkflow } from "../lib/workflowStatus";
 
@@ -105,6 +110,14 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
 
   const handleAnalyze = useCallback(async () => {
     if (!book) return;
+    let modelSettings: ModelSettingsPayload;
+    try {
+      modelSettings = await getModelSettings();
+    } catch (error) {
+      setError(`无法读取模型配置：${String(error)}`, book.bookId);
+      setStage("error", book.bookId);
+      return;
+    }
     const controller = new AbortController();
     abortRef.current = controller;
     const clearController = () => {
@@ -116,10 +129,10 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
     setProgress(0, book.bookId);
     setAnalyzeProgress("正在开始分析…", book.bookId);
     setChapterStatuses({}, book.bookId);
-    setProgressDetail([{ label: "模型", value: "DeepSeek Flash" }], book.bookId);
+    const modelLabel = llmDisplayName(modelSettings);
+    setProgressDetail([{ label: "模型", value: modelLabel }], book.bookId);
 
     const startTime = Date.now();
-    const modelLabel = "DeepSeek Flash";
 
     const chaptersToAnalyze = book.chapters.filter((c) =>
       selectedChapters.has(c.id),
@@ -215,6 +228,7 @@ export function useChapterAnalysis(deps: UseChapterAnalysisDeps) {
             chapterTextPath: chapter.textPath,
             outputDirectory: `${book.workDir}/scripts`,
             narratorVoiceId: book.narratorVoiceId ?? "narrator_female",
+            llmModelId: modelSettings.current.llmModelId,
             // Pass accumulated character context for cross-chapter consistency
             knownCharacters: knownCharacters.length > 0 ? knownCharacters : undefined,
           });

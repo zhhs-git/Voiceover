@@ -14,6 +14,7 @@ from audiobook_worker.web_server import (
     WebHandler,
     safe_filename,
 )
+from audiobook_worker import model_settings as model_settings_module
 
 
 def _write_wav(path: Path) -> None:
@@ -21,6 +22,43 @@ def _write_wav(path: Path) -> None:
     with wave.open(str(path), "wb") as output:
         output.setparams((1, 2, 44100, 4410, "NONE", "not compressed"))
         output.writeframes(b"\x00\x00" * 4410)
+
+
+def _available_llm_options(*model_ids: str) -> list[dict[str, object]]:
+    return [
+        {
+            "id": model_id,
+            "provider": model_id.split("/", 1)[0],
+            "displayName": model_id,
+            "family": "default",
+            "available": True,
+        }
+        for model_id in model_ids
+    ]
+
+
+def _available_voxcpm2_capability() -> dict[str, object]:
+    return {
+        "id": "voxcpm2",
+        "modelId": "VoxCPM2",
+        "displayName": "VoxCPM2（本地）",
+        "available": True,
+        "reason": "已检测到本地模型和独立运行环境。",
+    }
+
+
+def test_voxcpm2_paths_preserves_the_venv_python_launcher(tmp_path: Path):
+    launcher = tmp_path / "data" / "voxcpm2" / ".venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    target = tmp_path / "base-python"
+    target.touch()
+    launcher.symlink_to(target)
+
+    paths = model_settings_module.voxcpm2_paths(tmp_path)
+
+    assert paths["python"] == launcher
+    assert paths["python"].is_symlink()
+    assert paths["python"].resolve() == target.resolve()
 
 
 def _wait_for_batch(
@@ -72,6 +110,156 @@ def test_web_state_uses_shared_sqlite_and_book_directories(tmp_path: Path):
     assert state.run_worker(
         "_read_file", {"path": str(work_dir / "sample.json")}
     ) == {"ok": True}
+
+
+def test_model_settings_payload_projects_only_safe_llm_metadata(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("AUDIOBOOK_LLM_MODEL", raising=False)
+    monkeypatch.delenv("MODEL_ID", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.setattr(
+        model_settings_module,
+        "read_models_json",
+        lambda: {
+            "default": "openai/gpt-safe",
+            "providers": {
+                "openai": {
+                    "baseUrl": "https://private.example/v1",
+                    "apiKey": "super-secret-api-key",
+                    "apiKeyEnv": "PRIVATE_API_KEY",
+                    "models": [
+                        {
+                            "id": "gpt-safe",
+                            "name": "Safe GPT",
+                            "token": "another-secret",
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        model_settings_module,
+        "probe_voxcpm2",
+        lambda _root=None: _available_voxcpm2_capability(),
+    )
+    state = ServerState(tmp_path)
+
+    payload = state.model_settings_payload()
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["current"] == {
+        "llmModelId": "openai/gpt-safe",
+        "ttsBackend": "mimo",
+        "ttsModelId": "mimo-v2.5-tts-voiceclone",
+    }
+    assert payload["llmOptions"] == [
+        {
+            "id": "openai/gpt-safe",
+            "provider": "openai",
+            "displayName": "Safe GPT",
+            "family": "default",
+            "available": True,
+        },
+        {
+            "id": "mock",
+            "provider": "local",
+            "displayName": "离线 Mock（仅测试）",
+            "family": "mock",
+            "available": True,
+        },
+    ]
+    for forbidden in (
+        "super-secret-api-key",
+        "another-secret",
+        "https://private.example/v1",
+        "PRIVATE_API_KEY",
+        "apiKey",
+        "token",
+    ):
+        assert forbidden not in serialized
+    state.close()
+
+
+def test_model_settings_persist_and_invalid_update_keeps_last_valid_value(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
+    )
+    monkeypatch.setattr(
+        model_settings_module,
+        "probe_voxcpm2",
+        lambda _root=None: _available_voxcpm2_capability(),
+    )
+    state = ServerState(tmp_path)
+    saved = state.update_model_settings(
+        {
+            "llmModelId": "openai/gpt-first",
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+        }
+    )
+
+    try:
+        state.update_model_settings(
+            {
+                "llmModelId": "missing/model",
+                "ttsBackend": "mimo",
+                "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            }
+        )
+    except ValueError as error:
+        assert "LLM 模型不可用或不存在" in str(error)
+    else:
+        raise AssertionError("an unavailable LLM must be rejected")
+
+    assert state.current_model_settings().to_dict() == saved["current"]
+    state.close()
+
+    reopened = ServerState(tmp_path)
+    assert reopened.current_model_settings().to_dict() == saved["current"]
+    reopened.close()
+
+
+def test_model_settings_reject_unavailable_voxcpm2_without_replacing_current_value(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda: _available_llm_options("openai/gpt-safe"),
+    )
+    monkeypatch.setattr(
+        model_settings_module,
+        "probe_voxcpm2",
+        lambda _root=None: {
+            **_available_voxcpm2_capability(),
+            "available": False,
+            "reason": "缺少 VoxCPM2 模型目录。",
+        },
+    )
+    state = ServerState(tmp_path)
+    previous = state.current_model_settings().to_dict()
+
+    try:
+        state.update_model_settings(
+            {
+                "llmModelId": "openai/gpt-safe",
+                "ttsBackend": "voxcpm2",
+                "ttsModelId": "VoxCPM2",
+            }
+        )
+    except ValueError as error:
+        assert "缺少 VoxCPM2 模型目录" in str(error)
+    else:
+        raise AssertionError("an unavailable VoxCPM2 environment must be rejected")
+
+    assert state.current_model_settings().to_dict() == previous
+    state.close()
 
 
 def test_delete_book_removes_managed_upload_and_generated_work_directory(tmp_path: Path):
@@ -360,6 +548,7 @@ def test_external_audiobook_archive_automates_analysis_generation_and_chapter_mp
     assert analysis_requests[1]["knownCharacters"] == [
         {"id": "hero", "canonicalName": "主角"}
     ]
+    assert analysis_requests[0]["llmModelId"] == state.current_model_settings().llm_model_id
     state.close()
 
 
@@ -672,6 +861,140 @@ def test_batch_generation_preserves_each_chapter_stage_order_and_persists_output
     assert finished["chapters"][0]["mixedAudioPath"] == str(
         work_dir / "audio" / "chapter_001_mixed.wav"
     )
+    state.close()
+
+
+def test_batch_model_snapshot_remains_immutable_after_global_settings_change(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
+    )
+    monkeypatch.setattr(
+        model_settings_module,
+        "probe_voxcpm2",
+        lambda _root=None: _available_voxcpm2_capability(),
+    )
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001",))
+    monkeypatch.setattr(state, "_launch_batch_generation_locked", lambda _batch_id: None)
+    state.update_model_settings(
+        {
+            "llmModelId": "openai/gpt-first",
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+        }
+    )
+    started = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001"]}
+    )
+    batch_id = str(started["batchId"])
+
+    state.update_model_settings(
+        {
+            "llmModelId": "openai/gpt-second",
+            "ttsBackend": "voxcpm2",
+            "ttsModelId": "VoxCPM2",
+        }
+    )
+    status = state.batch_generation_status(batch_id)
+    definition = state._batch_stage_definition("voice_synthesize")
+    _context, voice_request = state._batch_stage_request(
+        batch_id,
+        "chapter_001",
+        definition,
+    )
+    _context, plan_request = state._batch_stage_request(
+        batch_id,
+        "chapter_001",
+        state._batch_stage_definition("audio_plan"),
+    )
+
+    assert status["modelSettings"] == {
+        "llmModelId": "openai/gpt-first",
+        "ttsBackend": "mimo",
+        "ttsModelId": "mimo-v2.5-tts-voiceclone",
+    }
+    assert voice_request["backend"] == "mimo"
+    assert voice_request["modelId"] == "mimo-v2.5-tts-voiceclone"
+    assert plan_request["llmModelId"] == "openai/gpt-first"
+    assert state._batch_stage_resource(batch_id, definition) == "mimo"
+    assert state.current_model_settings().to_dict() == {
+        "llmModelId": "openai/gpt-second",
+        "ttsBackend": "voxcpm2",
+        "ttsModelId": "VoxCPM2",
+    }
+    state.close()
+
+
+def test_voxcpm2_batch_voice_stage_uses_the_capacity_one_local_resource(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda: _available_llm_options("openai/gpt-safe"),
+    )
+    monkeypatch.setattr(
+        model_settings_module,
+        "probe_voxcpm2",
+        lambda _root=None: _available_voxcpm2_capability(),
+    )
+    state = ServerState(tmp_path)
+    _seed_batch_book(state, ("chapter_001", "chapter_002"))
+    state.update_model_settings(
+        {
+            "llmModelId": "openai/gpt-safe",
+            "ttsBackend": "voxcpm2",
+            "ttsModelId": "VoxCPM2",
+        }
+    )
+    first_voice_started = threading.Event()
+    release_voice = threading.Event()
+    active = 0
+    maximum = 0
+    voice_calls: list[str] = []
+    lock = threading.Lock()
+
+    def fake_worker(command: str, request: dict[str, object]):
+        nonlocal active, maximum
+        if command == "synthesize_chapter_audio":
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                voice_calls.append(str(request["chapterId"]))
+            first_voice_started.set()
+            try:
+                release_voice.wait(timeout=2)
+            finally:
+                with lock:
+                    active -= 1
+        return {"status": "succeeded", "warnings": [], "artifacts": []}
+
+    monkeypatch.setattr(state, "run_worker", fake_worker)
+    started = state.start_batch_generation(
+        {"bookId": "book_123", "chapterIds": ["chapter_001", "chapter_002"]}
+    )
+    batch_id = str(started["batchId"])
+    assert state._batch_stage_resource(
+        batch_id,
+        state._batch_stage_definition("voice_synthesize"),
+    ) == "voxcpm"
+    assert first_voice_started.wait(timeout=1)
+    time.sleep(0.05)
+    assert voice_calls == ["chapter_001"]
+    assert maximum == 1
+
+    state.cancel_batch_generation(batch_id)
+    release_voice.set()
+    finished = _wait_for_batch(
+        state,
+        batch_id,
+        lambda response: response["status"] == "cancelled",
+    )
+    assert all(chapter["status"] == "cancelled" for chapter in finished["chapters"])
     state.close()
 
 
@@ -1157,6 +1480,80 @@ def test_worker_resource_limits_bound_mimo_local_audio_llm_and_mix_commands(
     assert all(not thread.is_alive() for thread in threads)
     assert mimo_process_concurrencies == ["1", "1", "1", "1"]
     assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)] * 4
+
+
+def test_direct_voxcpm2_tts_requests_use_the_single_local_voxcpm_resource(
+    tmp_path: Path, monkeypatch
+):
+    state = ServerState(tmp_path)
+    script_path = tmp_path / "scripts" / "chapter_001.json"
+    script_path.parent.mkdir(parents=True)
+    script_path.write_text("{}", encoding="utf-8")
+    active = 0
+    maximum = 0
+    started = threading.Event()
+    release = threading.Event()
+    environments: list[dict[str, str]] = []
+    lock = threading.Lock()
+
+    def fake_subprocess_run(arguments, **kwargs):
+        nonlocal active, maximum
+        assert arguments[3] == "synthesize_chapter_audio"
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        with lock:
+            environments.append(environment)
+            active += 1
+            maximum = max(maximum, active)
+        started.set()
+        try:
+            release.wait(timeout=2)
+        finally:
+            with lock:
+                active -= 1
+        Path(arguments[5]).write_text(
+            json.dumps({"status": "succeeded", "warnings": [], "artifacts": []}),
+            encoding="utf-8",
+        )
+        return type("Completed", (), {"stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr(
+        "audiobook_worker.web_server.subprocess.run",
+        fake_subprocess_run,
+    )
+    request = {
+        "scriptPath": str(script_path),
+        "outputDirectory": str(tmp_path / "segments" / "voxcpm2"),
+        "backend": "voxcpm2",
+        "modelId": "VoxCPM2",
+    }
+    threads = [
+        threading.Thread(
+            target=state.run_worker,
+            args=("synthesize_chapter_audio", dict(request)),
+        )
+        for _ in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        assert started.wait(timeout=1)
+        # While a direct local-model request is admitted, the independent
+        # MiMo permit remains available and the other VoxCPM2 requests wait.
+        assert state.worker_resource_semaphores["mimo"].acquire(blocking=False)
+        state.worker_resource_semaphores["mimo"].release()
+        time.sleep(0.05)
+        assert maximum == 1
+        assert len(environments) == 1
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        state.close()
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert maximum == 1
+    assert len(environments) == 3
 
 
 def test_batch_generation_persists_stage_and_chapter_durations(tmp_path: Path, monkeypatch):

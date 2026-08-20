@@ -7,9 +7,11 @@ import type {
 } from "../lib/batchGeneration";
 import {
   batchChapterDisplayStage,
-  isBatchChapterMiMoInProgress,
+  batchTtsBackend,
+  batchTtsBackendLabel,
   isBatchChapterStageInProgress,
-  isBatchChapterWaitingForMiMo,
+  isBatchChapterTtsInProgress,
+  isBatchChapterWaitingForTts,
 } from "../lib/batchGeneration";
 
 const BATCH_STATUS_LABELS: Record<BatchGenerationStatus, string> = {
@@ -42,24 +44,40 @@ function stageLabel(stage: string | null | undefined): string | null {
   return STAGE_LABELS[stage] ?? stage;
 }
 
-function chapterStatusLabel(chapter: BatchGenerationChapter): string {
-  if (isBatchChapterWaitingForMiMo(chapter)) return "等待 MiMo";
-  if (isBatchChapterMiMoInProgress(chapter)) return "MiMo 配音中";
+function chapterStatusLabel(
+  chapter: BatchGenerationChapter,
+  ttsBackend: ReturnType<typeof batchTtsBackend>,
+): string {
+  const backendLabel = ttsBackend === "voxcpm2" ? "VoxCPM2" : "MiMo";
+  if (isBatchChapterWaitingForTts(chapter)) return `等待 ${backendLabel}`;
+  if (isBatchChapterTtsInProgress(chapter)) return `${backendLabel} 配音中`;
   return CHAPTER_STATUS_LABELS[chapter.status];
 }
 
 function chapterDetail(
   chapter: BatchGenerationChapter,
   mimoCooldownSeconds: number | null | undefined,
+  ttsBackend: ReturnType<typeof batchTtsBackend>,
 ): string {
   if (chapter.status === "failed") return chapter.error || "生成失败";
-  if (isBatchChapterWaitingForMiMo(chapter)) {
-    if (typeof mimoCooldownSeconds === "number" && Number.isFinite(mimoCooldownSeconds) && mimoCooldownSeconds > 0) {
+  if (isBatchChapterWaitingForTts(chapter)) {
+    if (
+      ttsBackend === "mimo"
+      && typeof mimoCooldownSeconds === "number"
+      && Number.isFinite(mimoCooldownSeconds)
+      && mimoCooldownSeconds > 0
+    ) {
       return `MiMo 限流冷却中，约${formatBatchElapsed(Math.ceil(mimoCooldownSeconds))}后继续`;
     }
-    return "等待 MiMo 串行配音";
+    return ttsBackend === "voxcpm2"
+      ? "等待 VoxCPM2 本地章节配音"
+      : "等待 MiMo 串行配音";
   }
-  if (isBatchChapterMiMoInProgress(chapter)) return "正在原章节配音（MiMo 串行）";
+  if (isBatchChapterTtsInProgress(chapter)) {
+    return ttsBackend === "voxcpm2"
+      ? "正在原章节配音（VoxCPM2 本地章节串行）"
+      : "正在原章节配音（MiMo 串行）";
+  }
   const stage = stageLabel(batchChapterDisplayStage(chapter));
   if (isBatchChapterStageInProgress(chapter) && stage) return `正在${stage}`;
   return chapter.stageState === "ready" && stage ? `等待${stage}` : "";
@@ -135,6 +153,7 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
     chapter.status === "succeeded" || chapter.status === "failed" || chapter.status === "cancelled",
   ).length;
   const elapsedSeconds = batchElapsedSeconds(batch, nowMilliseconds);
+  const ttsBackend = batchTtsBackend(batch);
 
   return (
     <section className="batch-generation-status" aria-label="批量生成队列状态">
@@ -149,6 +168,12 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
               </span>
             )}
           </p>
+          {batch.modelSettings && (
+            <p className="batch-generation-model-settings">
+              <span>LLM：{batch.modelSettings.llmModelId}</span>
+              <span>配音：{batchTtsBackendLabel(ttsBackend)}</span>
+            </p>
+          )}
         </div>
         <span className={`workflow-summary-status batch-status-${batch.status}`}>
           {BATCH_STATUS_LABELS[batch.status]}
@@ -156,7 +181,11 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
       </div>
       <div className="batch-generation-chapter-list" role="list">
         {batch.chapters.map((chapter) => {
-          const detail = chapterDetail(chapter, batch.mimoCooldownSeconds);
+          const detail = chapterDetail(
+            chapter,
+            batch.mimoCooldownSeconds,
+            ttsBackend,
+          );
           const duration = typeof chapter.durationSeconds === "number" && Number.isFinite(chapter.durationSeconds)
             ? formatBatchElapsed(chapter.durationSeconds)
             : null;
@@ -166,7 +195,7 @@ export function BatchGenerationStatusList({ batch }: BatchGenerationStatusListPr
               <span className="batch-generation-position">{chapter.position + 1}</span>
               <span className="batch-generation-title">{chapter.title}</span>
               <span className={`batch-generation-chapter-status batch-chapter-${chapter.status}`}>
-                {chapterStatusLabel(chapter)}
+                {chapterStatusLabel(chapter, ttsBackend)}
               </span>
               {duration && (
                 <span className="batch-generation-duration" title={timingTitle}>
