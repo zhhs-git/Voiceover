@@ -52,6 +52,7 @@ from audiobook_worker.tts_quality import (
     TtsSegmentAudioQualityError,
     analyze_tts_segment_wav,
 )
+from audiobook_worker.voxcpm2_profile_loudness import voxcpm2_profile_loudness
 from audiobook_worker.transcription import (
     DEFAULT_WHISPER_MODEL,
     TranscriptionError,
@@ -531,6 +532,7 @@ def _segment_cache_signature(
     if str(backend_name or "").strip().casefold() == "voxcpm2":
         payload["voxcpm2PromptFormatVersion"] = VOXCPM2_PROMPT_FORMAT_VERSION
         payload["voxcpm2Language"] = voxcpm2_language_for_segment(segment)
+        payload["voxcpm2ProfileLoudness"] = voxcpm2_profile_loudness()
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

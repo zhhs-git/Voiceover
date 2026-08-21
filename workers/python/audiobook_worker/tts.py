@@ -33,6 +33,10 @@ from audiobook_worker.script_builder import (
     is_narrator_voice_id,
     normalize_narrator_voice_id,
 )
+from audiobook_worker.voxcpm2_profile_loudness import (
+    profile_loudness_is_current,
+    voxcpm2_profile_loudness,
+)
 from audiobook_worker.tts_quality import validate_tts_segment_wav
 
 # ---------------------------------------------------------------------------
@@ -900,6 +904,7 @@ class VoxCPM2TTSBackend:
                         "referenceText": reference_text,
                         "language": language,
                         "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
+                        "profileLoudness": voxcpm2_profile_loudness(),
                     }
                 )
             output_path = directory / f"{segment_id}.wav"
@@ -1115,6 +1120,7 @@ def _voxcpm2_voice_profile_signature(
         "language": _voxcpm2_language_key(language),
         "referenceText": voxcpm2_reference_text(language),
         "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
+        "profileLoudness": voxcpm2_profile_loudness(),
     }
     encoded = json.dumps(
         payload,
@@ -1145,6 +1151,7 @@ def _voxcpm2_profile_is_usable(
         and metadata.get("backend") == "voxcpm2"
         and metadata.get("modelId") == VOXCPM2_MODEL_ID
         and metadata.get("promptFormatVersion") == VOXCPM2_PROMPT_FORMAT_VERSION
+        and profile_loudness_is_current(metadata.get("profileLoudness"))
         and metadata.get("signature") == signature
     )
 

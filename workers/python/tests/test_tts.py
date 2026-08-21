@@ -30,6 +30,7 @@ from audiobook_worker.tts import (
     voice_registry,
 )
 from audiobook_worker import tts as tts_module
+from audiobook_worker.voxcpm2_profile_loudness import voxcpm2_profile_loudness
 
 
 def _wav_bytes(duration_seconds: float = 0.1, sample_rate: int = 24_000) -> bytes:
@@ -154,6 +155,7 @@ def test_voxcpm2_payload_separates_stable_profile_from_dynamic_delivery(
     assert payload["promptFormatVersion"] == VOXCPM2_PROMPT_FORMAT_VERSION
     assert profile["voiceDesign"] == voice_design
     assert profile["promptFormatVersion"] == VOXCPM2_PROMPT_FORMAT_VERSION
+    assert profile["profileLoudness"] == voxcpm2_profile_loudness()
     assert profile["referenceText"] == voxcpm2_reference_text("zh")
     assert "角色：" not in profile["profileControl"]
     assert "低沉" in profile["profileControl"]
@@ -215,6 +217,61 @@ def test_voxcpm2_profile_control_has_english_fallback_without_mutating_design():
     assert "adult male voice" in english
     assert not any("\u3400" <= character <= "\u9fff" for character in english)
     assert design.startswith("角色：")
+
+
+def test_voxcpm2_profile_cache_requires_current_loudness_contract(tmp_path: Path):
+    profile_path = tmp_path / "profiles" / "guard_zh.wav"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_bytes(_wav_bytes())
+    metadata_path = profile_path.with_suffix(".json")
+    signature = tts_module._voxcpm2_voice_profile_signature(
+        voice_id="guard",
+        description="成年男性，低沉而清晰。",
+        language="zh",
+    )
+    metadata = {
+        "version": tts_module._VOXCPM2_VOICE_PROFILE_VERSION,
+        "backend": "voxcpm2",
+        "modelId": "VoxCPM2",
+        "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
+        "signature": signature,
+        "profileLoudness": voxcpm2_profile_loudness(),
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert tts_module._voxcpm2_profile_is_usable(
+        profile_path,
+        metadata_path,
+        signature=signature,
+    )
+    metadata.pop("profileLoudness")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    assert not tts_module._voxcpm2_profile_is_usable(
+        profile_path,
+        metadata_path,
+        signature=signature,
+    )
+
+
+def test_voxcpm2_profile_signature_includes_loudness_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    before = tts_module._voxcpm2_voice_profile_signature(
+        voice_id="guard",
+        description="成年男性，低沉而清晰。",
+        language="zh",
+    )
+    monkeypatch.setattr(
+        tts_module,
+        "voxcpm2_profile_loudness",
+        lambda: {**voxcpm2_profile_loudness(), "version": 2},
+    )
+
+    assert tts_module._voxcpm2_voice_profile_signature(
+        voice_id="guard",
+        description="成年男性，低沉而清晰。",
+        language="zh",
+    ) != before
 
 
 def test_voxcpm2_narrator_uses_selected_stable_identity(tmp_path: Path, monkeypatch):

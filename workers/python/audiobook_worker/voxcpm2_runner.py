@@ -19,6 +19,21 @@ import wave
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .voxcpm2_profile_loudness import (
+        VoxCPM2ProfileLoudnessError,
+        normalize_voxcpm2_profile_wav,
+        profile_loudness_is_current,
+        voxcpm2_profile_loudness,
+    )
+else:  # pragma: no cover - exercised by the isolated direct-script runtime.
+    from voxcpm2_profile_loudness import (
+        VoxCPM2ProfileLoudnessError,
+        normalize_voxcpm2_profile_wav,
+        profile_loudness_is_current,
+        voxcpm2_profile_loudness,
+    )
+
 
 PROMPT_FORMAT_VERSION = 2
 PROFILE_VERSION = PROMPT_FORMAT_VERSION
@@ -95,6 +110,7 @@ def _profile_is_usable(
         isinstance(metadata, dict)
         and metadata.get("version") == PROFILE_VERSION
         and metadata.get("promptFormatVersion") == PROMPT_FORMAT_VERSION
+        and profile_loudness_is_current(metadata.get("profileLoudness"))
         and metadata.get("signature") == signature
     )
 
@@ -156,6 +172,61 @@ def _prompt_format_version(value: object, *, name: str) -> int:
     return version
 
 
+def _profile_loudness(value: object) -> dict[str, int | float]:
+    if not profile_loudness_is_current(value):
+        raise VoxCPM2RunnerError("profileLoudness must match the current VoxCPM2 contract.")
+    return voxcpm2_profile_loudness()
+
+
+def _profile_candidate_path(profile_path: Path) -> Path:
+    suffix = profile_path.suffix or ".wav"
+    return profile_path.with_name(
+        f".{profile_path.stem}.candidate.{os.getpid()}.{time.time_ns()}{suffix}"
+    )
+
+
+def _metadata_candidate_path(metadata_path: Path) -> Path:
+    suffix = metadata_path.suffix or ".json"
+    return metadata_path.with_name(
+        f".{metadata_path.stem}.candidate.{os.getpid()}.{time.time_ns()}{suffix}"
+    )
+
+
+def _atomic_replace_profile_and_metadata(
+    profile_candidate: Path,
+    profile_path: Path,
+    metadata_candidate: Path,
+    metadata_path: Path,
+) -> None:
+    """Commit the WAV and sidecar together, restoring old files on failure."""
+
+    backup_token = f"{os.getpid()}.{time.time_ns()}"
+    targets = (profile_path, metadata_path)
+    backups: dict[Path, Path] = {}
+    installed: list[Path] = []
+    try:
+        for target in targets:
+            if target.exists() or target.is_symlink():
+                backup = target.with_name(f".{target.name}.backup.{backup_token}")
+                target.replace(backup)
+                backups[target] = backup
+        profile_candidate.replace(profile_path)
+        installed.append(profile_path)
+        metadata_candidate.replace(metadata_path)
+        installed.append(metadata_path)
+    except Exception:
+        for target in installed:
+            target.unlink(missing_ok=True)
+        for target in reversed(targets):
+            backup = backups.get(target)
+            if backup is not None and backup.exists():
+                backup.replace(target)
+        raise
+    else:
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+
+
 def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[str, Any]:
     voice_id = _required_text(item.get("voiceId"), name="profile voiceId")
     profile_path = Path(_required_text(item.get("profilePath"), name="profilePath"))
@@ -173,6 +244,7 @@ def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[
         item.get("promptFormatVersion"),
         name="profile promptFormatVersion",
     )
+    profile_loudness = _profile_loudness(item.get("profileLoudness"))
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
@@ -188,22 +260,41 @@ def _ensure_profile(model: Any, item: dict[str, Any], sample_rate: int) -> dict[
                 inference_timesteps=10,
                 max_len=4096,
             )
-            _atomic_write_wav(profile_path, waveform, sample_rate)
-            _write_json(
-                metadata_path,
-                {
-                    "version": PROFILE_VERSION,
-                    "promptFormatVersion": prompt_format_version,
-                    "signature": signature,
-                    "voiceId": voice_id,
-                    "voiceDesign": voice_design,
-                    "profileControl": profile_control,
-                    "referenceText": reference_text,
-                    "language": language,
-                    "backend": "voxcpm2",
-                    "modelId": "VoxCPM2",
-                },
-            )
+            candidate_path = _profile_candidate_path(profile_path)
+            metadata_candidate_path = _metadata_candidate_path(metadata_path)
+            try:
+                _atomic_write_wav(candidate_path, waveform, sample_rate)
+                try:
+                    normalize_voxcpm2_profile_wav(candidate_path)
+                except VoxCPM2ProfileLoudnessError as error:
+                    raise VoxCPM2RunnerError(
+                        f"VoxCPM2 profile loudness normalization failed: {error}"
+                    ) from error
+                _write_json(
+                    metadata_candidate_path,
+                    {
+                        "version": PROFILE_VERSION,
+                        "promptFormatVersion": prompt_format_version,
+                        "profileLoudness": profile_loudness,
+                        "signature": signature,
+                        "voiceId": voice_id,
+                        "voiceDesign": voice_design,
+                        "profileControl": profile_control,
+                        "referenceText": reference_text,
+                        "language": language,
+                        "backend": "voxcpm2",
+                        "modelId": "VoxCPM2",
+                    },
+                )
+                _atomic_replace_profile_and_metadata(
+                    candidate_path,
+                    profile_path,
+                    metadata_candidate_path,
+                    metadata_path,
+                )
+            finally:
+                candidate_path.unlink(missing_ok=True)
+                metadata_candidate_path.unlink(missing_ok=True)
             return {"voiceId": voice_id, "path": str(profile_path), "cacheHit": False}
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

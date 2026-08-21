@@ -1008,6 +1008,33 @@ def test_voxcpm2_cache_signature_is_prompt_versioned_without_changing_mimo(
     )
 
 
+def test_voxcpm2_cache_signature_is_loudness_versioned_without_changing_mimo(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    segment = {
+        "id": "seg_0001",
+        "text": "The door opened.",
+        "voiceId": "guard_voice",
+        "voiceDesign": "an adult male voice",
+        "emotion": "neutral",
+        "pace": "normal",
+    }
+    mimo_before = cli_module._segment_cache_signature(segment, "mimo", None)
+    voxcpm2_before = cli_module._segment_cache_signature(segment, "voxcpm2", "VoxCPM2")
+    original_loudness = cli_module.voxcpm2_profile_loudness()
+    monkeypatch.setattr(
+        cli_module,
+        "voxcpm2_profile_loudness",
+        lambda: {**original_loudness, "version": original_loudness["version"] + 1},
+    )
+
+    assert cli_module._segment_cache_signature(segment, "mimo", None) == mimo_before
+    assert (
+        cli_module._segment_cache_signature(segment, "voxcpm2", "VoxCPM2")
+        != voxcpm2_before
+    )
+
+
 def test_decorated_tts_segments_receive_the_script_language(tmp_path: Path):
     import audiobook_worker.cli as cli_module
 

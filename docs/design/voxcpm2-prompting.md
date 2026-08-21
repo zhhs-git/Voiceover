@@ -56,6 +56,39 @@ and `promptFormatVersion` for sidecar observability. Only `profileControl` is
 used as the model control text; `voiceDesign` is metadata, not a second
 prompt.
 
+## Reference-Profile Loudness
+
+VoxCPM2 normalizes only the generated reference profile before it enters the
+voice-profile cache. The runner writes model output to a temporary candidate,
+uses ffmpeg's `loudnorm` filter, validates the resulting PCM S16 WAV, and only
+then atomically replaces the accepted reference file. The fixed contract is:
+
+```text
+integrated loudness: -20 LUFS
+true peak ceiling:   -3 dBFS
+loudness range:      7 LU
+profileLoudness:     version 1
+```
+
+The profile payload and sidecar both persist the versioned mapping:
+
+```json
+{
+  "profileLoudness": {
+    "version": 1,
+    "integratedLufs": -20.0,
+    "truePeakDb": -3.0,
+    "loudnessRange": 7.0
+  }
+}
+```
+
+This is deliberately a base-level correction for role identity. It does not
+normalize individual cloned segments, the assembled chapter, or the final mix:
+whispers, pauses, emotion, and pace remain part of each segment's performance.
+If ffmpeg fails, only the candidate is removed; an earlier accepted profile and
+sidecar remain untouched.
+
 ## Segment Delivery
 
 Every segment reuses the profile WAV for stable identity. Its dynamic control
@@ -80,11 +113,13 @@ Examples:
 
 ## Runner and Cache Contract
 
-`promptFormatVersion = 2` is part of every local runner request, profile
-sidecar, and VoxCPM2 segment cache signature. Profile compatibility is also
-version 2, so old local reference WAVs are ignored and regenerated. The
-segment signature adds this version and the resolved language only when the
-backend is `voxcpm2`; MiMo signature bytes and request structure are unchanged.
+`promptFormatVersion = 2` remains part of every local runner request, profile
+sidecar, and VoxCPM2 segment cache signature. `profileLoudness = v1` is a
+separate local-only cache contract: it is included in local profile and segment
+signatures, and is required in local profile sidecars. Old unnormalized local
+profiles and dependent segment WAVs therefore miss on their next original
+chapter regeneration. MiMo signature bytes and request structure are unchanged,
+and already completed chapter/final audio is never rewritten in place.
 
 One chapter still makes one isolated runner request. That process loads
 VoxCPM2 once and synthesizes uncached segments serially in source order. The
