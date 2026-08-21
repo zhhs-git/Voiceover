@@ -929,9 +929,10 @@ def test_batch_model_snapshot_remains_immutable_after_global_settings_change(
     state.close()
 
 
-def test_voxcpm2_batch_voice_stage_uses_the_capacity_one_local_resource(
+def test_voxcpm2_batch_voice_stage_uses_four_chapter_runner_slots(
     tmp_path: Path, monkeypatch
 ):
+    monkeypatch.delenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", raising=False)
     monkeypatch.setattr(
         model_settings_module,
         "discover_llm_options",
@@ -943,7 +944,8 @@ def test_voxcpm2_batch_voice_stage_uses_the_capacity_one_local_resource(
         lambda _root=None: _available_voxcpm2_capability(),
     )
     state = ServerState(tmp_path)
-    _seed_batch_book(state, ("chapter_001", "chapter_002"))
+    chapter_ids = tuple(f"chapter_{index:03d}" for index in range(1, 6))
+    _seed_batch_book(state, chapter_ids)
     state.update_model_settings(
         {
             "llmModelId": "openai/gpt-safe",
@@ -975,7 +977,7 @@ def test_voxcpm2_batch_voice_stage_uses_the_capacity_one_local_resource(
 
     monkeypatch.setattr(state, "run_worker", fake_worker)
     started = state.start_batch_generation(
-        {"bookId": "book_123", "chapterIds": ["chapter_001", "chapter_002"]}
+        {"bookId": "book_123", "chapterIds": list(chapter_ids)}
     )
     batch_id = str(started["batchId"])
     assert state._batch_stage_resource(
@@ -984,8 +986,8 @@ def test_voxcpm2_batch_voice_stage_uses_the_capacity_one_local_resource(
     ) == "voxcpm"
     assert first_voice_started.wait(timeout=1)
     time.sleep(0.05)
-    assert voice_calls == ["chapter_001"]
-    assert maximum == 1
+    assert len(voice_calls) == 4
+    assert maximum == 4
 
     state.cancel_batch_generation(batch_id)
     release_voice.set()
@@ -1156,6 +1158,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
         "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
         "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
         "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        "AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -1168,6 +1171,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
     assert defaults.llm_workers == 2
     assert defaults.local_audio_workers == 4
     assert defaults.mix_workers == 2
+    assert defaults.voxcpm_workers == 4
     assert defaults.non_mimo_workers_while_mimo_pending == 4
 
     for name in (
@@ -1177,6 +1181,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
         "AUDIOBOOK_LLM_WORKER_CONCURRENCY",
         "AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY",
         "AUDIOBOOK_MLX_WORKER_CONCURRENCY",
+        "AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY",
         "AUDIOBOOK_MIX_WORKER_CONCURRENCY",
     ):
         monkeypatch.setenv(name, "99")
@@ -1188,6 +1193,15 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
     assert capped.llm_workers == 2
     assert capped.local_audio_workers == 4
     assert capped.mix_workers == 2
+    assert capped.voxcpm_workers == 4
+
+    monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "2")
+    lowered_voxcpm = BatchConcurrencyConfig.from_environment()
+    assert lowered_voxcpm.voxcpm_workers == 2
+    monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "0")
+    assert BatchConcurrencyConfig.from_environment().voxcpm_workers == 1
+    monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "not-a-number")
+    assert BatchConcurrencyConfig.from_environment().voxcpm_workers == 4
 
     monkeypatch.delenv("AUDIOBOOK_MLX_WORKER_CONCURRENCY", raising=False)
     monkeypatch.setenv("AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY", "2")
@@ -1482,9 +1496,10 @@ def test_worker_resource_limits_bound_mimo_local_audio_llm_and_mix_commands(
     assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)] * 4
 
 
-def test_direct_voxcpm2_tts_requests_use_the_single_local_voxcpm_resource(
+def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
     tmp_path: Path, monkeypatch
 ):
+    monkeypatch.delenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", raising=False)
     state = ServerState(tmp_path)
     script_path = tmp_path / "scripts" / "chapter_001.json"
     script_path.parent.mkdir(parents=True)
@@ -1532,19 +1547,20 @@ def test_direct_voxcpm2_tts_requests_use_the_single_local_voxcpm_resource(
             target=state.run_worker,
             args=("synthesize_chapter_audio", dict(request)),
         )
-        for _ in range(3)
+        for _ in range(5)
     ]
     for thread in threads:
         thread.start()
     try:
         assert started.wait(timeout=1)
         # While a direct local-model request is admitted, the independent
-        # MiMo permit remains available and the other VoxCPM2 requests wait.
+        # MiMo remains independent, while the fifth VoxCPM2 request waits for
+        # one of the four shared local chapter permits.
         assert state.worker_resource_semaphores["mimo"].acquire(blocking=False)
         state.worker_resource_semaphores["mimo"].release()
         time.sleep(0.05)
-        assert maximum == 1
-        assert len(environments) == 1
+        assert maximum == 4
+        assert len(environments) == 4
     finally:
         release.set()
         for thread in threads:
@@ -1552,8 +1568,8 @@ def test_direct_voxcpm2_tts_requests_use_the_single_local_voxcpm_resource(
         state.close()
 
     assert all(not thread.is_alive() for thread in threads)
-    assert maximum == 1
-    assert len(environments) == 3
+    assert maximum == 4
+    assert len(environments) == 5
 
 
 def test_batch_generation_persists_stage_and_chapter_durations(tmp_path: Path, monkeypatch):

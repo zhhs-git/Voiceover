@@ -244,6 +244,9 @@ _MAX_LLM_WORKERS = 2
 # Whisper and Stable Audio share unified memory. Four total local model jobs
 # are the highest production limit validated without memory pressure.
 _MAX_LOCAL_AUDIO_WORKERS = 4
+# VoxCPM2 chapter runners share one MPS device. Four whole-chapter processes
+# are the highest validated setting; callers may lower this at startup.
+_MAX_VOXCPM_WORKERS = 4
 _MAX_MIX_WORKERS = 2
 
 
@@ -285,7 +288,7 @@ class BatchConcurrencyConfig:
     llm_workers: int = _MAX_LLM_WORKERS
     local_audio_workers: int = _MAX_LOCAL_AUDIO_WORKERS
     mix_workers: int = _MAX_MIX_WORKERS
-    voxcpm_workers: int = 1
+    voxcpm_workers: int = _MAX_VOXCPM_WORKERS
 
     @classmethod
     def from_environment(cls) -> "BatchConcurrencyConfig":
@@ -311,9 +314,11 @@ class BatchConcurrencyConfig:
                 default=_MAX_MIX_WORKERS,
                 maximum=_MAX_MIX_WORKERS,
             ),
-            # VoxCPM2 keeps a multi-gigabyte model resident.  It is always a
-            # single host resource, regardless of user environment settings.
-            voxcpm_workers=1,
+            voxcpm_workers=_safe_concurrency_setting(
+                "AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY",
+                default=_MAX_VOXCPM_WORKERS,
+                maximum=_MAX_VOXCPM_WORKERS,
+            ),
         )
 
     @property
