@@ -228,9 +228,16 @@ AUDIOBOOK_LLM_API_KEY=
 
 VoxCPM2 不是仓库依赖自动下载的服务。主机必须提供 `data/voxcpm2/.venv` 和
 `data/voxcpm2/models/VoxCPM2`；这些模型权重和虚拟环境被 Git 忽略，不应提交到仓库。
-默认最多允许四个 VoxCPM2 章节同时占用本地模型资源；每个章节只启动一个 runner，
-模型在章节内加载一次并按源顺序合成片段，以控制内存占用和保持稳定参考音色。批量和
-直接 TTS 请求共用这四个资源位。
+默认最多允许四个 VoxCPM2 章节客户端同时提交工作，但它们共用一个按需启动的常驻
+本地模型服务，而不是每章各加载一份模型。服务会在角色参考音色就绪后，跨章节挑选
+长度相近的独立片段做真实张量 batch；每个章节仍按原始片段顺序写入缓存、组装时间线
+和最终音频。批量与直接 TTS 请求共用这四个客户端资源位。
+
+服务只在首个本地 VoxCPM2 请求到来时启动，默认空闲 300 秒后释放模型。为了避免在
+MPS 统一内存上盲目放大 batch，`AUDIOBOOK_VOXCPM_BATCH_SIZE=auto` 在没有匹配版本的
+本机基准选择文件时始终使用 `1`；只有 B=2 或 B=4 同时通过 WAV、时间线、混音和内存
+校验，并且吞吐至少比 B=1 提高 3% 后，`auto` 才会采用该值。需要排障时可显式设为 `1`
+恢复为单条推理。
 
 VoxCPM2 的固定音色与片段演绎提示词、语言选择和缓存版本详见
 [VoxCPM2 Prompting Contract](docs/design/voxcpm2-prompting.md)。
@@ -264,9 +271,9 @@ MiMo 是不可提高的**全服务单请求通道**：参考音色、章节片�
 非 MiMo 阶段运行，以保证下一章不会被后续阶段饿死。LLM 最多 2 个、Whisper 与
 Stable Audio 共用最多 4 个本地音频模型进程，且两类任务合计不会超过 4 个；原章节组装/
 最终混音/MP3 最多 2 个。资源等待不会占用批量 worker。该上限来自本机压测的稳定档位，
-而不是曾触发内存压力的 8 路组合。VoxCPM2 另有最多 4 路的独立本地模型资源位；
-每路对应一个完整章节 runner，不能把同一章节拆成多个 runner。角色参考 WAV 和元数据
-仍由跨进程文件锁保护，避免同时创建时损坏或漂移。
+而不是曾触发内存压力的 8 路组合。VoxCPM2 另有最多 4 路章节客户端资源位；它们始终
+共享一份常驻本地模型，服务只会对互相独立的片段进行张量 batch，不会把整章文字拼成
+一条请求。角色参考 WAV 和元数据仍由跨进程文件锁保护，避免同时创建时损坏或漂移。
 
 ```bash
 export AUDIOBOOK_BATCH_WORKER_CONCURRENCY="5"  # 1–5，默认 5：批量阶段 worker 上限
@@ -275,7 +282,9 @@ export AUDIOBOOK_MIMO_CONCURRENCY="1"          # 兼容字段；实际始终强�
 export AUDIOBOOK_MIMO_RPM="80"                  # 1–80，默认 80：MiMo 全局请求启动预算
 export AUDIOBOOK_LLM_WORKER_CONCURRENCY="2"    # 1–2，默认 2：分析/音频规划 LLM
 export AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY="4"  # 1–4：Whisper + Stable Audio 合计
-export AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY="4"  # 1–4，默认 4：VoxCPM2 章节 runner
+export AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY="4"  # 1–4，默认 4：VoxCPM2 章节客户端
+export AUDIOBOOK_VOXCPM_BATCH_SIZE="auto"       # auto、1、2 或 4；auto 未基准验证时固定为 1
+export AUDIOBOOK_VOXCPM_IDLE_SECONDS="300"      # 0–3600：最后一个本地请求完成后的模型保温秒数
 export AUDIOBOOK_MIX_WORKER_CONCURRENCY="2"    # 1–2，默认 2：最终混音、转 MP3
 export AUDIOBOOK_MIMO_MAX_ATTEMPTS="3"          # 单个网络请求最多尝试次数，1–5
 export AUDIOBOOK_MIMO_RETRY_BACKOFF_SECONDS="0.75"  # 重试的指数退避基准秒数

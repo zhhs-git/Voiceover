@@ -38,7 +38,7 @@ script, a small deterministic English fallback retains recognizable gender,
 age, timbre, resonance, and diction anchors; the stored `voiceDesign` is not
 changed.
 
-The isolated runner sends exactly this effective profile text to VoxCPM2:
+隔离的常驻本地服务会为每个参考音色发送以下有效 profile 文本给 VoxCPM2：
 
 ```text
 (<profileControl>)<referenceText>
@@ -113,23 +113,31 @@ Examples:
 
 ## Runner and Cache Contract
 
-`promptFormatVersion = 2` remains part of every local runner request, profile
-sidecar, and VoxCPM2 segment cache signature. `profileLoudness = v1` is a
-separate local-only cache contract: it is included in local profile and segment
-signatures, and is required in local profile sidecars. Old unnormalized local
-profiles and dependent segment WAVs therefore miss on their next original
-chapter regeneration. MiMo signature bytes and request structure are unchanged,
-and already completed chapter/final audio is never rewritten in place.
+`promptFormatVersion = 2` remains part of every local service request, profile
+sidecar, and VoxCPM2 segment cache signature. `profileLoudness = v1` and the
+batch-adapter version are separate local-only cache contracts: both are included
+in local segment signatures, while profile loudness is required in local profile
+sidecars. Old local segment WAVs therefore miss once after an incompatible
+adapter change. MiMo signature bytes and request structure are unchanged, and
+already completed chapter/final audio is never rewritten in place.
 
-One chapter still makes one isolated runner request. That process loads
-VoxCPM2 once and synthesizes uncached segments serially in source order. The
-model parameters remain `cfg_value=2.0` and `inference_timesteps=10`.
+The web server admits up to four whole-chapter VoxCPM2 clients, but those
+clients share one lazily started isolated service and exactly one loaded model.
+After profile preparation, the service can form a true padded tensor batch from
+independent, length-compatible segments belonging to different chapters. It
+keeps a stable segment ID, source position, source segment IDs, reference WAV,
+delivery control and cache signature for every item; the CLI alone preserves
+source-order cache sidecars, chapter assembly and timeline records. It never
+concatenates whole chapters or relies on completion order for playback.
 
-Independent chapters may run concurrently. The web server's shared `voxcpm`
-resource admits up to four whole-chapter runners by default, and both batch and
-direct TTS requests use the same gate. `AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY`
-can lower the capacity to 1--3 for a memory-constrained host, but values above
-four are clamped. Segment-level parallelism is intentionally unsupported.
+`AUDIOBOOK_VOXCPM_BATCH_SIZE` accepts `auto`, `1`, `2` or `4`. `auto` is
+deliberately `1` until the representative local benchmark has selected a
+matching adapter version; a larger value is selected only after valid WAV,
+timeline and final-mix checks, no new memory pressure, and at least a 3% B=1
+throughput improvement. `AUDIOBOOK_VOXCPM_IDLE_SECONDS` defaults to `300` and
+releases the idle service in `0..3600` seconds. Explicit `1` remains the safe
+operational rollback. The model parameters remain `cfg_value=2.0` and
+`inference_timesteps=10`.
 
 ## Why Controllable Cloning
 

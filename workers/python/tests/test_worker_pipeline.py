@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,11 +7,15 @@ from pathlib import Path
 def run_worker(command: str, input_payload: dict, tmp_path: Path) -> dict:
     input_path = tmp_path / f"{command}.input.json"
     output_path = tmp_path / f"{command}.output.json"
-    input_path.write_text(json.dumps(input_payload), encoding="utf-8")
+    payload = dict(input_payload)
+    if command in {"analyze_chapter", "apply_corrections"}:
+        # Tests must never reach the user's project .env or configured LLM.
+        # This is the same explicit request-level mock switch used by the CLI.
+        payload["mockLlm"] = True
+    input_path.write_text(json.dumps(payload), encoding="utf-8")
     result = subprocess.run(
         [sys.executable, "-m", "audiobook_worker.cli", command, str(input_path), str(output_path)],
         cwd=Path(__file__).resolve().parents[1],
-        env={**os.environ, "AUDIOBOOK_LLM_MODEL": "mock"},
         text=True,
         capture_output=True,
         check=False,
