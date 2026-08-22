@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 
 from audiobook_worker.audio_asset_ids import normalize_audio_plan_asset_ids
 from audiobook_worker.dialogue import resolve_text_language, segment_dialogue
+from audiobook_worker.llm_env import read_llm_environment
 
 
 @dataclass(frozen=True)
@@ -772,7 +773,7 @@ def _decode_model_json(content: Any) -> dict[str, Any]:
 
 def default_analyzer(model_id: str | None = None):
     """Build the configured analyzer, optionally overriding the process default."""
-    model_override = model_id or os.environ.get("AUDIOBOOK_LLM_MODEL")
+    model_override = model_id or read_llm_environment().model_id
     if model_override == "mock":
         return MockLLMAnalyzer()
     resolved = resolve_model(model_override)
@@ -783,22 +784,88 @@ def default_analyzer(model_id: str | None = None):
 
 
 def resolve_model(model_arg: str | None = None) -> ResolvedModel | None:
-    config = read_models_json()
+    environment = read_llm_environment()
+    try:
+        config = read_models_json()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # A project-local endpoint must stay usable even if an optional legacy
+        # catalog was manually edited into invalid JSON.
+        config = None
+    if environment.base_url:
+        selected_model = model_arg or environment.model_id
+        if not selected_model and isinstance(config, dict):
+            selected_model = str(config.get("default") or "").strip()
+        if not selected_model:
+            selected_model = "gpt-4o"
+        metadata = _catalog_model_details(config, selected_model)
+        provider = str(metadata.get("provider") or "env")
+        provider_config = metadata.get("providerConfig")
+        model_entry = metadata.get("model")
+        if not isinstance(provider_config, dict):
+            provider_config = {}
+        if not isinstance(model_entry, dict):
+            model_entry = {}
+        return ResolvedModel(
+            provider=provider,
+            model_id=selected_model,
+            base_url=environment.base_url,
+            api_key=environment.api_key or "unused",
+            api=str(provider_config.get("api") or "openai-completions"),
+            family=str(provider_config.get("family") or "default"),
+            max_tokens=int(model_entry.get("maxTokens", 8192)),
+            supports_response_format=bool(
+                model_entry.get(
+                    "supportsResponseFormat",
+                    provider_config.get("supportsResponseFormat", False),
+                )
+            ),
+        )
     if config is not None:
         return resolve_model_from_config(config, model_arg)
 
-    base_url = os.environ.get("MODEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+    base_url = environment.base_url
     if not base_url:
         return None
     return ResolvedModel(
         provider="env",
-        model_id=os.environ.get("MODEL_ID") or os.environ.get("OPENAI_MODEL") or "gpt-4o",
+        model_id=environment.model_id or "gpt-4o",
         base_url=base_url,
-        api_key=os.environ.get("MODEL_API_KEY") or os.environ.get("OPENAI_API_KEY") or "unused",
+        api_key=environment.api_key or "unused",
         api="openai-completions",
         family="default",
         max_tokens=8192,
     )
+
+
+def _catalog_model_details(
+    config: dict[str, Any] | None,
+    model_id: str,
+) -> dict[str, Any]:
+    """Find optional metadata without allowing catalog URLs/keys to win."""
+
+    if not isinstance(config, dict):
+        return {}
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return {}
+    for provider, raw_provider in providers.items():
+        if not isinstance(raw_provider, dict):
+            continue
+        models = raw_provider.get("models", [])
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            raw_id = str(model.get("id") or "").strip()
+            candidates = {raw_id, f"{provider}/{raw_id}"}
+            if model_id in candidates:
+                return {
+                    "provider": str(provider),
+                    "providerConfig": raw_provider,
+                    "model": model,
+                }
+    return {}
 
 
 def read_models_json(paths: list[Path] | None = None) -> dict[str, Any] | None:

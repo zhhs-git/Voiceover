@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from audiobook_worker import llm as llm_module
 from audiobook_worker.llm import (
     AudioScenePlan,
     AudioPlanningRequest,
@@ -18,9 +19,11 @@ from audiobook_worker.llm import (
     analyzer_from_models_config,
     ensure_audio_music_coverage,
     normalize_audio_plan_anchors,
+    resolve_model,
     resolve_model_from_config,
     select_active_audio_characters,
 )
+from audiobook_worker.llm_env import LlmEnvironment
 
 
 def test_mock_adapter_returns_characters_speaker_emotion_and_confidence():
@@ -384,6 +387,68 @@ def test_resolves_default_deepseek_model_from_pi_models_config():
     assert resolved.api_key == "test-key"
     assert resolved.max_tokens == 384000
     assert resolved.supports_response_format is False
+
+
+def test_project_llm_environment_overrides_legacy_provider_url_and_key(monkeypatch):
+    monkeypatch.setattr(
+        llm_module,
+        "read_models_json",
+        lambda: {
+            "default": "legacy/legacy-model",
+            "providers": {
+                "legacy": {
+                    "baseUrl": "https://legacy.example/v1",
+                    "apiKey": "legacy-secret",
+                    "family": "legacy",
+                    "models": [{"id": "legacy-model", "maxTokens": 4096}],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        llm_module,
+        "read_llm_environment",
+        lambda: LlmEnvironment(
+            model_id="provider/project-model",
+            base_url="https://project.example/v1",
+            api_key="project-secret",
+        ),
+    )
+
+    resolved = resolve_model()
+
+    assert resolved is not None
+    assert resolved.model_id == "provider/project-model"
+    assert resolved.base_url == "https://project.example/v1"
+    assert resolved.api_key == "project-secret"
+    assert resolved.provider == "env"
+
+
+def test_project_llm_environment_does_not_depend_on_a_valid_legacy_catalog(monkeypatch):
+    def broken_catalog():
+        raise json.JSONDecodeError("bad catalog", "{", 1)
+
+    monkeypatch.setattr(
+        llm_module,
+        "read_models_json",
+        broken_catalog,
+    )
+    monkeypatch.setattr(
+        llm_module,
+        "read_llm_environment",
+        lambda: LlmEnvironment(
+            model_id="provider/project-model",
+            base_url="https://project.example/v1",
+            api_key="project-secret",
+        ),
+    )
+
+    resolved = resolve_model()
+
+    assert resolved is not None
+    assert resolved.model_id == "provider/project-model"
+    assert resolved.base_url == "https://project.example/v1"
+    assert resolved.api_key == "project-secret"
 
 
 def test_can_switch_between_deepseek_pro_and_flash_models_from_config():

@@ -11,17 +11,23 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from audiobook_worker.llm import read_models_json
+from audiobook_worker.llm_env import (
+    project_root,
+    read_llm_environment,
+    validate_llm_base_url,
+    validate_llm_model_id,
+)
 
 
 DEFAULT_TTS_BACKEND = "mimo"
 DEFAULT_TTS_MODEL_ID = "mimo-v2.5-tts-voiceclone"
 VOXCPM2_BACKEND = "voxcpm2"
 VOXCPM2_MODEL_ID = "VoxCPM2"
-MODEL_SETTINGS_VERSION = 1
+MODEL_SETTINGS_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -51,12 +57,6 @@ class ModelSettings:
         return cls(llm_model_id, tts_backend, tts_model_id)
 
 
-def project_root() -> Path:
-    """Locate the repository root without depending on the current directory."""
-
-    return Path(__file__).resolve().parents[3]
-
-
 def voxcpm2_paths(root: Path | None = None) -> dict[str, Path]:
     configured = os.environ.get("AUDIOBOOK_VOXCPM2_ROOT", "").strip()
     base = (
@@ -82,7 +82,51 @@ def _safe_model_id(provider: str, model_id: object) -> str:
     return value if value.startswith(prefix) else f"{prefix}{value}"
 
 
-def discover_llm_options() -> list[dict[str, object]]:
+def _legacy_provider_config(model_id: str, root: Path | None = None) -> dict[str, object]:
+    """Return catalog metadata for compatibility without projecting secrets."""
+
+    del root  # The legacy catalog remains user-home scoped by design.
+    try:
+        config = read_models_json()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(config, dict) or not isinstance(config.get("providers"), dict):
+        return {}
+    for provider, raw_provider in config["providers"].items():
+        if not isinstance(raw_provider, dict) or not isinstance(raw_provider.get("models"), list):
+            continue
+        for raw_model in raw_provider["models"]:
+            if not isinstance(raw_model, dict):
+                continue
+            raw_id = str(raw_model.get("id") or "").strip()
+            if model_id in {raw_id, _safe_model_id(str(provider), raw_id)}:
+                return raw_provider
+    return {}
+
+
+def legacy_llm_base_url(model_id: str, root: Path | None = None) -> str:
+    candidate = str(_legacy_provider_config(model_id, root).get("baseUrl") or "").strip()
+    if not candidate:
+        return ""
+    try:
+        return validate_llm_base_url(candidate)
+    except ValueError:
+        # A legacy catalog may contain an endpoint with embedded credentials.
+        # Do not project it to the browser; the resolver still owns legacy
+        # compatibility for actual requests.
+        return ""
+
+
+def legacy_llm_api_key(model_id: str, root: Path | None = None) -> str:
+    provider = _legacy_provider_config(model_id, root)
+    inline = str(provider.get("apiKey") or "").strip()
+    if inline:
+        return inline
+    environment_name = str(provider.get("apiKeyEnv") or "").strip()
+    return str(os.environ.get(environment_name) or "").strip() if environment_name else ""
+
+
+def discover_llm_options(root: Path | None = None) -> list[dict[str, object]]:
     """Return safe LLM choices from the existing local Pi model config."""
 
     options: list[dict[str, object]] = []
@@ -127,11 +171,7 @@ def discover_llm_options() -> list[dict[str, object]]:
     # Config-free installations can still use the legacy environment-backed
     # resolver.  Present that model as a safe choice without exposing its URL
     # or the name/value of its credential environment variable.
-    env_model = (
-        os.environ.get("AUDIOBOOK_LLM_MODEL")
-        or os.environ.get("MODEL_ID")
-        or os.environ.get("OPENAI_MODEL")
-    )
+    env_model = read_llm_environment(root).model_id
     if env_model and env_model != "mock" and env_model not in seen:
         options.append(
             {
@@ -157,8 +197,8 @@ def discover_llm_options() -> list[dict[str, object]]:
     return options
 
 
-def default_llm_model_id() -> str:
-    configured = os.environ.get("AUDIOBOOK_LLM_MODEL", "").strip()
+def default_llm_model_id(root: Path | None = None) -> str:
+    configured = read_llm_environment(root).model_id
     if configured:
         return configured
     try:
@@ -181,7 +221,7 @@ def default_llm_model_id() -> str:
                         model_id = _safe_model_id(str(provider), first.get("id"))
                         if model_id:
                             return model_id
-    return os.environ.get("MODEL_ID") or os.environ.get("OPENAI_MODEL") or "mock"
+    return read_llm_environment(root).model_id or "mock"
 
 
 def probe_voxcpm2(root: Path | None = None) -> dict[str, object]:
@@ -259,12 +299,20 @@ def normalize_settings(
     *,
     root: Path | None = None,
     require_available_tts: bool = True,
+    llm_base_url: str | None = None,
 ) -> ModelSettings:
     raw = ModelSettings.from_value(value)
     if raw is None:
         raise ValueError("模型配置必须包含 llmModelId、ttsBackend 和 ttsModelId。")
-    llm_ids = {str(item["id"]) for item in discover_llm_options()}
-    if raw.llm_model_id not in llm_ids:
+    validate_llm_model_id(raw.llm_model_id)
+    llm_ids = {str(item["id"]) for item in discover_llm_options(root)}
+    configured_base_url = str(llm_base_url or read_llm_environment(root).base_url).strip()
+    if configured_base_url:
+        try:
+            validate_llm_base_url(configured_base_url)
+        except ValueError:
+            configured_base_url = ""
+    if raw.llm_model_id not in llm_ids and not configured_base_url:
         raise ValueError(f"LLM 模型不可用或不存在：{raw.llm_model_id}")
     if raw.tts_backend == DEFAULT_TTS_BACKEND:
         if raw.tts_model_id != DEFAULT_TTS_MODEL_ID:
@@ -281,9 +329,13 @@ def normalize_settings(
 
 
 def legacy_default_settings(root: Path | None = None) -> ModelSettings:
-    llm_id = default_llm_model_id()
+    llm_id = default_llm_model_id(root)
     # A stale environment value should not prevent the service from starting.
-    if llm_id not in {str(item["id"]) for item in discover_llm_options()}:
+    environment = read_llm_environment(root)
+    if (
+        llm_id not in {str(item["id"]) for item in discover_llm_options(root)}
+        and not environment.base_url
+    ):
         llm_id = "mock"
     return ModelSettings(llm_model_id=llm_id)
 
@@ -295,15 +347,46 @@ def effective_settings(
 ) -> ModelSettings:
     fallback = legacy_default_settings(root)
     try:
-        return normalize_settings(stored_value, root=root)
+        normalized = normalize_settings(stored_value, root=root)
     except ValueError:
         return fallback
+    environment = read_llm_environment(root)
+    if environment.model_id and (
+        environment.model_id in {str(item["id"]) for item in discover_llm_options(root)}
+        or environment.base_url
+    ):
+        return replace(normalized, llm_model_id=environment.model_id)
+    return normalized
 
 
 def settings_payload(settings: ModelSettings, *, root: Path | None = None) -> dict[str, object]:
+    environment = read_llm_environment(root)
+    if environment.base_url:
+        try:
+            base_url = validate_llm_base_url(environment.base_url)
+        except ValueError:
+            # Do not ever project a manually edited credential-bearing or
+            # malformed project URL. Returning a blank field lets the user
+            # replace it through the validated settings endpoint.
+            base_url = ""
+    else:
+        base_url = legacy_llm_base_url(settings.llm_model_id, root)
+    # A project endpoint deliberately owns its credential boundary.  Once it
+    # exists, an explicit clear must not make a legacy catalog key appear
+    # configured or silently re-enter the project setting on a later save.
+    api_key_configured = (
+        environment.api_key_configured
+        if environment.base_url
+        else environment.api_key_configured or bool(legacy_llm_api_key(settings.llm_model_id, root))
+    )
     return {
         "version": MODEL_SETTINGS_VERSION,
         "current": settings.to_dict(),
-        "llmOptions": discover_llm_options(),
+        "llmConfig": {
+            "modelId": settings.llm_model_id,
+            "baseUrl": base_url,
+            "apiKeyConfigured": api_key_configured,
+        },
+        "llmOptions": discover_llm_options(root),
         "ttsOptions": tts_options(root),
     }

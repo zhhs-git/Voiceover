@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   getModelSettings,
+  type LlmProviderConfigUpdate,
   type ModelSettings,
   type ModelSettingsPayload,
   type TtsBackendId,
@@ -16,9 +17,19 @@ function initialDraft(payload: ModelSettingsPayload): ModelSettings {
   return { ...payload.current };
 }
 
+function initialLlmDraft(payload: ModelSettingsPayload): LlmProviderConfigUpdate {
+  return {
+    modelId: payload.llmConfig.modelId || payload.current.llmModelId,
+    baseUrl: payload.llmConfig.baseUrl,
+    apiKey: "",
+    clearApiKey: false,
+  };
+}
+
 export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
   const [payload, setPayload] = useState<ModelSettingsPayload | null>(null);
   const [draft, setDraft] = useState<ModelSettings | null>(null);
+  const [llmDraft, setLlmDraft] = useState<LlmProviderConfigUpdate | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -31,6 +42,7 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
         if (cancelled) return;
         setPayload(next);
         setDraft(initialDraft(next));
+        setLlmDraft(initialLlmDraft(next));
         setError(null);
       })
       .catch((loadError) => {
@@ -48,16 +60,38 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
     () => payload?.ttsOptions.find((option) => option.id === draft?.ttsBackend),
     [draft?.ttsBackend, payload?.ttsOptions],
   );
+  const selectedLlmIsCatalogued = useMemo(
+    () => payload?.llmOptions.some((option) => option.id === llmDraft?.modelId) ?? false,
+    [llmDraft?.modelId, payload?.llmOptions],
+  );
+
+  function markDirty() {
+    setSaved(false);
+    setError(null);
+  }
 
   async function save() {
-    if (!draft || isSaving) return;
+    if (!draft || !llmDraft || isSaving) return;
     setIsSaving(true);
     setSaved(false);
     setError(null);
     try {
-      const next = await updateModelSettings(draft);
+      const apiKey = llmDraft.apiKey?.trim();
+      const providerUpdate = {
+        modelId: llmDraft.modelId,
+        baseUrl: llmDraft.baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        ...(llmDraft.clearApiKey ? { clearApiKey: true } : {}),
+      };
+      const next = await updateModelSettings(
+        draft,
+        llmDraft.baseUrl.trim() || apiKey || llmDraft.clearApiKey
+          ? providerUpdate
+          : undefined,
+      );
       setPayload(next);
       setDraft(initialDraft(next));
+      setLlmDraft(initialLlmDraft(next));
       setSaved(true);
       onSaved?.(next);
     } catch (saveError) {
@@ -71,7 +105,7 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
     return <section className="model-settings-panel" aria-label="模型配置">正在读取模型配置…</section>;
   }
 
-  if (!payload || !draft) {
+  if (!payload || !draft || !llmDraft) {
     return (
       <section className="model-settings-panel" aria-label="模型配置">
         <p className="model-settings-error" role="alert">{error || "模型配置不可用。"}</p>
@@ -84,7 +118,7 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
       <header className="model-settings-header">
         <div>
           <h2>模型配置</h2>
-          <p>当前设置</p>
+          <p>LLM 连接配置保存在本项目 .env；API Key 仅可写入，页面不会显示已保存内容。</p>
         </div>
       </header>
 
@@ -93,23 +127,109 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
           <span>分析模型</span>
           <select
             aria-label="分析模型"
-            value={draft.llmModelId}
+            value={llmDraft.modelId}
             onChange={(event) => {
-              setSaved(false);
+              markDirty();
               setDraft((current) => current && {
                 ...current,
                 llmModelId: event.target.value,
               });
+              setLlmDraft((current) => current && {
+                ...current,
+                modelId: event.target.value,
+              });
             }}
             disabled={isSaving}
           >
+            {!selectedLlmIsCatalogued && llmDraft.modelId && (
+              <option value={llmDraft.modelId}>自定义：{llmDraft.modelId}</option>
+            )}
             {payload.llmOptions.map((option) => (
               <option key={option.id} value={option.id} disabled={!option.available}>
-                {option.displayName}
+                {option.displayName}{option.available ? "" : "（不可用）"}
               </option>
             ))}
           </select>
         </label>
+
+        <label className="model-settings-field">
+          <span>分析模型 ID</span>
+          <input
+            aria-label="分析模型 ID"
+            value={llmDraft.modelId}
+            onChange={(event) => {
+              markDirty();
+              const modelId = event.target.value;
+              setDraft((current) => current && { ...current, llmModelId: modelId });
+              setLlmDraft((current) => current && { ...current, modelId });
+            }}
+            disabled={isSaving}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+
+        <label className="model-settings-field model-settings-field-wide">
+          <span>LLM 服务 URL</span>
+          <input
+            aria-label="LLM 服务 URL"
+            type="url"
+            value={llmDraft.baseUrl}
+            onChange={(event) => {
+              markDirty();
+              setLlmDraft((current) => current && {
+                ...current,
+                baseUrl: event.target.value,
+              });
+            }}
+            disabled={isSaving}
+            autoComplete="url"
+            spellCheck={false}
+            placeholder="https://api.example.com/v1"
+          />
+        </label>
+
+        <div className="model-settings-field model-settings-field-wide">
+          <label htmlFor="llm-api-key">LLM API Key</label>
+          <input
+            id="llm-api-key"
+            aria-label="LLM API Key"
+            type="password"
+            value={llmDraft.apiKey || ""}
+            onChange={(event) => {
+              markDirty();
+              setLlmDraft((current) => current && {
+                ...current,
+                apiKey: event.target.value,
+                clearApiKey: false,
+              });
+            }}
+            disabled={isSaving || llmDraft.clearApiKey}
+            autoComplete="new-password"
+            spellCheck={false}
+            placeholder={payload.llmConfig.apiKeyConfigured ? "已配置；留空则保持不变" : "输入后仅写入本机 .env"}
+          />
+          <small className="model-settings-key-status" aria-live="polite">
+            API Key：{payload.llmConfig.apiKeyConfigured ? "已配置" : "未配置"}
+          </small>
+          <label className="model-settings-checkbox">
+            <input
+              aria-label="清除已保存的 API Key"
+              type="checkbox"
+              checked={Boolean(llmDraft.clearApiKey)}
+              onChange={(event) => {
+                markDirty();
+                setLlmDraft((current) => current && {
+                  ...current,
+                  apiKey: "",
+                  clearApiKey: event.target.checked,
+                });
+              }}
+              disabled={isSaving || !payload.llmConfig.apiKeyConfigured}
+            />
+            <span>清除已保存的 API Key</span>
+          </label>
+        </div>
 
         <label className="model-settings-field">
           <span>配音模型</span>
@@ -120,7 +240,7 @@ export function ModelSettingsPanel({ onSaved }: ModelSettingsPanelProps) {
               const backend = event.target.value as TtsBackendId;
               const option = payload.ttsOptions.find((item) => item.id === backend);
               if (!option || !option.available) return;
-              setSaved(false);
+              markDirty();
               setDraft((current) => current && {
                 ...current,
                 ttsBackend: backend,

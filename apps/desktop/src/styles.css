@@ -1862,7 +1862,7 @@ aside.chapter-list .chapter-title {
 /* Model selection is a durable server setting, so keep its controls compact
    and make unavailable local backends explain their prerequisite clearly. */
 .model-settings-panel {
-  width: min(720px, 100%);
+  width: min(760px, 100%);
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -1912,7 +1912,8 @@ aside.chapter-list .chapter-title {
   font-weight: 600;
 }
 
-.model-settings-field select {
+.model-settings-field select,
+.model-settings-field input:not([type="checkbox"]) {
   width: 100%;
   min-height: 36px;
   padding: 7px 9px;
@@ -1921,6 +1922,36 @@ aside.chapter-list .chapter-title {
   color: var(--text-primary);
   background: var(--bg-surface);
   font-weight: 400;
+}
+
+.model-settings-field-wide {
+  grid-column: 1 / -1;
+}
+
+.model-settings-key-status {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.model-settings-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.model-settings-checkbox input {
+  margin: 0;
+}
+
+.model-settings-checkbox:has(input:disabled) {
+  color: var(--text-muted);
+  cursor: not-allowed;
 }
 
 .model-settings-diagnostics {

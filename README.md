@@ -167,24 +167,30 @@ ln -s "$(git rev-parse --show-toplevel)/scripts/Audiobook-Generator.command" "$H
 
 ## 模型配置和密钥
 
-处理程序会从主机用户目录中查找 OpenAI 兼容模型配置：
+网页的“模型配置”页签可以直接配置 OpenAI 兼容的 LLM 模型 ID、服务 URL 和 API Key。
+保存后会将下列值写入项目根目录的 `.env`（Git 已忽略该文件，写入权限会收紧为仅当前用户可读写）：
+
+```env
+AUDIOBOOK_LLM_MODEL=provider/model-id
+AUDIOBOOK_LLM_BASE_URL=https://api.example.com/v1
+AUDIOBOOK_LLM_API_KEY=
+```
+
+可从 [`.env.example`](.env.example) 复制该模板。API Key 是仅写字段：读取网页配置时只会返回“是否已配置”，不会返回完整值、掩码值，也不会写入 SQLite 或批量任务快照。将输入框留空会保留原有密钥；需要移除时，请勾选“清除已保存的 API Key”。
+
+项目 `.env` 中的 URL 和 Key 会优先于旧配置生效。每次保存会立刻更新网页服务进程环境，之后启动的分析/音频规划 worker 会使用新配置；服务重启后也会从项目 `.env` 重新读取。
+
+为兼容现有安装，未配置项目 `.env` 时，处理程序仍会从主机用户目录读取模型目录与旧提供方配置：
 
 - `~/.pi/agent/models.json`
 - `~/.pi/models.json`
 
-可以通过 `AUDIOBOOK_LLM_MODEL` 选择已配置的模型，例如：
-
-```bash
-export AUDIOBOOK_LLM_MODEL="deepseek/deepseek-v4-flash"
-```
-
-实际默认模型取自模型配置中的 `default` 项，网页界面不会硬编码默认模型。
-如果找不到可用的模型配置，处理程序会使用确定性的 mock 分析器，便于测试流水线。
+这两个文件现在仅作为模型目录、模型元数据和旧安装回退来源；新的 URL/Key 应通过网页或项目 `.env` 保存，而非继续写入用户级 `models.json`。如果找不到可用的模型配置，处理程序会使用确定性的 mock 分析器，便于测试流水线。
 
 为兼容不同的 OpenAI 兼容网关，分析请求默认不发送 `response_format`，而是由提示词和本地 JSON 解析器约束结构化输出。只有确认某个网关支持 JSON mode 时，才在提供方或模型条目中设置
 `"supportsResponseFormat": true`。
 
-不要把 API Key 写入仓库。建议在模型配置中使用环境变量引用，而不是直接写入密钥：
+不要把 API Key 写入仓库。`.env`、`.env.*` 和常见凭据文件已经被 Git 忽略；不要手工将 `.env` 添加到提交中。旧的 `models.json` 结构仍可供历史安装回退：
 
 ```json
 {

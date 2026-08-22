@@ -1,9 +1,14 @@
 import json
+import os
+import sqlite3
+import stat
 import threading
 import time
 import wave
 import zipfile
 from pathlib import Path
+
+import pytest
 
 from audiobook_worker.web_server import (
     BatchConcurrencyConfig,
@@ -15,6 +20,34 @@ from audiobook_worker.web_server import (
     safe_filename,
 )
 from audiobook_worker import model_settings as model_settings_module
+
+
+_PROVIDER_ENVIRONMENT_NAMES = (
+    "AUDIOBOOK_LLM_MODEL",
+    "AUDIOBOOK_LLM_BASE_URL",
+    "AUDIOBOOK_LLM_API_KEY",
+    "MODEL_ID",
+    "MODEL_BASE_URL",
+    "MODEL_API_KEY",
+    "OPENAI_MODEL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_provider_environment():
+    previous = {name: os.environ.get(name) for name in _PROVIDER_ENVIRONMENT_NAMES}
+    for name in _PROVIDER_ENVIRONMENT_NAMES:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _write_wav(path: Path) -> None:
@@ -112,7 +145,7 @@ def test_web_state_uses_shared_sqlite_and_book_directories(tmp_path: Path):
     ) == {"ok": True}
 
 
-def test_model_settings_payload_projects_only_safe_llm_metadata(
+def test_model_settings_payload_projects_safe_provider_config_without_secret(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.delenv("AUDIOBOOK_LLM_MODEL", raising=False)
@@ -144,7 +177,8 @@ def test_model_settings_payload_projects_only_safe_llm_metadata(
         "probe_voxcpm2",
         lambda _root=None: _available_voxcpm2_capability(),
     )
-    state = ServerState(tmp_path)
+    configuration_root = tmp_path / "configuration"
+    state = ServerState(tmp_path, configuration_root=configuration_root)
 
     payload = state.model_settings_payload()
     serialized = json.dumps(payload, ensure_ascii=False)
@@ -170,15 +204,44 @@ def test_model_settings_payload_projects_only_safe_llm_metadata(
             "available": True,
         },
     ]
+    assert payload["llmConfig"] == {
+        "modelId": "openai/gpt-safe",
+        "baseUrl": "https://private.example/v1",
+        "apiKeyConfigured": True,
+    }
     for forbidden in (
         "super-secret-api-key",
         "another-secret",
-        "https://private.example/v1",
         "PRIVATE_API_KEY",
-        "apiKey",
         "token",
     ):
         assert forbidden not in serialized
+
+    cleared = state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "openai/gpt-safe",
+                "baseUrl": "https://private.example/v1",
+                "clearApiKey": True,
+            },
+        }
+    )
+    state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "openai/gpt-safe",
+                "baseUrl": "https://private.example/v1",
+            },
+        }
+    )
+    assert cleared["llmConfig"]["apiKeyConfigured"] is False
+    assert "AUDIOBOOK_LLM_API_KEY" not in (
+        configuration_root / ".env"
+    ).read_text(encoding="utf-8")
     state.close()
 
 
@@ -188,14 +251,14 @@ def test_model_settings_persist_and_invalid_update_keeps_last_valid_value(
     monkeypatch.setattr(
         model_settings_module,
         "discover_llm_options",
-        lambda: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
+        lambda _root=None: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
     )
     monkeypatch.setattr(
         model_settings_module,
         "probe_voxcpm2",
         lambda _root=None: _available_voxcpm2_capability(),
     )
-    state = ServerState(tmp_path)
+    state = ServerState(tmp_path, configuration_root=tmp_path / "configuration")
     saved = state.update_model_settings(
         {
             "llmModelId": "openai/gpt-first",
@@ -220,7 +283,7 @@ def test_model_settings_persist_and_invalid_update_keeps_last_valid_value(
     assert state.current_model_settings().to_dict() == saved["current"]
     state.close()
 
-    reopened = ServerState(tmp_path)
+    reopened = ServerState(tmp_path, configuration_root=tmp_path / "configuration")
     assert reopened.current_model_settings().to_dict() == saved["current"]
     reopened.close()
 
@@ -231,7 +294,7 @@ def test_model_settings_reject_unavailable_voxcpm2_without_replacing_current_val
     monkeypatch.setattr(
         model_settings_module,
         "discover_llm_options",
-        lambda: _available_llm_options("openai/gpt-safe"),
+        lambda _root=None: _available_llm_options("openai/gpt-safe"),
     )
     monkeypatch.setattr(
         model_settings_module,
@@ -242,7 +305,7 @@ def test_model_settings_reject_unavailable_voxcpm2_without_replacing_current_val
             "reason": "缺少 VoxCPM2 模型目录。",
         },
     )
-    state = ServerState(tmp_path)
+    state = ServerState(tmp_path, configuration_root=tmp_path / "configuration")
     previous = state.current_model_settings().to_dict()
 
     try:
@@ -259,6 +322,209 @@ def test_model_settings_reject_unavailable_voxcpm2_without_replacing_current_val
         raise AssertionError("an unavailable VoxCPM2 environment must be rejected")
 
     assert state.current_model_settings().to_dict() == previous
+    state.close()
+
+
+def test_model_settings_persists_provider_in_project_dotenv_without_exposing_key(
+    tmp_path: Path, monkeypatch
+):
+    for name in (
+        "AUDIOBOOK_LLM_MODEL",
+        "AUDIOBOOK_LLM_BASE_URL",
+        "AUDIOBOOK_LLM_API_KEY",
+        "MODEL_ID",
+        "MODEL_BASE_URL",
+        "MODEL_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda _root=None: _available_llm_options("openai/gpt-safe"),
+    )
+    configuration_root = tmp_path / "configuration"
+    configuration_root.mkdir()
+    dotenv = configuration_root / ".env"
+    dotenv.write_text("# Preserve this comment\nUNRELATED_VALUE=keep\n", encoding="utf-8")
+    state = ServerState(tmp_path / "data", configuration_root=configuration_root)
+
+    saved = state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "provider/custom-analysis-model",
+                "baseUrl": "https://gateway.example/v1/",
+                "apiKey": "test-provider-secret",
+            },
+        }
+    )
+
+    dotenv_text = dotenv.read_text(encoding="utf-8")
+    serialized_payload = json.dumps(saved, ensure_ascii=False)
+    with state.db_lock:
+        stored = str(
+            state.db.execute(
+                "SELECT value_json FROM app_settings WHERE key = 'model_settings'"
+            ).fetchone()["value_json"]
+        )
+    assert "# Preserve this comment" in dotenv_text
+    assert "UNRELATED_VALUE=keep" in dotenv_text
+    assert "AUDIOBOOK_LLM_MODEL=provider/custom-analysis-model" in dotenv_text
+    assert "AUDIOBOOK_LLM_BASE_URL=https://gateway.example/v1" in dotenv_text
+    assert "AUDIOBOOK_LLM_API_KEY=test-provider-secret" in dotenv_text
+    assert stat.S_IMODE(dotenv.stat().st_mode) == 0o600
+    assert saved["current"]["llmModelId"] == "provider/custom-analysis-model"
+    assert saved["llmConfig"] == {
+        "modelId": "provider/custom-analysis-model",
+        "baseUrl": "https://gateway.example/v1",
+        "apiKeyConfigured": True,
+    }
+    assert "test-provider-secret" not in serialized_payload
+    assert "test-provider-secret" not in stored
+    assert "apiKey\"" not in stored
+
+    retained = state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "provider/second-model",
+                "baseUrl": "https://gateway.example/v1",
+            },
+        }
+    )
+    assert "AUDIOBOOK_LLM_API_KEY=test-provider-secret" in dotenv.read_text(encoding="utf-8")
+    assert retained["llmConfig"]["apiKeyConfigured"] is True
+
+    cleared = state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "provider/second-model",
+                "baseUrl": "https://gateway.example/v1",
+                "clearApiKey": True,
+            },
+        }
+    )
+    assert "AUDIOBOOK_LLM_API_KEY" not in dotenv.read_text(encoding="utf-8")
+    assert cleared["llmConfig"]["apiKeyConfigured"] is False
+    assert "AUDIOBOOK_LLM_API_KEY" not in os.environ
+    state.close()
+
+
+def test_model_settings_does_not_project_an_invalid_manual_dotenv_url(tmp_path: Path):
+    configuration_root = tmp_path / "configuration"
+    configuration_root.mkdir()
+    (configuration_root / ".env").write_text(
+        "AUDIOBOOK_LLM_MODEL=provider/manual-model\n"
+        "AUDIOBOOK_LLM_BASE_URL=https://user:password@gateway.example/v1\n"
+        "AUDIOBOOK_LLM_API_KEY=manual-secret\n",
+        encoding="utf-8",
+    )
+    state = ServerState(tmp_path / "data", configuration_root=configuration_root)
+
+    serialized = json.dumps(state.model_settings_payload(), ensure_ascii=False)
+
+    assert "user:password" not in serialized
+    assert "manual-secret" not in serialized
+    assert '"baseUrl": ""' in serialized
+    state.close()
+
+
+def test_model_settings_rejects_invalid_provider_update_without_changing_dotenv(
+    tmp_path: Path, monkeypatch
+):
+    for name in (
+        "AUDIOBOOK_LLM_MODEL",
+        "AUDIOBOOK_LLM_BASE_URL",
+        "AUDIOBOOK_LLM_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda _root=None: _available_llm_options("openai/gpt-safe"),
+    )
+    configuration_root = tmp_path / "configuration"
+    state = ServerState(tmp_path / "data", configuration_root=configuration_root)
+    state.update_model_settings(
+        {
+            "ttsBackend": "mimo",
+            "ttsModelId": "mimo-v2.5-tts-voiceclone",
+            "llmConfig": {
+                "modelId": "provider/good-model",
+                "baseUrl": "https://gateway.example/v1",
+                "apiKey": "test-provider-secret",
+            },
+        }
+    )
+    dotenv = configuration_root / ".env"
+    before = dotenv.read_bytes()
+    previous = state.current_model_settings().to_dict()
+
+    with pytest.raises(ValueError, match="http 或 https"):
+        state.update_model_settings(
+            {
+                "ttsBackend": "mimo",
+                "ttsModelId": "mimo-v2.5-tts-voiceclone",
+                "llmConfig": {
+                    "modelId": "provider/bad-model",
+                    "baseUrl": "ftp://gateway.example/v1",
+                },
+            }
+        )
+
+    assert dotenv.read_bytes() == before
+    assert state.current_model_settings().to_dict() == previous
+    state.close()
+
+
+def test_model_settings_restores_dotenv_when_sqlite_write_fails(tmp_path: Path, monkeypatch):
+    for name in (
+        "AUDIOBOOK_LLM_MODEL",
+        "AUDIOBOOK_LLM_BASE_URL",
+        "AUDIOBOOK_LLM_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        model_settings_module,
+        "discover_llm_options",
+        lambda _root=None: _available_llm_options("openai/gpt-safe"),
+    )
+    configuration_root = tmp_path / "configuration"
+    state = ServerState(tmp_path / "data", configuration_root=configuration_root)
+
+    def reject_model_settings_insert(action, first, _second, _database, _trigger):
+        if action == sqlite3.SQLITE_INSERT and first == "app_settings":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    state.db.set_authorizer(reject_model_settings_insert)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            state.update_model_settings(
+                {
+                    "ttsBackend": "mimo",
+                    "ttsModelId": "mimo-v2.5-tts-voiceclone",
+                    "llmConfig": {
+                        "modelId": "provider/temporary-model",
+                        "baseUrl": "https://gateway.example/v1",
+                        "apiKey": "test-provider-secret",
+                    },
+                }
+            )
+    finally:
+        state.db.set_authorizer(None)
+
+    assert not (configuration_root / ".env").exists()
+    assert "AUDIOBOOK_LLM_MODEL" not in os.environ
+    assert "AUDIOBOOK_LLM_BASE_URL" not in os.environ
+    assert "AUDIOBOOK_LLM_API_KEY" not in os.environ
     state.close()
 
 
@@ -870,14 +1136,14 @@ def test_batch_model_snapshot_remains_immutable_after_global_settings_change(
     monkeypatch.setattr(
         model_settings_module,
         "discover_llm_options",
-        lambda: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
+        lambda _root=None: _available_llm_options("openai/gpt-first", "openai/gpt-second"),
     )
     monkeypatch.setattr(
         model_settings_module,
         "probe_voxcpm2",
         lambda _root=None: _available_voxcpm2_capability(),
     )
-    state = ServerState(tmp_path)
+    state = ServerState(tmp_path, configuration_root=tmp_path / "configuration")
     _seed_batch_book(state, ("chapter_001",))
     monkeypatch.setattr(state, "_launch_batch_generation_locked", lambda _batch_id: None)
     state.update_model_settings(
@@ -936,14 +1202,14 @@ def test_voxcpm2_batch_voice_stage_uses_four_chapter_runner_slots(
     monkeypatch.setattr(
         model_settings_module,
         "discover_llm_options",
-        lambda: _available_llm_options("openai/gpt-safe"),
+        lambda _root=None: _available_llm_options("openai/gpt-safe"),
     )
     monkeypatch.setattr(
         model_settings_module,
         "probe_voxcpm2",
         lambda _root=None: _available_voxcpm2_capability(),
     )
-    state = ServerState(tmp_path)
+    state = ServerState(tmp_path, configuration_root=tmp_path / "configuration")
     chapter_ids = tuple(f"chapter_{index:03d}" for index in range(1, 6))
     _seed_batch_book(state, chapter_ids)
     state.update_model_settings(

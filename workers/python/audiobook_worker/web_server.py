@@ -38,8 +38,17 @@ from audiobook_worker.model_settings import (
     DEFAULT_TTS_MODEL_ID,
     ModelSettings,
     effective_settings,
+    legacy_llm_api_key,
+    legacy_llm_base_url,
     normalize_settings,
     settings_payload,
+)
+from audiobook_worker.llm_env import (
+    project_root,
+    read_llm_environment,
+    restore_dotenv,
+    validate_llm_base_url,
+    write_llm_environment,
 )
 
 
@@ -404,9 +413,16 @@ def character_aliases(value: object) -> list[str]:
 
 
 class ServerState:
-    def __init__(self, data_directory: Path, frontend_directory: Path | None = None) -> None:
+    def __init__(
+        self,
+        data_directory: Path,
+        frontend_directory: Path | None = None,
+        *,
+        configuration_root: Path | None = None,
+    ) -> None:
         self.data_directory = data_directory.resolve()
         self.frontend_directory = frontend_directory.resolve() if frontend_directory else None
+        self.configuration_root = (configuration_root or project_root()).resolve()
         self.books_directory = self.data_directory / "books"
         self.uploads_directory = self.data_directory / "uploads"
         self.data_directory.mkdir(parents=True, exist_ok=True)
@@ -419,6 +435,10 @@ class ServerState:
         self.db = sqlite3.connect(self.data_directory / "audiobook.db", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db_lock = threading.RLock()
+        # A provider update spans the project .env, process environment, and
+        # SQLite. Serialize the complete sequence so concurrent browser saves
+        # cannot leave the credential file and durable model tuple mismatched.
+        self.model_settings_lock = threading.RLock()
         self.concurrency = BatchConcurrencyConfig.from_environment()
         self.worker_resource_semaphores = {
             "mimo": threading.BoundedSemaphore(self.concurrency.mimo_process_slots),
@@ -625,35 +645,97 @@ class ServerState:
         """Return the effective setting, preserving legacy defaults if needed."""
         return effective_settings(
             self._stored_model_settings_value(),
-            root=Path(__file__).resolve().parents[3],
+            root=self.configuration_root,
         )
 
     def model_settings_payload(self) -> dict[str, object]:
         return settings_payload(
             self.current_model_settings(),
-            root=Path(__file__).resolve().parents[3],
+            root=self.configuration_root,
         )
 
     def update_model_settings(self, value: dict[str, object]) -> dict[str, object]:
-        """Validate the complete update before atomically replacing the record."""
-        normalized = normalize_settings(
-            value,
-            root=Path(__file__).resolve().parents[3],
-        )
-        now = time.time()
-        with self.db_lock:
-            self.db.execute(
-                "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
-                "updated_at = excluded.updated_at",
-                (
-                    "model_settings",
-                    json.dumps(normalized.to_dict(), ensure_ascii=False, sort_keys=True),
-                    now,
-                ),
-            )
-            self.db.commit()
-        return self.model_settings_payload()
+        """Persist non-secret selection and optional LLM config atomically."""
+
+        if not isinstance(value, dict):
+            raise ValueError("模型配置必须是对象。")
+        with self.model_settings_lock:
+            root = self.configuration_root
+            current_settings = self.current_model_settings()
+            current_environment = read_llm_environment(root)
+            if "llmConfig" in value and not isinstance(value.get("llmConfig"), dict):
+                raise ValueError("LLM 配置必须是对象。")
+            raw_llm_config = value.get("llmConfig")
+            dotenv_snapshot = None
+            settings_value = dict(value)
+
+            if isinstance(raw_llm_config, dict):
+                if "modelId" in raw_llm_config:
+                    model_id = str(raw_llm_config.get("modelId") or "").strip()
+                else:
+                    model_id = str(
+                        value.get("llmModelId") or current_settings.llm_model_id
+                    ).strip()
+                if "baseUrl" in raw_llm_config:
+                    base_url = str(raw_llm_config.get("baseUrl") or "").strip()
+                else:
+                    base_url = (
+                        current_environment.base_url
+                        or legacy_llm_base_url(model_id, root)
+                    ).strip()
+                api_key_value = raw_llm_config.get("apiKey")
+                if api_key_value is not None and not isinstance(api_key_value, str):
+                    raise ValueError("LLM API Key 必须是字符串。")
+                clear_api_key = raw_llm_config.get("clearApiKey", False)
+                if not isinstance(clear_api_key, bool):
+                    raise ValueError("clearApiKey 必须是布尔值。")
+                if api_key_value and clear_api_key:
+                    raise ValueError("不能同时填写新的 API Key 并清除密钥。")
+                validated_base_url = validate_llm_base_url(base_url)
+                settings_value["llmModelId"] = model_id
+                normalized = normalize_settings(
+                    settings_value,
+                    root=root,
+                    llm_base_url=validated_base_url,
+                )
+                retained_key = current_environment.api_key
+                if not current_environment.base_url:
+                    retained_key = retained_key or legacy_llm_api_key(model_id, root)
+                dotenv_snapshot = write_llm_environment(
+                    root,
+                    model_id=model_id,
+                    base_url=validated_base_url,
+                    api_key=(api_key_value.strip() if api_key_value else retained_key) or None,
+                    clear_api_key=clear_api_key,
+                )
+            else:
+                # Preserve the old flat API for existing clients that only change
+                # the model/TTS tuple and have not opted into project .env config.
+                normalized = normalize_settings(settings_value, root=root)
+
+            now = time.time()
+            try:
+                with self.db_lock:
+                    self.db.execute(
+                        "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+                        "updated_at = excluded.updated_at",
+                        (
+                            "model_settings",
+                            json.dumps(normalized.to_dict(), ensure_ascii=False, sort_keys=True),
+                            now,
+                        ),
+                    )
+                    self.db.commit()
+            except Exception:
+                try:
+                    with self.db_lock:
+                        self.db.rollback()
+                finally:
+                    if dotenv_snapshot is not None:
+                        restore_dotenv(dotenv_snapshot)
+                raise
+            return self.model_settings_payload()
 
     def _model_settings_from_snapshot(self, value: object) -> ModelSettings:
         """Decode a persisted batch snapshot without revalidating its host probe.

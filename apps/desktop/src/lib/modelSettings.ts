@@ -8,6 +8,21 @@ export interface ModelSettings {
   ttsModelId: string;
 }
 
+/** Safe, read-only projection of the active OpenAI-compatible provider. */
+export interface LlmProviderConfig {
+  modelId: string;
+  baseUrl: string;
+  apiKeyConfigured: boolean;
+}
+
+/** Write-only provider fields accepted by model_settings_update. */
+export interface LlmProviderConfigUpdate {
+  modelId: string;
+  baseUrl: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
 export interface LlmModelOption {
   id: string;
   provider: string;
@@ -27,6 +42,7 @@ export interface TtsModelOption {
 export interface ModelSettingsPayload {
   version: number;
   current: ModelSettings;
+  llmConfig: LlmProviderConfig;
   llmOptions: LlmModelOption[];
   ttsOptions: TtsModelOption[];
 }
@@ -37,8 +53,12 @@ export async function getModelSettings(): Promise<ModelSettingsPayload> {
 
 export async function updateModelSettings(
   settings: ModelSettings,
+  llmConfig?: LlmProviderConfigUpdate,
 ): Promise<ModelSettingsPayload> {
-  return invoke<ModelSettingsPayload>("model_settings_update", { ...settings });
+  return invoke<ModelSettingsPayload>("model_settings_update", {
+    ...settings,
+    ...(llmConfig ? { llmConfig } : {}),
+  });
 }
 
 export function llmDisplayName(payload: ModelSettingsPayload): string {
