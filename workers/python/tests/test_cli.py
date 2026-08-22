@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -803,12 +804,6 @@ def test_voxcpm2_chapter_synthesis_uses_one_runner_request_for_all_uncached_segm
 
     class FakeVoxCPM2Backend:
         _device = "mps"
-        service_metrics = {
-            "batches": 1,
-            "configuredBatchSize": 2,
-            "maxEffectiveBatchSize": 2,
-            "fallbackCount": 0,
-        }
 
         def synthesize_segments(self, segments, output_directory):
             runner_calls.append([segment["id"] for segment in segments])
@@ -831,12 +826,6 @@ def test_voxcpm2_chapter_synthesis_uses_one_runner_request_for_all_uncached_segm
     result = json.loads(output_path.read_text(encoding="utf-8"))
     assert result["status"] == "succeeded"
     assert runner_calls == [["seg_0001", "seg_0002"]]
-    assert result["metadata"]["voxcpm2Service"] == {
-        "batches": 1,
-        "configuredBatchSize": 2,
-        "maxEffectiveBatchSize": 2,
-        "fallbackCount": 0,
-    }
     assert (audio_dir / "timeline.json").is_file()
     assert all((audio_dir / f"seg_000{index}.wav.json").is_file() for index in (1, 2))
 
@@ -1426,13 +1415,13 @@ def test_apply_corrections_command(tmp_path: Path):
         },
         "outputDirectory": str(output_dir),
         "language": "en",
-        "mockLlm": True,
     }
     input_path = tmp_path / "input.json"
     input_path.write_text(json.dumps(request), encoding="utf-8")
     output_path = tmp_path / "output.json"
 
-    exit_code = main(["apply_corrections", str(input_path), str(output_path)])
+    with patch.dict(os.environ, {"AUDIOBOOK_LLM_MODEL": "mock"}):
+        exit_code = main(["apply_corrections", str(input_path), str(output_path)])
 
     assert exit_code == 0
     result = json.loads(output_path.read_text())

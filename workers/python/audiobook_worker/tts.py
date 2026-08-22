@@ -37,11 +37,6 @@ from audiobook_worker.voxcpm2_profile_loudness import (
     profile_loudness_is_current,
     voxcpm2_profile_loudness,
 )
-from audiobook_worker.voxcpm2_service_client import (
-    endpoint_from_environment,
-    synthesize_with_service,
-)
-from audiobook_worker.voxcpm2_service_protocol import BATCH_ADAPTER_VERSION
 from audiobook_worker.tts_quality import validate_tts_segment_wav
 
 # ---------------------------------------------------------------------------
@@ -94,7 +89,6 @@ _MIMO_MAX_REFERENCE_BASE64_LENGTH = 10 * 1024 * 1024
 _MIMO_SAFE_RPM = 80
 _MIMO_RATE_STATE_ENV = "AUDIOBOOK_MIMO_RATE_STATE_PATH"
 VOXCPM2_PROMPT_FORMAT_VERSION = 2
-VOXCPM2_BATCH_ADAPTER_VERSION = BATCH_ADAPTER_VERSION
 _VOXCPM2_VOICE_PROFILE_VERSION = VOXCPM2_PROMPT_FORMAT_VERSION
 _VOXCPM2_REFERENCE_TEXTS = {
     "zh": "清晨的风穿过窗边，屋里很安静。",
@@ -816,9 +810,8 @@ class VoxCPM2TTSBackend:
     """Adapter for the locally installed VoxCPM2 reference-cloning workflow.
 
     The model lives in ``data/voxcpm2/.venv`` and must never be imported by
-    this worker interpreter. A web-owned local service can batch independent
-    uncached segments across chapter clients while a standalone worker keeps
-    the legacy one-shot runner fallback.
+    this worker interpreter.  A chapter passes all uncached segments to the
+    runner together, allowing the isolated process to load the 2B model once.
     """
 
     backend_id = "voxcpm2"
@@ -831,7 +824,6 @@ class VoxCPM2TTSBackend:
         runner_python: Path | str | None = None,
         model_path: Path | str | None = None,
         runner_path: Path | str | None = None,
-        service_context: dict[str, object] | None = None,
     ) -> None:
         paths = voxcpm2_paths()
         self._model_id = str(model_id or VOXCPM2_MODEL_ID)
@@ -845,15 +837,7 @@ class VoxCPM2TTSBackend:
         self._voice_profile_directory = (
             Path(voice_profile_directory) if voice_profile_directory else None
         )
-        self._service_context = dict(service_context or {})
         self._device: str | None = None
-        self._service_metrics: dict[str, int] = {}
-
-    @property
-    def service_metrics(self) -> dict[str, int]:
-        """Safe, per-request resident-service metrics for stage metadata."""
-
-        return dict(self._service_metrics)
 
     def synthesize_segment(
         self,
@@ -881,27 +865,10 @@ class VoxCPM2TTSBackend:
         profile_request_keys: set[tuple[Path, str]] = set()
         runner_segments: list[dict[str, object]] = []
         expected_paths: dict[str, Path] = {}
-        for fallback_source_position, segment in enumerate(segments):
+        for segment in segments:
             segment_id = str(segment.get("id") or "").strip()
             if not segment_id:
                 raise RuntimeError("VoxCPM2 cannot synthesize a segment without an id.")
-            try:
-                source_position = int(segment.get("sourcePosition", fallback_source_position))
-            except (TypeError, ValueError):
-                source_position = fallback_source_position
-            if source_position < 0:
-                source_position = fallback_source_position
-            raw_source_segment_ids = segment.get("sourceSegmentIds")
-            if isinstance(raw_source_segment_ids, list):
-                source_segment_ids = [
-                    str(source_id).strip()
-                    for source_id in raw_source_segment_ids
-                    if str(source_id).strip()
-                ]
-            else:
-                source_segment_ids = []
-            if not source_segment_ids:
-                source_segment_ids = [segment_id]
             voice_id, _, description = _voice_context_for_segment(segment)
             language = voxcpm2_language_for_segment(segment)
             profile_control = voxcpm2_profile_control(description, language)
@@ -951,34 +918,16 @@ class VoxCPM2TTSBackend:
                     "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
                     "referenceWavPath": str(profile_path),
                     "outputPath": str(output_path),
-                    "sourcePosition": source_position,
-                    "sourceSegmentIds": source_segment_ids,
-                    "cacheSignature": str(segment.get("cacheSignature") or ""),
                 }
             )
 
         response = self._run_runner(
             {
                 "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
-                "chapter": self._service_context,
                 "profiles": profiles,
                 "segments": runner_segments,
             }
         )
-        raw_metrics = response.get("metrics")
-        metric_names = (
-            "batches",
-            "configuredBatchSize",
-            "maxEffectiveBatchSize",
-            "fallbackCount",
-        )
-        self._service_metrics = {
-            name: value
-            for name in metric_names
-            if isinstance(raw_metrics, dict)
-            and isinstance((value := raw_metrics.get(name)), int)
-            and not isinstance(value, bool)
-        }
         device = response.get("device")
         self._device = str(device) if isinstance(device, str) and device else None
         raw_results = response.get("segments")
@@ -1066,12 +1015,6 @@ class VoxCPM2TTSBackend:
             **payload,
             "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
         }
-        service_endpoint = endpoint_from_environment()
-        if service_endpoint is not None:
-            response = synthesize_with_service(service_endpoint, request)
-            device = response.get("device")
-            self._device = str(device) if isinstance(device, str) and device else None
-            return response
         try:
             configured_timeout = int(
                 os.environ.get(

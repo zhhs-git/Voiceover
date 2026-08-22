@@ -50,10 +50,6 @@ from audiobook_worker.llm_env import (
     validate_llm_base_url,
     write_llm_environment,
 )
-from audiobook_worker.voxcpm2_service_supervisor import (
-    VoxCPM2ServiceSupervisor,
-    VoxCPM2ServiceSupervisorError,
-)
 
 
 MAX_UPLOAD_BYTES = int(os.environ.get("AUDIOBOOK_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
@@ -436,13 +432,6 @@ class ServerState:
         # the actual HTTP call, so reference generation, chapter synthesis,
         # direct segments, and retries share one cross-process MiMo lane.
         self.mimo_rate_state_path = self.data_directory / ".mimo-rate-state.json"
-        # A local TTS request may admit up to four regular-worker clients, but
-        # they share one lazily started resident model service.  Constructing
-        # this supervisor does not start or import VoxCPM2.
-        self.voxcpm_service = VoxCPM2ServiceSupervisor(
-            self.data_directory,
-            configuration_root=self.configuration_root,
-        )
         self.db = sqlite3.connect(self.data_directory / "audiobook.db", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db_lock = threading.RLock()
@@ -493,7 +482,6 @@ class ServerState:
             if not self._batch_executor_shutdown:
                 self.batch_chapter_executor.shutdown(wait=False, cancel_futures=True)
                 self._batch_executor_shutdown = True
-        self.voxcpm_service.close()
         self.db.close()
 
     def attach_web_port(self, port: int) -> None:
@@ -1162,7 +1150,6 @@ class ServerState:
         if command not in allowed:
             return {"status": "failed", "warnings": [], "artifacts": [], "error": {"code": "unknown_command", "message": command}}
         self.validate_request_paths(request)
-        resource = _tts_resource_for_request(command, request)
         with self._worker_resource(command, request):
             with tempfile.TemporaryDirectory(prefix="audiobook-web-", dir=self.data_directory) as temp:
                 input_path = Path(temp) / "input.json"
@@ -1171,20 +1158,7 @@ class ServerState:
                 environment = os.environ.copy()
                 environment.setdefault("AUDIOBOOK_TTS_DEVICE", "auto")
                 environment.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-                if resource == "voxcpm":
-                    try:
-                        environment.update(self.voxcpm_service.worker_environment())
-                    except VoxCPM2ServiceSupervisorError as error:
-                        return {
-                            "status": "failed",
-                            "warnings": [],
-                            "artifacts": [],
-                            "error": {
-                                "code": "voxcpm2_service_start_failed",
-                                "message": str(error),
-                            },
-                        }
-                if resource == "mimo":
+                if _tts_resource_for_request(command, request) == "mimo":
                     # These settings are deliberately hard-coded. The child
                     # also uses a file-backed gate at the real HTTP boundary,
                     # which covers every process spawned by this web service.

@@ -43,7 +43,6 @@ from audiobook_worker.tts import (
     MiMoTTSBackend,
     MockTTSBackend,
     ParlerTTSBackend,
-    VOXCPM2_BATCH_ADAPTER_VERSION,
     VOXCPM2_PROMPT_FORMAT_VERSION,
     VoxCPM2TTSBackend,
     voxcpm2_language_for_segment,
@@ -532,7 +531,6 @@ def _segment_cache_signature(
     }
     if str(backend_name or "").strip().casefold() == "voxcpm2":
         payload["voxcpm2PromptFormatVersion"] = VOXCPM2_PROMPT_FORMAT_VERSION
-        payload["voxcpm2BatchAdapterVersion"] = VOXCPM2_BATCH_ADAPTER_VERSION
         payload["voxcpm2Language"] = voxcpm2_language_for_segment(segment)
         payload["voxcpm2ProfileLoudness"] = voxcpm2_profile_loudness()
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1832,12 +1830,6 @@ def _tts_backend_for_request(request: dict[str, Any]):
         }
         if isinstance(voice_profile_directory, str) and voice_profile_directory:
             voxcpm2_kwargs["voice_profile_directory"] = voice_profile_directory
-        voxcpm2_kwargs["service_context"] = {
-            "bookId": str(request.get("bookId") or ""),
-            "chapterId": str(request.get("chapterId") or ""),
-            "backend": backend_name,
-            "modelId": model_id or VOXCPM2_MODEL_ID,
-        }
         return VoxCPM2TTSBackend(**voxcpm2_kwargs)
     if backend_name == "kokoro":
         return KokoroTTSBackend()
@@ -2096,19 +2088,12 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
         results: dict[int, Any] = {}
         failures: dict[int, Exception] = {}
         if backend_name == "voxcpm2":
-            # VoxCPM2 submits the whole missing subset in one request. The
-            # web-owned service owns one model and may batch independent items
-            # across admitted chapters; cache hits never reach that service.
+            # VoxCPM2 must receive the whole missing subset in one request.
+            # The isolated runner loads the 2B model once and synthesizes these
+            # entries sequentially, while cache hits never pay a model-load cost.
             try:
                 synthesized = active_backend.synthesize_segments(
-                    [
-                        {
-                            **segment,
-                            "sourcePosition": index,
-                            "cacheSignature": signature,
-                        }
-                        for index, segment, signature in pending_segments
-                    ],
+                    [segment for _, segment, _ in pending_segments],
                     output_directory,
                 )
             except Exception as error:
@@ -2219,24 +2204,13 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
         max_characters=max_characters,
         gap_seconds=gap_seconds,
     )
-    metadata: dict[str, Any] = {
+    payload = _response("succeeded", artifacts=artifacts)
+    payload["metadata"] = {
         "originalSegmentCount": len(original_segments),
         "synthesizedSegmentCount": len(segments),
         "cachedSegmentCount": sum(1 for artifact in artifacts if artifact["metadata"].get("cacheHit")),
         "segmentIds": [segment["id"] for segment in segments],
     }
-    if backend_name == "voxcpm2" and active_backend is not None:
-        raw_service_metrics = getattr(active_backend, "service_metrics", None)
-        if isinstance(raw_service_metrics, dict):
-            metadata["voxcpm2Service"] = {
-                name: value
-                for name, value in raw_service_metrics.items()
-                if isinstance(name, str)
-                and isinstance(value, int)
-                and not isinstance(value, bool)
-            }
-    payload = _response("succeeded", artifacts=artifacts)
-    payload["metadata"] = metadata
     # The public "原章节配音" stage also includes the following assembly
     # command.  Keep it running until the complete chapter WAV exists.
     finish_voice("running", "片段配音已完成，正在组装原章节音频。")

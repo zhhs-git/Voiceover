@@ -1802,18 +1802,6 @@ def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
         "audiobook_worker.web_server.subprocess.run",
         fake_subprocess_run,
     )
-    # The web process owns one resident service and injects only its ephemeral
-    # local endpoint/token into admitted VoxCPM2 worker children.  This test
-    # exercises the existing four-client admission gate without starting an
-    # actual model process.
-    monkeypatch.setattr(
-        state.voxcpm_service,
-        "worker_environment",
-        lambda: {
-            "AUDIOBOOK_VOXCPM_SERVICE_SOCKET": str(tmp_path / "runtime.sock"),
-            "AUDIOBOOK_VOXCPM_SERVICE_TOKEN": "test-service-token",
-        },
-    )
     request = {
         "scriptPath": str(script_path),
         "outputDirectory": str(tmp_path / "segments" / "voxcpm2"),
@@ -1848,11 +1836,6 @@ def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
     assert all(not thread.is_alive() for thread in threads)
     assert maximum == 4
     assert len(environments) == 5
-    assert all(
-        environment["AUDIOBOOK_VOXCPM_SERVICE_SOCKET"] == str(tmp_path / "runtime.sock")
-        and environment["AUDIOBOOK_VOXCPM_SERVICE_TOKEN"] == "test-service-token"
-        for environment in environments
-    )
 
 
 def test_batch_generation_persists_stage_and_chapter_durations(tmp_path: Path, monkeypatch):

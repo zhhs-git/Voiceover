@@ -72,17 +72,7 @@ def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
                     "durationSeconds": 0.1,
                 }
             )
-        return {
-            "status": "succeeded",
-            "device": "mps",
-            "segments": results,
-            "metrics": {
-                "batches": 2,
-                "configuredBatchSize": 4,
-                "maxEffectiveBatchSize": 2,
-                "fallbackCount": 0,
-            },
-        }
+        return {"status": "succeeded", "device": "mps", "segments": results}
 
     monkeypatch.setattr(backend, "_run_runner", fake_runner)
     artifacts = backend.synthesize_segments(
@@ -92,8 +82,6 @@ def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
                 "text": "第一句。",
                 "speakerId": "narrator",
                 "voiceId": "narrator_female",
-                "sourcePosition": 4,
-                "sourceSegmentIds": ["source_0004"],
             },
             {
                 "id": "seg_0002",
@@ -101,8 +89,6 @@ def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
                 "speakerId": "narrator",
                 "voiceId": "narrator_female",
                 "emotion": "tense",
-                "sourcePosition": 9,
-                "sourceSegmentIds": ["source_0009", "source_0010"],
             },
         ],
         tmp_path / "segments",
@@ -117,15 +103,7 @@ def test_voxcpm2_backend_sends_one_runner_request_for_all_chapter_segments(
         "seg_0001",
         "seg_0002",
     ]
-    assert [item["sourcePosition"] for item in runner_calls[0]["segments"]] == [4, 9]
-    assert runner_calls[0]["segments"][1]["sourceSegmentIds"] == ["source_0009", "source_0010"]
     assert len(runner_calls[0]["profiles"]) == 1
-    assert backend.service_metrics == {
-        "batches": 2,
-        "configuredBatchSize": 4,
-        "maxEffectiveBatchSize": 2,
-        "fallbackCount": 0,
-    }
 
 
 def test_voxcpm2_payload_separates_stable_profile_from_dynamic_delivery(
