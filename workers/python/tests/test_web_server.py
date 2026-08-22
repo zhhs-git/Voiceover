@@ -1195,7 +1195,7 @@ def test_batch_model_snapshot_remains_immutable_after_global_settings_change(
     state.close()
 
 
-def test_voxcpm2_batch_voice_stage_uses_four_chapter_runner_slots(
+def test_voxcpm2_batch_voice_stage_uses_two_chapter_runner_slots(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.delenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", raising=False)
@@ -1252,8 +1252,8 @@ def test_voxcpm2_batch_voice_stage_uses_four_chapter_runner_slots(
     ) == "voxcpm"
     assert first_voice_started.wait(timeout=1)
     time.sleep(0.05)
-    assert len(voice_calls) == 4
-    assert maximum == 4
+    assert len(voice_calls) == 2
+    assert maximum == 2
 
     state.cancel_batch_generation(batch_id)
     release_voice.set()
@@ -1437,7 +1437,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
     assert defaults.llm_workers == 2
     assert defaults.local_audio_workers == 4
     assert defaults.mix_workers == 2
-    assert defaults.voxcpm_workers == 4
+    assert defaults.voxcpm_workers == 2
     assert defaults.non_mimo_workers_while_mimo_pending == 4
 
     for name in (
@@ -1459,7 +1459,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
     assert capped.llm_workers == 2
     assert capped.local_audio_workers == 4
     assert capped.mix_workers == 2
-    assert capped.voxcpm_workers == 4
+    assert capped.voxcpm_workers == 2
 
     monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "2")
     lowered_voxcpm = BatchConcurrencyConfig.from_environment()
@@ -1467,7 +1467,7 @@ def test_batch_concurrency_configuration_has_safe_defaults_and_hard_ceilings(
     monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "0")
     assert BatchConcurrencyConfig.from_environment().voxcpm_workers == 1
     monkeypatch.setenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", "not-a-number")
-    assert BatchConcurrencyConfig.from_environment().voxcpm_workers == 4
+    assert BatchConcurrencyConfig.from_environment().voxcpm_workers == 2
 
     monkeypatch.delenv("AUDIOBOOK_MLX_WORKER_CONCURRENCY", raising=False)
     monkeypatch.setenv("AUDIOBOOK_LOCAL_AUDIO_WORKER_CONCURRENCY", "2")
@@ -1762,7 +1762,7 @@ def test_worker_resource_limits_bound_mimo_local_audio_llm_and_mix_commands(
     assert mimo_rate_state_paths == [str(state.mimo_rate_state_path)] * 4
 
 
-def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
+def test_direct_voxcpm2_tts_requests_share_two_local_voxcpm_slots(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.delenv("AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY", raising=False)
@@ -1821,12 +1821,12 @@ def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
         assert started.wait(timeout=1)
         # While a direct local-model request is admitted, the independent
         # MiMo remains independent, while the fifth VoxCPM2 request waits for
-        # one of the four shared local chapter permits.
+        # one of the two shared local chapter permits.
         assert state.worker_resource_semaphores["mimo"].acquire(blocking=False)
         state.worker_resource_semaphores["mimo"].release()
         time.sleep(0.05)
-        assert maximum == 4
-        assert len(environments) == 4
+        assert maximum == 2
+        assert len(environments) == 2
     finally:
         release.set()
         for thread in threads:
@@ -1834,7 +1834,7 @@ def test_direct_voxcpm2_tts_requests_share_four_local_voxcpm_slots(
         state.close()
 
     assert all(not thread.is_alive() for thread in threads)
-    assert maximum == 4
+    assert maximum == 2
     assert len(environments) == 5
 
 

@@ -650,7 +650,7 @@ class MiMoTTSBackend:
             cached = self._reference_audio_cache.get(signature)
             if cached and _is_readable_wav(profile_path):
                 return cached
-            # The in-process RLock above does not help when four chapter
+            # The in-process RLock above does not help when multiple chapter
             # subprocesses share one book's voice-profiles directory. fcntl
             # keeps the complete cache-check/design/replace sequence exclusive
             # across those processes without serialising their ordinary TTS.

@@ -126,10 +126,12 @@ VoxCPM2 once and synthesizes uncached segments serially in source order. The
 model parameters remain `cfg_value=2.0` and `inference_timesteps=10`.
 
 Independent chapters may run concurrently. The web server's shared `voxcpm`
-resource admits up to four whole-chapter runners by default, and both batch and
+resource admits up to two whole-chapter runners by default, and both batch and
 direct TTS requests use the same gate. `AUDIOBOOK_VOXCPM_WORKER_CONCURRENCY`
-can lower the capacity to 1--3 for a memory-constrained host, but values above
-four are clamped. Segment-level parallelism is intentionally unsupported.
+can lower the capacity to one, while values above two are clamped. Four-way
+runs contended for the shared MPS device and saturated unified memory without
+a stable wall-clock gain. Segment-level parallelism is intentionally
+unsupported.
 
 ## Why Controllable Cloning
 
