@@ -37,7 +37,11 @@ from audiobook_worker.voxcpm2_profile_loudness import (
     profile_loudness_is_current,
     voxcpm2_profile_loudness,
 )
-from audiobook_worker.tts_quality import validate_tts_segment_wav
+from audiobook_worker.tts_quality import (
+    TtsSegmentAudioQualityError,
+    TtsSegmentAudioQualityResult,
+    validate_tts_segment_wav,
+)
 
 # ---------------------------------------------------------------------------
 # Shared data
@@ -102,9 +106,16 @@ _VOXCPM2_RUNNER_TIMEOUT_SECONDS = 60 * 60
 class MiMoRequestError(RuntimeError):
     """A MiMo request failure with an explicit retry policy for callers."""
 
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        quality: TtsSegmentAudioQualityResult | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.quality = quality
 
 
 def _bounded_positive_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
@@ -1184,6 +1195,12 @@ def _decode_and_validate_mimo_segment_wav(
             text=segment.get("text", ""),
             pace=segment.get("pace", "normal"),
         )
+    except TtsSegmentAudioQualityError as error:
+        raise MiMoRequestError(
+            f"MiMo returned an unusable TTS segment WAV: {error}",
+            retryable=True,
+            quality=error.result,
+        ) from error
     except RuntimeError as error:
         raise MiMoRequestError(
             f"MiMo returned an unusable TTS segment WAV: {error}",

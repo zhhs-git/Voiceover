@@ -50,6 +50,7 @@ from audiobook_worker.tts import (
 )
 from audiobook_worker.tts_quality import (
     TtsSegmentAudioQualityError,
+    TtsSegmentAudioQualityResult,
     analyze_tts_segment_wav,
 )
 from audiobook_worker.voxcpm2_profile_loudness import voxcpm2_profile_loudness
@@ -591,14 +592,42 @@ def _segment_audio_passes_quality(
         return False
     if not _backend_requires_segment_quality(backend_name):
         return True
+    result = _segment_audio_quality_result(segment, audio_path, backend_name)
+    return result is not None and result.accepted
+
+
+def _segment_audio_quality_result(
+    segment: dict[str, Any],
+    audio_path: Path,
+    backend_name: str,
+) -> TtsSegmentAudioQualityResult | None:
+    """Inspect a quality-gated WAV while retaining rejection metrics."""
+
+    if not _is_readable_wav(audio_path) or not _backend_requires_segment_quality(
+        backend_name
+    ):
+        return None
     try:
         return analyze_tts_segment_wav(
             audio_path,
             text=segment.get("text", ""),
             pace=segment.get("pace", "normal"),
-        ).accepted
-    except TtsSegmentAudioQualityError:
-        return False
+        )
+    except TtsSegmentAudioQualityError as error:
+        return error.result
+
+
+class _SegmentAudioQualityFailure(ValueError):
+    """A readable TTS WAV failed the quality gate and has diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        quality: TtsSegmentAudioQualityResult,
+    ) -> None:
+        super().__init__(message)
+        self.quality = quality
 
 
 def _write_segment_cache_metadata(
@@ -1116,10 +1145,23 @@ def _segment_artifact_payload(
         raise ValueError(
             f"TTS did not create a readable WAV for segment {segment['id']}."
         )
-    if not _segment_audio_passes_quality(segment, expected_audio_path, backend_name):
+    quality = _segment_audio_quality_result(
+        segment,
+        expected_audio_path,
+        backend_name,
+    )
+    if _backend_requires_segment_quality(backend_name) and (
+        quality is None or not quality.accepted
+    ):
         _invalidate_segment_cache(expected_audio_path)
-        raise ValueError(
-            f"TTS generated an unusable WAV for segment {segment['id']}."
+        if quality is None:
+            raise ValueError(
+                f"TTS generated an unusable WAV for segment {segment['id']}."
+            )
+        raise _SegmentAudioQualityFailure(
+            "TTS generated an unusable WAV for segment "
+            f"{segment['id']} ({', '.join(quality.issues)}; {quality.describe()}).",
+            quality=quality,
         )
 
     source_segment_ids = segment.get("sourceSegmentIds", [segment["id"]])
@@ -1849,14 +1891,25 @@ def _synthesize_segment_audio(request: dict[str, Any]) -> dict[str, Any]:
     backend_name = str(request.get("backend") or "mimo").strip().casefold()
     backend = _tts_backend_for_request(request)
     artifact = backend.synthesize_segment(segment, Path(request["outputDirectory"]))
-    if not _segment_audio_passes_quality(segment, artifact.path, backend_name):
+    quality = _segment_audio_quality_result(segment, artifact.path, backend_name)
+    if _backend_requires_segment_quality(backend_name) and (
+        quality is None or not quality.accepted
+    ):
         _invalidate_segment_cache(artifact.path)
+        details: dict[str, Any] = {"segmentId": segment["id"]}
+        message = f"TTS generated an unusable WAV for segment {segment['id']}."
+        if quality is not None:
+            details["quality"] = quality.to_dict()
+            message = (
+                f"TTS generated an unusable WAV for segment {segment['id']} "
+                f"({', '.join(quality.issues)}; {quality.describe()})."
+            )
         return _response(
             "failed",
             error={
                 "code": "invalid_segment_audio",
-                "message": f"TTS generated an unusable WAV for segment {segment['id']}.",
-                "details": {"segmentId": segment["id"]},
+                "message": message,
+                "details": details,
             },
         )
     return _response(
@@ -2132,13 +2185,18 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
             failed_segment = segments[failed_index]
             expected_audio_path = output_directory / f"{failed_segment['id']}.wav"
             _invalidate_segment_cache(expected_audio_path)
+            failure = failures[failed_index]
+            details: dict[str, Any] = {"segmentId": failed_segment["id"]}
+            quality = getattr(failure, "quality", None)
+            if isinstance(quality, TtsSegmentAudioQualityResult):
+                details["quality"] = quality.to_dict()
             finish_voice("failed", str(failures[failed_index]))
             return _response(
                 "failed",
                 error={
                     "code": "tts_synthesis_failed",
-                    "message": str(failures[failed_index]),
-                    "details": {"segmentId": failed_segment["id"]},
+                    "message": str(failure),
+                    "details": details,
                 },
             )
 
@@ -2154,6 +2212,19 @@ def _synthesize_chapter_audio(request: dict[str, Any]) -> dict[str, Any]:
                     model_id=model_id,
                     cache_segments=cache_segments,
                     device=device,
+                )
+            except _SegmentAudioQualityFailure as error:
+                finish_voice("failed", str(error))
+                return _response(
+                    "failed",
+                    error={
+                        "code": "tts_synthesis_failed",
+                        "message": str(error),
+                        "details": {
+                            "segmentId": segment["id"],
+                            "quality": error.quality.to_dict(),
+                        },
+                    },
                 )
             except ValueError as error:
                 finish_voice("failed", str(error))

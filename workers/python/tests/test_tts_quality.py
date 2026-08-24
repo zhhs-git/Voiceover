@@ -75,6 +75,15 @@ def test_duration_exceeding_text_limit_is_rejected_without_pcm_scan():
     assert result.accepted is False
     assert result.issues == ("duration_exceeds_text_limit",)
     assert result.silence_ratio is None
+    assert result.longest_silence_seconds is None
+    assert result.to_dict() == {
+        "speechUnits": 1,
+        "durationSeconds": 10.25,
+        "maximumDurationSeconds": 9.111,
+        "silenceRatio": None,
+        "longestSilenceSeconds": None,
+        "issues": ["duration_exceeds_text_limit"],
+    }
 
 
 def test_long_trailing_silence_is_rejected_inside_a_plausible_duration():
@@ -87,6 +96,9 @@ def test_long_trailing_silence_is_rejected_inside_a_plausible_duration():
     assert "continuous_silence_exceeds_limit" in result.issues
     assert "silence_ratio_exceeds_limit" in result.issues
     assert result.longest_silence_seconds == pytest.approx(9.0, abs=0.25)
+    diagnostics = result.to_dict()
+    assert diagnostics["silenceRatio"] == pytest.approx(0.9, abs=0.03)
+    assert diagnostics["longestSilenceSeconds"] == pytest.approx(9.0, abs=0.25)
 
 
 def test_long_interior_silence_is_rejected_inside_a_plausible_duration():

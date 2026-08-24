@@ -62,6 +62,25 @@ class TtsSegmentAudioQualityResult:
             details.append(f"longestSilence={self.longest_silence_seconds:.2f}s")
         return ", ".join(details)
 
+    def to_dict(self) -> dict[str, object]:
+        """Return stable camelCase diagnostics for worker/API error payloads."""
+        return {
+            "speechUnits": self.speech_units,
+            "durationSeconds": round(self.duration_seconds, 3),
+            "maximumDurationSeconds": round(self.maximum_duration_seconds, 3),
+            "silenceRatio": (
+                round(self.silence_ratio, 6)
+                if self.silence_ratio is not None
+                else None
+            ),
+            "longestSilenceSeconds": (
+                round(self.longest_silence_seconds, 3)
+                if self.longest_silence_seconds is not None
+                else None
+            ),
+            "issues": list(self.issues),
+        }
+
 
 def speech_units_for_text(text: object) -> int:
     """Count conservative speaking units for mixed Chinese and word-based text."""

@@ -955,12 +955,21 @@ def test_mimo_quality_rejection_keeps_an_existing_cache_entry(tmp_path: Path):
         request_audio=lambda _payload: rejected_audio,
     )
 
-    with pytest.raises(MiMoRequestError, match="unusable TTS segment WAV"):
+    with pytest.raises(MiMoRequestError, match="unusable TTS segment WAV") as error:
         backend.synthesize_segment(
             {"id": "seg_existing", "text": "嘘。", "pace": "normal"},
             tmp_path,
         )
 
+    assert error.value.quality is not None
+    assert error.value.quality.to_dict() == {
+        "speechUnits": 1,
+        "durationSeconds": 10.0,
+        "maximumDurationSeconds": 9.111,
+        "silenceRatio": None,
+        "longestSilenceSeconds": None,
+        "issues": ["duration_exceeds_text_limit"],
+    }
     assert output_path.read_bytes() == b"prior accepted audio"
 
 

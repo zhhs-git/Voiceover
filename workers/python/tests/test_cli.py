@@ -830,6 +830,81 @@ def test_voxcpm2_chapter_synthesis_uses_one_runner_request_for_all_uncached_segm
     assert all((audio_dir / f"seg_000{index}.wav.json").is_file() for index in (1, 2))
 
 
+def test_voxcpm2_quality_failure_returns_metrics_before_invalidating_audio(
+    tmp_path: Path,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import AudioArtifact
+
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book1",
+                "chapterId": "ch01",
+                "segments": [
+                    {
+                        "id": "seg_bad",
+                        "text": "嘘。",
+                        "voiceId": "narrator_female",
+                        "pace": "normal",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audio_dir = tmp_path / "segments" / "voxcpm2"
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "outputDirectory": str(audio_dir),
+                "backend": "voxcpm2",
+                "modelId": "VoxCPM2",
+                "cacheSegments": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+
+    class BadVoxCPM2Backend:
+        _device = "mps"
+
+        def synthesize_segments(self, segments, output_directory):
+            path = Path(output_directory) / f"{segments[0]['id']}.wav"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(path), "wb") as wav_file:
+                wav_file.setparams((1, 2, 24_000, 24_000 * 12, "NONE", "not compressed"))
+                wav_file.writeframes(b"\x00\x08" * (24_000 * 12))
+            return [AudioArtifact("segment_audio", path, 12.0)]
+
+    with patch(
+        "audiobook_worker.cli.VoxCPM2TTSBackend",
+        return_value=BadVoxCPM2Backend(),
+    ):
+        assert main(["synthesize_chapter_audio", str(input_path), str(output_path)]) == 1
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"]["segmentId"] == "seg_bad"
+    assert result["error"]["details"]["quality"] == {
+        "speechUnits": 1,
+        "durationSeconds": 12.0,
+        "maximumDurationSeconds": 9.111,
+        "silenceRatio": None,
+        "longestSilenceSeconds": None,
+        "issues": ["duration_exceeds_text_limit"],
+    }
+    assert not (audio_dir / "seg_bad.wav").exists()
+    assert not (audio_dir / "seg_bad.wav.json").exists()
+    assert not (audio_dir / "timeline.json").exists()
+
+
 def test_voxcpm2_chapter_synthesis_does_not_write_a_timeline_when_runner_fails(
     tmp_path: Path,
 ):

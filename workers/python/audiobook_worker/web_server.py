@@ -253,10 +253,10 @@ _MAX_LLM_WORKERS = 2
 # Whisper and Stable Audio share unified memory. Four total local model jobs
 # are the highest production limit validated without memory pressure.
 _MAX_LOCAL_AUDIO_WORKERS = 4
-# VoxCPM2 chapter runners share one MPS device. Two whole-chapter processes
-# are the conservative production limit after four-way runs saturated unified
-# memory without improving wall-clock throughput; callers may lower this.
-_MAX_VOXCPM_WORKERS = 2
+# VoxCPM2 chapter runners share one MPS device. A single whole-chapter process
+# is the stable production limit: two processes produced malformed WAVs and
+# saturated unified memory without improving wall-clock throughput.
+_MAX_VOXCPM_WORKERS = 1
 _MAX_MIX_WORKERS = 2
 
 
