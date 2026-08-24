@@ -104,6 +104,14 @@ this control. Chinese segments use concise Chinese emotion and pace phrases;
 English and other segments use English fallback phrases. The complete script
 language is attached to each decorated TTS segment before this composition.
 
+Segment diffusion keeps the runtime's fresh random state. The runner seeds only
+reference-profile generation, where reproducibility is useful for a durable
+voice asset; it does not derive a fixed segment seed from the segment ID, text,
+or dynamic delivery. VoxCPM2 samples diffusion noise per segment, and tying
+that noise to delivery text can make one valid segment repeatedly follow a bad
+MPS trajectory with a long silent tail. The WAV quality gate remains a final
+guard, while a regenerated segment receives a new sampling trajectory.
+
 Examples:
 
 ```text

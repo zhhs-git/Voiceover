@@ -315,7 +315,10 @@ def _synthesize_segment(model: Any, item: dict[str, Any], sample_rate: int) -> d
         name=f"segment promptFormatVersion for {segment_id}",
     )
     _required_text(item.get("language"), name=f"segment language for {segment_id}")
-    _seed_from(f"{segment_id}:{text}:{delivery}:{reference_path}")
+    # Segment diffusion samples must keep the runtime's nondeterministic RNG.
+    # Binding the seed to dynamic delivery text can permanently select a bad
+    # MPS trajectory for one otherwise valid segment. Reference profiles are
+    # still seeded in _ensure_profile because they are durable voice assets.
     waveform = model.generate(
         text=_controlled_text(delivery, text),
         reference_wav_path=str(reference_path),

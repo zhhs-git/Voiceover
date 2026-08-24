@@ -89,6 +89,37 @@ def test_runner_keeps_profile_and_segment_controls_separate(
     assert calls[1]["reference_wav_path"] == str(reference_path)
 
 
+def test_runner_does_not_seed_segment_diffusion_from_dynamic_delivery(
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    class FakeModel:
+        def generate(self, **_kwargs):
+            return [0.0, 0.1, 0.0]
+
+    monkeypatch.setattr(voxcpm2_runner, "_seed_from", calls.append)
+    reference_path = tmp_path / "reference.wav"
+    _write_wav(reference_path)
+
+    voxcpm2_runner._synthesize_segment(
+        FakeModel(),
+        {
+            "id": "seg_0001",
+            "text": "The door opened.",
+            "delivery": "firm and clear",
+            "language": "en",
+            "promptFormatVersion": 2,
+            "referenceWavPath": str(reference_path),
+            "outputPath": str(tmp_path / "seg_0001.wav"),
+        },
+        24_000,
+    )
+
+    assert calls == []
+
+
 def test_runner_keeps_accepted_profile_when_loudness_normalization_fails(
     tmp_path: Path,
     monkeypatch,
