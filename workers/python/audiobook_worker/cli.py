@@ -41,6 +41,7 @@ from audiobook_worker.script_builder import (
 from audiobook_worker.tts import (
     KokoroTTSBackend,
     MiMoTTSBackend,
+    MiMoRequestError,
     MockTTSBackend,
     ParlerTTSBackend,
     VOXCPM2_PROMPT_FORMAT_VERSION,
@@ -1890,7 +1891,23 @@ def _synthesize_segment_audio(request: dict[str, Any]) -> dict[str, Any]:
     segment = _decorate_segments_for_voice(script_path, script, [segment])[0]
     backend_name = str(request.get("backend") or "mimo").strip().casefold()
     backend = _tts_backend_for_request(request)
-    artifact = backend.synthesize_segment(segment, Path(request["outputDirectory"]))
+    try:
+        artifact = backend.synthesize_segment(
+            segment,
+            Path(request["outputDirectory"]),
+        )
+    except MiMoRequestError as error:
+        details: dict[str, Any] = {"segmentId": segment["id"]}
+        if isinstance(error.quality, TtsSegmentAudioQualityResult):
+            details["quality"] = error.quality.to_dict()
+        return _response(
+            "failed",
+            error={
+                "code": "tts_synthesis_failed",
+                "message": str(error),
+                "details": details,
+            },
+        )
     quality = _segment_audio_quality_result(segment, artifact.path, backend_name)
     if _backend_requires_segment_quality(backend_name) and (
         quality is None or not quality.accepted

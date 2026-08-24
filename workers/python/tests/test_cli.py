@@ -383,6 +383,71 @@ def test_synthesize_segment_audio_uses_mimo_voiceclone_and_profile_directory(tmp
     assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "succeeded"
 
 
+def test_synthesize_segment_audio_preserves_mimo_quality_diagnostics(
+    tmp_path: Path,
+):
+    from audiobook_worker.cli import main
+    from audiobook_worker.tts import MiMoRequestError
+    from audiobook_worker.tts_quality import TtsSegmentAudioQualityResult
+
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "bookId": "book1",
+                "chapterId": "ch01",
+                "segments": [
+                    {
+                        "id": "seg_0001",
+                        "text": "嘘。",
+                        "voiceId": "narrator_default",
+                        "pace": "normal",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "scriptPath": str(script_path),
+                "segmentId": "seg_0001",
+                "outputDirectory": str(tmp_path / "audio"),
+                "backend": "mimo",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.json"
+    quality = TtsSegmentAudioQualityResult(
+        speech_units=1,
+        duration_seconds=10.0,
+        maximum_duration_seconds=9.111111,
+        silence_ratio=None,
+        longest_silence_seconds=None,
+        issues=("duration_exceeds_text_limit",),
+    )
+
+    with patch("audiobook_worker.cli.MiMoTTSBackend") as backend_class:
+        backend_class.return_value.synthesize_segment.side_effect = MiMoRequestError(
+            "MiMo returned an unusable TTS segment WAV",
+            retryable=True,
+            quality=quality,
+        )
+        assert main(["synthesize_segment_audio", str(input_path), str(output_path)]) == 1
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["error"]["code"] == "tts_synthesis_failed"
+    assert result["error"]["details"] == {
+        "segmentId": "seg_0001",
+        "quality": quality.to_dict(),
+    }
+
+
 def test_synthesize_chapter_audio_merges_adjacent_compatible_segments_and_cleans_stale_audio(tmp_path: Path):
     from audiobook_worker.cli import main
 
