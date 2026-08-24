@@ -78,6 +78,7 @@ def test_runner_keeps_profile_and_segment_controls_separate(
             "id": "seg_0001",
             "text": "The door opened.",
             "delivery": "natural and restrained, quick but clear",
+            "maxDurationSeconds": 8.0,
             "language": "en",
             "promptFormatVersion": 2,
             "referenceWavPath": str(reference_path),
@@ -109,6 +110,7 @@ def test_runner_does_not_seed_segment_diffusion_from_dynamic_delivery(
             "id": "seg_0001",
             "text": "The door opened.",
             "delivery": "firm and clear",
+            "maxDurationSeconds": 8.0,
             "language": "en",
             "promptFormatVersion": 2,
             "referenceWavPath": str(reference_path),
@@ -118,6 +120,49 @@ def test_runner_does_not_seed_segment_diffusion_from_dynamic_delivery(
     )
 
     assert calls == []
+
+
+def test_runner_caps_segment_generation_from_speech_duration_not_control_text(
+    tmp_path: Path,
+):
+    calls: list[dict[str, object]] = []
+
+    class RuntimeModel:
+        patch_size = 4
+        _decode_chunk_size = 1_920
+
+        @staticmethod
+        def text_tokenizer(text: str) -> list[int]:
+            return list(range(8 if text == "女人突然转头：" else 78))
+
+    class FakeModel:
+        tts_model = RuntimeModel()
+
+        def generate(self, **kwargs):
+            calls.append(kwargs)
+            return [0.0, 0.1, 0.0]
+
+    reference_path = tmp_path / "reference.wav"
+    _write_wav(reference_path, sample_rate=48_000)
+
+    voxcpm2_runner._synthesize_segment(
+        FakeModel(),
+        {
+            "id": "short_controlled_segment",
+            "text": "女人突然转头：",
+            "delivery": "谨慎克制，语速舒缓，保留自然停顿。" * 4,
+            "language": "zh",
+            "promptFormatVersion": 2,
+            "maxDurationSeconds": 17.23,
+            "referenceWavPath": str(reference_path),
+            "outputPath": str(tmp_path / "short_controlled_segment.wav"),
+        },
+        48_000,
+    )
+
+    # 4 latent patches * 1,920 samples decode per generation step.
+    assert calls[0]["max_len"] == 107
+    assert calls[0]["retry_badcase_ratio_threshold"] == pytest.approx(106 / 78)
 
 
 def test_runner_keeps_accepted_profile_when_loudness_normalization_fails(

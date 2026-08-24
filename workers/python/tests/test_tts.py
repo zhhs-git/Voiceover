@@ -31,6 +31,7 @@ from audiobook_worker.tts import (
 )
 from audiobook_worker import tts as tts_module
 from audiobook_worker.voxcpm2_profile_loudness import voxcpm2_profile_loudness
+from audiobook_worker.tts_quality import maximum_duration_for_segment
 
 
 def _wav_bytes(duration_seconds: float = 0.1, sample_rate: int = 24_000) -> bytes:
@@ -165,6 +166,10 @@ def test_voxcpm2_payload_separates_stable_profile_from_dynamic_delivery(
     assert "语速偏快" in segment["delivery"]
     assert len(segment["delivery"]) < len(long_direction) + 40
     assert "SCENE_ONLY" not in segment["delivery"]
+    assert segment["maxDurationSeconds"] == maximum_duration_for_segment(
+        segment["text"],
+        "fast",
+    )
 
 
 def test_voxcpm2_uses_english_controls_for_non_chinese_segments(tmp_path: Path, monkeypatch):

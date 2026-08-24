@@ -40,6 +40,7 @@ from audiobook_worker.voxcpm2_profile_loudness import (
 from audiobook_worker.tts_quality import (
     TtsSegmentAudioQualityError,
     TtsSegmentAudioQualityResult,
+    maximum_duration_for_segment,
     validate_tts_segment_wav,
 )
 
@@ -925,6 +926,14 @@ class VoxCPM2TTSBackend:
                     "id": segment_id,
                     "text": str(segment.get("text") or ""),
                     "delivery": self._delivery_instruction(segment),
+                    # VoxCPM2 also counts the parenthesized delivery control
+                    # when it computes its internal generation ceiling. Pass
+                    # the speech-only quality ceiling so a long control cannot
+                    # turn a short utterance into an unbounded decode.
+                    "maxDurationSeconds": maximum_duration_for_segment(
+                        segment.get("text", ""),
+                        segment.get("pace", "normal"),
+                    ),
                     "language": language,
                     "promptFormatVersion": VOXCPM2_PROMPT_FORMAT_VERSION,
                     "referenceWavPath": str(profile_path),

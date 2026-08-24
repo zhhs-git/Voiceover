@@ -112,6 +112,17 @@ that noise to delivery text can make one valid segment repeatedly follow a bad
 MPS trajectory with a long silent tail. The WAV quality gate remains a final
 guard, while a regenerated segment receives a new sampling trajectory.
 
+The main worker also sends a `maxDurationSeconds` field for every local
+segment. It is calculated from the source text and pace using the shared TTS
+quality contract. The runner converts that speech-only duration into VoxCPM2
+latent generation steps and passes it as `max_len`; it does not let the
+parenthesized delivery control contribute to the ceiling. The runner applies
+the same speech-only boundary to VoxCPM2's built-in bad-case retry ratio. This
+prevents a short sentence with a verbose pause direction from being allowed to
+decode for tens of seconds when the model's stop head follows a bad MPS
+trajectory. The quality gate still rejects any returned WAV that crosses the
+boundary; it never repairs an overlong response by trimming it.
+
 Examples:
 
 ```text

@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -37,6 +38,9 @@ else:  # pragma: no cover - exercised by the isolated direct-script runtime.
 
 PROMPT_FORMAT_VERSION = 2
 PROFILE_VERSION = PROMPT_FORMAT_VERSION
+_DEFAULT_MAX_GENERATION_STEPS = 4096
+_VOXCPM2_BADCASE_MARGIN_STEPS = 1
+_VOXCPM2_DEFAULT_BADCASE_RATIO = 6.0
 
 
 class VoxCPM2RunnerError(RuntimeError):
@@ -158,6 +162,78 @@ def _atomic_write_wav(path: Path, audio: Any, sample_rate: int) -> None:
 def _controlled_text(instruction: str, text: str) -> str:
     normalized_instruction = " ".join(instruction.split())
     return f"({normalized_instruction}){text}" if normalized_instruction else text
+
+
+def _token_count(model: Any, text: str) -> int | None:
+    tokenizer = getattr(getattr(model, "tts_model", None), "text_tokenizer", None)
+    if not callable(tokenizer):
+        return None
+    try:
+        count = len(tokenizer(text))
+    except Exception:
+        return None
+    return count if count > 0 else None
+
+
+def _segment_generation_limits(
+    model: Any,
+    *,
+    text: str,
+    controlled_text: str,
+    maximum_duration_seconds: object,
+    sample_rate: int,
+) -> tuple[int, float]:
+    """Return model limits based on speech text, never control-text length."""
+
+    try:
+        maximum_duration = float(maximum_duration_seconds)
+    except (TypeError, ValueError):
+        raise VoxCPM2RunnerError(
+            "segment maxDurationSeconds must be a positive number."
+        )
+    if not math.isfinite(maximum_duration) or maximum_duration <= 0:
+        raise VoxCPM2RunnerError(
+            "segment maxDurationSeconds must be a positive number."
+        )
+
+    runtime_model = getattr(model, "tts_model", None)
+    try:
+        patch_size = int(getattr(runtime_model, "patch_size"))
+        decode_chunk_size_value = getattr(runtime_model, "_decode_chunk_size", None)
+        if decode_chunk_size_value is None:
+            decode_chunk_size_value = getattr(
+                getattr(runtime_model, "audio_vae", None),
+                "decode_chunk_size",
+                None,
+            )
+        decode_chunk_size = int(decode_chunk_size_value)
+    except (AttributeError, TypeError, ValueError):
+        return _DEFAULT_MAX_GENERATION_STEPS, _VOXCPM2_DEFAULT_BADCASE_RATIO
+    samples_per_step = patch_size * decode_chunk_size
+    if patch_size <= 0 or decode_chunk_size <= 0 or samples_per_step <= 0:
+        return _DEFAULT_MAX_GENERATION_STEPS, _VOXCPM2_DEFAULT_BADCASE_RATIO
+
+    # Floor the cap so the generated WAV cannot exceed the same duration
+    # boundary enforced by the main worker's quality gate.
+    max_steps = max(
+        1,
+        min(
+            _DEFAULT_MAX_GENERATION_STEPS,
+            math.floor(maximum_duration * sample_rate / samples_per_step),
+        ),
+    )
+    speech_token_count = _token_count(model, text)
+    controlled_token_count = _token_count(model, controlled_text)
+    if not speech_token_count or not controlled_token_count:
+        return max_steps, _VOXCPM2_DEFAULT_BADCASE_RATIO
+
+    # VoxCPM2 applies this ratio to the length of the complete target string.
+    # Compensate for the parenthesized controls so its bad-case detector uses
+    # the speech-only ceiling as well.  The margin avoids retrying ordinary
+    # outputs merely because they land one step below the hard cap.
+    retry_steps = max(1, max_steps - _VOXCPM2_BADCASE_MARGIN_STEPS)
+    ratio = retry_steps / controlled_token_count
+    return max_steps, max(0.1, ratio)
 
 
 def _prompt_format_version(value: object, *, name: str) -> int:
@@ -319,12 +395,23 @@ def _synthesize_segment(model: Any, item: dict[str, Any], sample_rate: int) -> d
     # Binding the seed to dynamic delivery text can permanently select a bad
     # MPS trajectory for one otherwise valid segment. Reference profiles are
     # still seeded in _ensure_profile because they are durable voice assets.
+    controlled_text = _controlled_text(delivery, text)
+    max_len, retry_badcase_ratio = _segment_generation_limits(
+        model,
+        text=text,
+        controlled_text=controlled_text,
+        maximum_duration_seconds=item.get("maxDurationSeconds"),
+        sample_rate=sample_rate,
+    )
     waveform = model.generate(
-        text=_controlled_text(delivery, text),
+        text=controlled_text,
         reference_wav_path=str(reference_path),
         cfg_value=2.0,
         inference_timesteps=10,
-        max_len=4096,
+        max_len=max_len,
+        retry_badcase=True,
+        retry_badcase_max_times=3,
+        retry_badcase_ratio_threshold=retry_badcase_ratio,
     )
     _atomic_write_wav(output_path, waveform, sample_rate)
     with wave.open(str(output_path), "rb") as wav_file:
