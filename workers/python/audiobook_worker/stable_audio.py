@@ -8,10 +8,8 @@ import re
 import shutil
 import subprocess
 import time
-import urllib.error
-import urllib.request
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +20,7 @@ from audiobook_worker.audio_quality import (
     analyze_audio,
     repair_short_suspicious_intervals,
 )
+from audiobook_worker.llm import normalize_serialized_audio_plan_music_coverage
 
 
 def _default_stable_audio_dir() -> Path:
@@ -46,11 +45,9 @@ MUSIC_TARGET_LUFS = -18.0
 MUSIC_TRUE_PEAK_DB = -2.0
 MUSIC_LOUDNESS_RANGE = 7.0
 MUSIC_NORMALIZATION_TIMEOUT_SECONDS = 300.0
-QUALITY_REPORT_VERSION = 1
+QUALITY_REPORT_VERSION = 2
 QUALITY_REGENERATION_ATTEMPTS = 2
-DEFAULT_STABLE_AUDIO_GRADIO_URL = "http://127.0.0.1:7860"
-DEFAULT_STABLE_AUDIO_GRADIO_TIMEOUT_SECONDS = 3900.0
-DEFAULT_STABLE_AUDIO_GRADIO_STEPS = 8
+FALLBACK_MUSIC_ASSET_ID = "chapter_fallback_music"
 
 
 class StableAudioError(RuntimeError):
@@ -78,10 +75,6 @@ class StableAudioConfig:
     cfg: float = 3.0
     timeout_seconds: float = 3600.0
     quality_enabled: bool = True
-    gradio_url: str = DEFAULT_STABLE_AUDIO_GRADIO_URL
-    gradio_api_token: str | None = None
-    gradio_timeout_seconds: float = DEFAULT_STABLE_AUDIO_GRADIO_TIMEOUT_SECONDS
-    gradio_steps: int = DEFAULT_STABLE_AUDIO_GRADIO_STEPS
 
     @classmethod
     def from_environment(cls) -> "StableAudioConfig":
@@ -103,22 +96,6 @@ class StableAudioConfig:
             ),
             quality_enabled=_bool_environment(
                 "AUDIOBOOK_AUDIO_ASSET_QUALITY_ENABLED", True
-            ),
-            gradio_url=os.environ.get(
-                "STABLE_AUDIO_GRADIO_URL", DEFAULT_STABLE_AUDIO_GRADIO_URL
-            ).rstrip("/"),
-            gradio_api_token=(
-                os.environ.get("STABLE_AUDIO_GRADIO_API_TOKEN") or None
-            ),
-            gradio_timeout_seconds=_float_environment(
-                "STABLE_AUDIO_GRADIO_TIMEOUT_SECONDS",
-                DEFAULT_STABLE_AUDIO_GRADIO_TIMEOUT_SECONDS,
-            ),
-            gradio_steps=_int_environment(
-                "STABLE_AUDIO_GRADIO_STEPS",
-                DEFAULT_STABLE_AUDIO_GRADIO_STEPS,
-                minimum=1,
-                maximum=16,
             ),
         )
 
@@ -219,17 +196,6 @@ def _bool_environment(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
-
-
-def _int_environment(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return min(maximum, max(minimum, value))
 
 
 def _required_string(value: Any, field: str) -> str:
@@ -578,7 +544,7 @@ def _quality_metadata_is_current(value: Any) -> bool:
     if not (
         isinstance(value, dict)
         and value.get("detectorVersion") == AUDIO_QUALITY_DETECTOR_VERSION
-        and value.get("status") in {"passed", "repaired"}
+        and value.get("status") in {"passed", "repaired", "review_only"}
         and isinstance(value.get("reportPath"), str)
         and value.get("reportPath")
     ):
@@ -719,8 +685,56 @@ def prune_audio_asset_manifest(
     return manifest_path
 
 
-def _load_audio_script(script_path: Path) -> dict[str, Any]:
-    """Read a chapter script and persist any legacy asset-ID repair."""
+def _validate_declared_audio_models(
+    script: dict[str, Any],
+    config: StableAudioConfig,
+) -> None:
+    """Reject an explicit incompatible model before coverage can fill a gap."""
+
+    raw_plan = script.get("audioPlan")
+    raw_scenes = raw_plan.get("scenes") if isinstance(raw_plan, dict) else None
+    if not isinstance(raw_scenes, list):
+        return
+
+    def validate(value: object, expected: str, field: str) -> None:
+        if not isinstance(value, dict) or "model" not in value:
+            return
+        model = value.get("model")
+        if not isinstance(model, str) or model.strip() != expected:
+            raise StableAudioError(
+                "invalid_audio_plan",
+                f"{field} must use {expected}, got {model}",
+            )
+
+    for scene_index, raw_scene in enumerate(raw_scenes):
+        if not isinstance(raw_scene, dict):
+            continue
+        prefix = f"audioPlan.scenes[{scene_index}]"
+        validate(raw_scene.get("music"), config.music_model, f"{prefix}.music")
+        raw_variants = raw_scene.get("musicVariants")
+        if isinstance(raw_variants, list):
+            for variant_index, raw_variant in enumerate(raw_variants):
+                validate(
+                    raw_variant,
+                    config.music_model,
+                    f"{prefix}.musicVariants[{variant_index}]",
+                )
+        raw_sfx = raw_scene.get("sfx")
+        if isinstance(raw_sfx, list):
+            for sfx_index, raw_sfx_item in enumerate(raw_sfx):
+                validate(
+                    raw_sfx_item,
+                    config.sfx_model,
+                    f"{prefix}.sfx[{sfx_index}]",
+                )
+
+
+def _load_audio_script(
+    script_path: Path,
+    *,
+    config: StableAudioConfig | None = None,
+) -> dict[str, Any]:
+    """Read a chapter script and normalize legacy IDs and music coverage."""
 
     try:
         script = json.loads(script_path.read_text(encoding="utf-8"))
@@ -731,8 +745,23 @@ def _load_audio_script(script_path: Path) -> dict[str, Any]:
     if not isinstance(script, dict):
         raise StableAudioError("invalid_script", "chapter script must be an object")
 
-    changes = normalize_script_audio_asset_ids(script)
-    if changes:
+    if config is not None:
+        _validate_declared_audio_models(script, config)
+
+    script_changed = bool(normalize_script_audio_asset_ids(script))
+    raw_segments = script.get("segments")
+    if isinstance(raw_segments, list) and raw_segments:
+        normalized_plan = normalize_serialized_audio_plan_music_coverage(
+            script.get("audioPlan"),
+            segment_count=len(raw_segments),
+            language=str(script.get("language") or "zh"),
+            segments=[item if isinstance(item, dict) else {} for item in raw_segments],
+        )
+        if script.get("audioPlan") != normalized_plan:
+            script["audioPlan"] = normalized_plan
+            script_changed = True
+
+    if script_changed:
         try:
             script_path.write_text(
                 json.dumps(script, ensure_ascii=False, indent=2) + "\n",
@@ -754,9 +783,8 @@ def collect_audio_asset_specs(
 ) -> list[AudioAssetSpec]:
     """Read and validate the Stable Audio assets declared by a chapter script.
 
-    The Gradio handoff uses the same normalized plan as the CLI generator.  Keeping
-    this in one place prevents the browser workflow and the legacy command-line
-    workflow from disagreeing about asset IDs, models, or output filenames.
+    Keeping this in one place prevents callers and the backend CLI generator
+    from disagreeing about asset IDs, models, or output filenames.
     """
     script = _load_audio_script(script_path)
 
@@ -788,7 +816,7 @@ def collect_audio_asset_specs(
 
 
 def asset_output_path(output_directory: Path, spec: AudioAssetSpec) -> Path:
-    """Return the stable destination used by both CLI and Gradio generation."""
+    """Return the stable destination used by all backend asset workflows."""
     subdirectory = output_directory / ("music" if spec.kind == "music" else "sfx")
     return subdirectory / f"{_safe_asset_stem(spec.asset_id)}.wav"
 
@@ -842,7 +870,7 @@ def import_generated_audio_asset(
     *,
     config: StableAudioConfig | None = None,
 ) -> AudioAssetResult:
-    """Import one WAV through the same quality gate as CLI generation."""
+    """Import one externally generated WAV through the normal quality gate."""
     if not _is_readable_wav(source_path):
         raise StableAudioError(
             "invalid_stable_audio_output",
@@ -862,7 +890,7 @@ def import_generated_audio_asset(
         output_path,
         config=config,
         signature=signature,
-        source="gradio_import",
+        source="external_import",
     )
     if not outcome.accepted:
         _record_rejected_asset(
@@ -1036,6 +1064,7 @@ def _quality_metadata(
     source: str,
     generation_attempts: int,
     repair_intervals: tuple[tuple[float, float], ...] = (),
+    review_only: bool = False,
 ) -> dict[str, Any]:
     return {
         "detectorVersion": AUDIO_QUALITY_DETECTOR_VERSION,
@@ -1044,6 +1073,7 @@ def _quality_metadata(
         "source": source,
         "generationAttempts": generation_attempts,
         "repairIntervals": [list(interval) for interval in repair_intervals],
+        "reviewOnly": review_only,
     }
 
 
@@ -1051,6 +1081,7 @@ def _quality_attempt(
     *,
     source: str,
     generation_attempt: int,
+    generation_seed: int | None = None,
     quality: AudioQualityResult | None = None,
     error: str | None = None,
     repair: dict[str, Any] | None = None,
@@ -1061,6 +1092,8 @@ def _quality_attempt(
         "generationAttempt": generation_attempt,
         "result": result,
     }
+    if generation_seed is not None:
+        item["generationSeed"] = generation_seed
     if quality is not None:
         item["quality"] = quality.to_dict()
     if error:
@@ -1079,12 +1112,14 @@ def _inspect_audio_asset_candidate(
     report_path: Path,
     source: str,
     generation_attempt: int,
+    generation_seed: int | None = None,
 ) -> _AssetQualityOutcome:
-    """Inspect one candidate and optionally repair a short suspected span.
+    """Inspect one candidate and optionally repair a short actionable span.
 
-    Any suspicious source is moved out of its normal asset location *before*
-    a repair is attempted.  That keeps a concurrently-started mix from ever
-    finding the bad WAV by a fallback filesystem path.
+    Any source that requires repair is moved out of its normal asset location
+    *before* a repair is attempted. That keeps a concurrently-started mix from
+    ever finding the bad WAV by a fallback filesystem path. Tonal-only review
+    observations remain in place and are accepted with their diagnostics.
     """
 
     rejected_paths: list[Path] = []
@@ -1100,6 +1135,7 @@ def _inspect_audio_asset_candidate(
             _quality_attempt(
                 source=source,
                 generation_attempt=generation_attempt,
+                generation_seed=generation_seed,
                 error=str(error),
                 result="rejected",
             )
@@ -1113,24 +1149,27 @@ def _inspect_audio_asset_candidate(
             tuple(rejected_paths),
         )
 
-    if not quality_result.is_suspicious:
+    if not quality_result.requires_repair:
+        quality_status = "review_only" if quality_result.review_only else "passed"
         report["attempts"].append(
             _quality_attempt(
                 source=source,
                 generation_attempt=generation_attempt,
+                generation_seed=generation_seed,
                 quality=quality_result,
-                result="passed",
+                result=quality_status,
             )
         )
         return _AssetQualityOutcome(
             True,
-            "passed",
+            quality_status,
             report_path,
             _quality_metadata(
                 report_path,
-                status="passed",
+                status=quality_status,
                 source=source,
                 generation_attempts=generation_attempt,
+                review_only=quality_result.review_only,
             ),
         )
 
@@ -1144,6 +1183,7 @@ def _inspect_audio_asset_candidate(
             _quality_attempt(
                 source=source,
                 generation_attempt=generation_attempt,
+                generation_seed=generation_seed,
                 quality=quality_result,
                 result="rejected",
             )
@@ -1157,37 +1197,16 @@ def _inspect_audio_asset_candidate(
             tuple(rejected_paths),
         )
 
-    if spec.kind == "sfx" and quality_result.duration_seconds < 3.0:
-        report["attempts"].append(
-            _quality_attempt(
-                source=source,
-                generation_attempt=generation_attempt,
-                quality=quality_result,
-                repair={
-                    "status": "not_eligible",
-                    "reason": "short_sfx_direct_regeneration",
-                },
-                result="rejected",
-            )
-        )
-        return _AssetQualityOutcome(
-            False,
-            "rejected",
-            report_path,
-            None,
-            "short_sfx_direct_regeneration",
-            tuple(rejected_paths),
-        )
-
     repair_result = repair_short_suspicious_intervals(
         archived_source,
         candidate_path,
-        quality_result.suspicious_intervals,
+        quality_result.actionable_intervals or quality_result.suspicious_intervals,
     )
     report["attempts"].append(
         _quality_attempt(
             source=source,
             generation_attempt=generation_attempt,
+            generation_seed=generation_seed,
             quality=quality_result,
             repair=repair_result.to_dict(),
             result="repair_attempted" if repair_result.repaired else "rejected",
@@ -1215,11 +1234,12 @@ def _inspect_audio_asset_candidate(
         repair_error = str(error)
     else:
         repair_error = None
-    if repaired_quality is not None and not repaired_quality.is_suspicious:
+    if repaired_quality is not None and not repaired_quality.requires_repair:
         report["attempts"].append(
             _quality_attempt(
                 source="repair",
                 generation_attempt=generation_attempt,
+                generation_seed=generation_seed,
                 quality=repaired_quality,
                 result="repaired",
             )
@@ -1234,6 +1254,7 @@ def _inspect_audio_asset_candidate(
                 source=source,
                 generation_attempts=generation_attempt,
                 repair_intervals=repair_result.intervals,
+                review_only=repaired_quality.review_only,
             ),
             rejected_paths=tuple(rejected_paths),
         )
@@ -1247,6 +1268,7 @@ def _inspect_audio_asset_candidate(
         _quality_attempt(
             source="repair",
             generation_attempt=generation_attempt,
+            generation_seed=generation_seed,
             quality=repaired_quality,
             error=repair_error,
             result="rejected",
@@ -1269,80 +1291,83 @@ def _regeneration_seed(signature: str, attempt: int) -> int:
     return int(digest[:8], 16) % 2_147_483_646 + 1
 
 
-def _request_gradio_regeneration(
+def _generate_cli_audio_candidate(
     spec: AudioAssetSpec,
+    output_path: Path,
+    config: StableAudioConfig,
+) -> None:
+    """Generate one asset through the configured Stable Audio CLI."""
+
+    if not config.executable.is_file():
+        raise StableAudioError(
+            "stable_audio_unavailable",
+            f"Stable Audio executable not found: {config.executable}",
+            details={"executable": str(config.executable)},
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
+    command = _command_for(spec, output_path, config)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(config.root),
+            capture_output=True,
+            text=True,
+            timeout=config.timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise StableAudioError(
+            "stable_audio_unavailable",
+            f"Unable to execute Stable Audio: {error}",
+        ) from error
+    except OSError as error:
+        raise StableAudioError(
+            "stable_audio_unavailable",
+            f"Unable to execute Stable Audio: {error}",
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise StableAudioError(
+            "stable_audio_timeout",
+            f"Stable Audio timed out while generating {spec.asset_id}",
+            details={"assetId": spec.asset_id},
+        ) from error
+    if completed.returncode != 0:
+        raise StableAudioError(
+            "stable_audio_generation_failed",
+            f"Failed to generate {spec.asset_id}: {_failure_detail(completed)}",
+            details={
+                "assetId": spec.asset_id,
+                "returnCode": completed.returncode,
+            },
+        )
+    if not _is_readable_wav(output_path):
+        raise StableAudioError(
+            "invalid_stable_audio_output",
+            f"Stable Audio did not create a readable WAV for {spec.asset_id}",
+            details={"assetId": spec.asset_id, "path": str(output_path)},
+        )
+    if spec.kind == "music":
+        try:
+            _normalize_music_asset(output_path)
+        except StableAudioError:
+            output_path.unlink(missing_ok=True)
+            raise
+
+
+def _regenerate_audio_asset_cli(
+    spec: AudioAssetSpec,
+    output_path: Path,
     config: StableAudioConfig,
     *,
     signature: str,
     attempt: int,
-) -> Path:
-    """Ask the local 7860 service for one isolated background-audio asset."""
+) -> AudioAssetSpec:
+    """Regenerate one rejected asset with an auditable deterministic seed."""
 
-    base_url = config.gradio_url.strip().rstrip("/")
-    if not base_url:
-        raise StableAudioError(
-            "stable_audio_gradio_unavailable",
-            "STABLE_AUDIO_GRADIO_URL is empty",
-        )
-    payload = {
-        "model": spec.model,
-        "decoder": config.decoder,
-        "prompt": spec.prompt,
-        "negativePrompt": spec.negative_prompt,
-        "seconds": spec.duration_seconds,
-        "cfg": config.cfg if spec.negative_prompt else 1.0,
-        "seed": _regeneration_seed(signature, attempt),
-        "steps": config.gradio_steps,
-    }
-    headers = {"Content-Type": "application/json"}
-    if config.gradio_api_token:
-        headers["X-Stable-Audio-Token"] = config.gradio_api_token
-    request = urllib.request.Request(
-        f"{base_url}/api/audiobook/v1/generate",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=config.gradio_timeout_seconds) as response:
-            raw_response = response.read()
-            if response.status < 200 or response.status >= 300:
-                raise StableAudioError(
-                    "stable_audio_gradio_failed",
-                    f"Stable Audio Gradio returned HTTP {response.status}",
-                )
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace").strip()
-        raise StableAudioError(
-            "stable_audio_gradio_failed",
-            f"Stable Audio Gradio returned HTTP {error.code}: {detail or error.reason}",
-        ) from error
-    except (OSError, urllib.error.URLError) as error:
-        raise StableAudioError(
-            "stable_audio_gradio_unavailable",
-            f"Unable to reach Stable Audio Gradio: {error}",
-        ) from error
-    try:
-        decoded = json.loads(raw_response.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise StableAudioError(
-            "stable_audio_gradio_failed",
-            "Stable Audio Gradio returned invalid JSON",
-        ) from error
-    path_value = decoded.get("path") if isinstance(decoded, dict) else None
-    if not isinstance(path_value, str) or not path_value.strip():
-        raise StableAudioError(
-            "stable_audio_gradio_failed",
-            "Stable Audio Gradio response did not include a WAV path",
-        )
-    generated_path = Path(path_value).expanduser().resolve()
-    if generated_path.suffix.lower() != ".wav" or not _is_readable_wav(generated_path):
-        raise StableAudioError(
-            "invalid_stable_audio_output",
-            "Stable Audio Gradio did not return a readable WAV",
-            details={"path": str(generated_path)},
-        )
-    return generated_path
+    retry_spec = replace(spec, seed=_regeneration_seed(signature, attempt))
+    _generate_cli_audio_candidate(retry_spec, output_path, config)
+    return retry_spec
 
 
 def _copy_regenerated_candidate(
@@ -1395,6 +1420,7 @@ def _run_audio_asset_quality_gate(
         report_path=report_path,
         source=source,
         generation_attempt=0,
+        generation_seed=spec.seed,
     )
     rejected_paths.extend(first.rejected_paths)
     if first.accepted:
@@ -1405,28 +1431,30 @@ def _run_audio_asset_quality_gate(
 
     latest_reason = first.reason or "quality_rejected"
     for attempt in range(1, QUALITY_REGENERATION_ATTEMPTS + 1):
+        retry_seed = _regeneration_seed(signature, attempt)
         try:
-            generated_path = _request_gradio_regeneration(
+            retry_spec = _regenerate_audio_asset_cli(
                 spec,
+                output_path,
                 config,
                 signature=signature,
                 attempt=attempt,
             )
-            _copy_regenerated_candidate(generated_path, output_path, spec)
         except StableAudioError as error:
             latest_reason = error.code
             failed_candidate = _archive_audio_candidate(
                 output_directory,
                 spec,
                 output_path,
-                reason="gradio-regeneration-failed",
+                reason="cli-regeneration-failed",
             )
             if failed_candidate is not None:
                 rejected_paths.append(failed_candidate)
             report["attempts"].append(
                 {
-                    "source": "gradio_regeneration",
+                    "source": "stable_audio_cli_regeneration",
                     "generationAttempt": attempt,
+                    "generationSeed": retry_seed,
                     "result": "generation_failed",
                     "error": {"code": error.code, "message": str(error)},
                 }
@@ -1439,8 +1467,9 @@ def _run_audio_asset_quality_gate(
             output_path,
             report=report,
             report_path=report_path,
-            source="gradio_regeneration",
+            source="stable_audio_cli_regeneration",
             generation_attempt=attempt,
+            generation_seed=retry_spec.seed,
         )
         rejected_paths.extend(regenerated.rejected_paths)
         if regenerated.accepted:
@@ -1461,6 +1490,47 @@ def _run_audio_asset_quality_gate(
         None,
         latest_reason,
         tuple(rejected_paths),
+    )
+
+
+def _record_audio_generation_failure(
+    output_directory: Path,
+    manifest: dict[str, Any],
+    spec: AudioAssetSpec,
+    output_path: Path,
+    *,
+    signature: str,
+    source: str,
+    error: StableAudioError,
+) -> None:
+    """Quarantine a failed CLI candidate without discarding the chapter state."""
+
+    report_path = _quality_report_path(output_directory, spec)
+    rejected_candidate = _archive_audio_candidate(
+        output_directory,
+        spec,
+        output_path,
+        reason=f"{source}-generation-failed",
+    )
+    report = _new_quality_report(spec, signature)
+    report["status"] = "generation_failed"
+    report["reason"] = error.code
+    report["attempts"].append(
+        {
+            "source": source,
+            "generationAttempt": 0,
+            "generationSeed": spec.seed,
+            "result": "generation_failed",
+            "error": {"code": error.code, "message": str(error)},
+        }
+    )
+    _write_quality_report(report_path, report)
+    _record_rejected_asset(
+        manifest,
+        spec,
+        reason=error.code,
+        report_path=report_path,
+        rejected_paths=[rejected_candidate] if rejected_candidate is not None else [],
     )
 
 
@@ -1523,6 +1593,53 @@ def _refresh_quality_music_fallbacks(
         manifest.pop("qualityFallbacks", None)
 
 
+def _chapter_fallback_music_spec(
+    specs: list[AudioAssetSpec],
+) -> AudioAssetSpec | None:
+    """Build one conservative music bed for a chapter with no survivor.
+
+    The fallback is deliberately an explicit manifest asset. The mixer can
+    then map rejected scene music to it without ever searching for a rejected
+    WAV by filename.
+    """
+
+    base = next((spec for spec in specs if spec.kind == "music"), None)
+    if base is None:
+        return None
+    used_ids = {spec.asset_id for spec in specs if spec.kind == "music"}
+    asset_id = FALLBACK_MUSIC_ASSET_ID
+    suffix = 2
+    while asset_id in used_ids:
+        asset_id = f"{FALLBACK_MUSIC_ASSET_ID}_{suffix}"
+        suffix += 1
+    seed_source = (
+        f"{base.plan_signature}:chapter-fallback:{asset_id}".encode("utf-8")
+    )
+    seed = int(hashlib.sha256(seed_source).hexdigest()[:8], 16) % 2_147_483_646 + 1
+    prompt = (
+        f"{base.prompt.rstrip(' ,.;，。；')}, continuous understated instrumental "
+        "background bed, gentle texture, no sudden accents"
+    )
+    return replace(
+        base,
+        asset_id=asset_id,
+        scene_id="chapter_fallback",
+        prompt=prompt,
+        seed=seed,
+    )
+
+
+def _has_approved_music(
+    manifest: dict[str, Any],
+    specs: list[AudioAssetSpec],
+) -> bool:
+    assets = manifest.get("assets")
+    return isinstance(assets, dict) and any(
+        spec.kind == "music" and spec.manifest_key in assets
+        for spec in specs
+    )
+
+
 def _format_seconds(value: float) -> str:
     if value.is_integer():
         return str(int(value))
@@ -1577,10 +1694,13 @@ def generate_audio_assets(
     config: StableAudioConfig | None = None,
 ) -> AudioAssetGenerationResult:
     config = config or StableAudioConfig.from_environment()
-    script = _load_audio_script(script_path)
+    script = _load_audio_script(script_path, config=config)
 
-    all_specs = _collect_asset_specs(script)
-    specs = all_specs
+    planned_specs = _collect_asset_specs(script)
+    fallback_spec = _chapter_fallback_music_spec(planned_specs)
+    all_specs = [*planned_specs, *([fallback_spec] if fallback_spec else [])]
+    specs = planned_specs
+    selected_asset = asset_id is not None or asset_kind is not None
     if asset_id is not None or asset_kind is not None:
         if not isinstance(asset_id, str) or not asset_id.strip():
             raise StableAudioError(
@@ -1636,10 +1756,14 @@ def generate_audio_assets(
 
     results: list[AudioAssetResult] = []
     warnings: list[str] = []
-    for spec in specs:
+
+    def process_spec(
+        spec: AudioAssetSpec,
+        *,
+        continue_after_generation_failure: bool = False,
+    ) -> AudioAssetResult | None:
         signature = _asset_signature(spec, config)
         output_path = asset_output_path(output_directory, spec)
-        subdirectory = output_path.parent
         previous = manifest_assets.get(spec.manifest_key)
         matching_cached_candidate = (
             not force
@@ -1655,91 +1779,46 @@ def generate_audio_assets(
         )
 
         if cache_hit:
-            results.append(
-                AudioAssetResult(
-                    asset_id=spec.asset_id,
-                    kind=spec.kind,
-                    scene_id=spec.scene_id,
-                    model=spec.model,
-                    path=output_path,
-                    duration_seconds=_wav_duration(output_path),
-                    signature=signature,
-                    cache_hit=True,
-                    quality=(previous.get("quality") if isinstance(previous, dict) else None),
-                )
+            return AudioAssetResult(
+                asset_id=spec.asset_id,
+                kind=spec.kind,
+                scene_id=spec.scene_id,
+                model=spec.model,
+                path=output_path,
+                duration_seconds=_wav_duration(output_path),
+                signature=signature,
+                cache_hit=True,
+                quality=(previous.get("quality") if isinstance(previous, dict) else None),
             )
-            continue
 
         if matching_cached_candidate:
             source = "cache_validation"
         else:
-            if not config.executable.is_file():
-                raise StableAudioError(
-                    "stable_audio_unavailable",
-                    f"Stable Audio executable not found: {config.executable}",
-                    details={"executable": str(config.executable)},
-                    partial_assets=results,
-                )
-            subdirectory.mkdir(parents=True, exist_ok=True)
             manifest_assets.pop(spec.manifest_key, None)
-            output_path.unlink(missing_ok=True)
-            command = _command_for(spec, output_path, config)
             try:
-                completed = subprocess.run(
-                    command,
-                    cwd=str(config.root),
-                    capture_output=True,
-                    text=True,
-                    timeout=config.timeout_seconds,
-                    check=False,
-                )
-            except FileNotFoundError as error:
+                _generate_cli_audio_candidate(spec, output_path, config)
+            except StableAudioError as error:
+                if continue_after_generation_failure:
+                    _record_audio_generation_failure(
+                        output_directory,
+                        manifest,
+                        spec,
+                        output_path,
+                        signature=signature,
+                        source="stable_audio_cli_fallback",
+                        error=error,
+                    )
+                    warnings.append(
+                        f"audio_generation_failed:{spec.manifest_key}:{error.code}"
+                    )
+                    _write_manifest(manifest_path, manifest)
+                    return None
                 raise StableAudioError(
-                    "stable_audio_unavailable",
-                    f"Unable to execute Stable Audio: {error}",
+                    error.code,
+                    str(error),
+                    details=error.details,
                     partial_assets=results,
                 ) from error
-            except OSError as error:
-                raise StableAudioError(
-                    "stable_audio_unavailable",
-                    f"Unable to execute Stable Audio: {error}",
-                    partial_assets=results,
-                ) from error
-            except subprocess.TimeoutExpired as error:
-                raise StableAudioError(
-                    "stable_audio_timeout",
-                    f"Stable Audio timed out while generating {spec.asset_id}",
-                    details={"assetId": spec.asset_id},
-                    partial_assets=results,
-                ) from error
-            if completed.returncode != 0:
-                raise StableAudioError(
-                    "stable_audio_generation_failed",
-                    f"Failed to generate {spec.asset_id}: {_failure_detail(completed)}",
-                    details={
-                        "assetId": spec.asset_id,
-                        "returnCode": completed.returncode,
-                    },
-                    partial_assets=results,
-                )
-            if not _is_readable_wav(output_path):
-                raise StableAudioError(
-                    "invalid_stable_audio_output",
-                    f"Stable Audio did not create a readable WAV for {spec.asset_id}",
-                    details={"assetId": spec.asset_id, "path": str(output_path)},
-                    partial_assets=results,
-                )
-            if spec.kind == "music":
-                try:
-                    _normalize_music_asset(output_path)
-                except StableAudioError as error:
-                    output_path.unlink(missing_ok=True)
-                    raise StableAudioError(
-                        error.code,
-                        str(error),
-                        details=error.details,
-                        partial_assets=results,
-                    ) from error
             source = "stable_audio_cli"
 
         outcome = _run_audio_asset_quality_gate(
@@ -1762,7 +1841,7 @@ def generate_audio_assets(
                 f"audio_quality_rejected:{spec.manifest_key}:{outcome.reason or 'unknown'}"
             )
             _write_manifest(manifest_path, manifest)
-            continue
+            return None
 
         actual_duration = _wav_duration(output_path)
         result = AudioAssetResult(
@@ -1773,10 +1852,12 @@ def generate_audio_assets(
             path=output_path,
             duration_seconds=actual_duration,
             signature=signature,
-            cache_hit=(matching_cached_candidate and outcome.status == "passed"),
+            cache_hit=(
+                matching_cached_candidate
+                and outcome.status in {"passed", "review_only"}
+            ),
             quality=outcome.quality,
         )
-        results.append(result)
         _record_accepted_asset(
             manifest,
             spec,
@@ -1786,6 +1867,31 @@ def generate_audio_assets(
             quality=outcome.quality,
         )
         _write_manifest(manifest_path, manifest)
+        return result
+
+    for spec in specs:
+        result = process_spec(spec)
+        if result is not None:
+            results.append(result)
+
+    if not selected_asset and fallback_spec is not None:
+        if _has_approved_music(manifest, planned_specs):
+            # A normal planned music asset recovered. Keep the old fallback
+            # WAV on disk for diagnosis, but stop advertising it to the mixer.
+            manifest_assets.pop(fallback_spec.manifest_key, None)
+            rejected_assets = manifest.get("rejectedAssets")
+            if isinstance(rejected_assets, dict):
+                rejected_assets.pop(fallback_spec.manifest_key, None)
+        elif not _has_approved_music(manifest, all_specs):
+            fallback_result = process_spec(
+                fallback_spec,
+                continue_after_generation_failure=True,
+            )
+            if fallback_result is not None:
+                results.append(fallback_result)
+                warnings.append("quality_music_fallback_generated")
+            else:
+                warnings.append("quality_music_fallback_unavailable")
 
     _refresh_quality_music_fallbacks(manifest, all_specs)
     if specs and not results:

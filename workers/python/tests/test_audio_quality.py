@@ -10,6 +10,7 @@ import pytest
 
 from audiobook_worker.audio_quality import (
     AUDIO_QUALITY_DETECTOR_VERSION,
+    _classify_recovery_intervals,
     analyze_audio,
     main,
     repair_short_suspicious_intervals,
@@ -63,6 +64,9 @@ def test_short_loud_high_frequency_burst_is_reported(tmp_path: Path):
 
     assert result.status == "sharp_suspected"
     assert "high_frequency_burst" in result.issues
+    assert result.requires_repair
+    assert result.actionable_intervals
+    assert not result.review_only
     assert any(0.15 <= time_seconds <= 0.35 for time_seconds in result.suspicious_times)
 
 
@@ -110,6 +114,7 @@ def test_short_abrupt_low_frequency_burst_is_a_spectral_candidate(tmp_path: Path
     assert result.status == "sharp_suspected"
     assert "tonal_spectral_event" in result.issues
     assert any(0.15 <= start_time <= 0.35 for start_time, _ in result.suspicious_intervals)
+    assert result.requires_repair
 
 
 def test_short_interval_repair_preserves_source_and_writes_shorter_wav(tmp_path: Path):
@@ -136,6 +141,37 @@ def test_short_interval_repair_preserves_source_and_writes_shorter_wav(tmp_path:
         assert output.getnframes() < original.getnframes()
     assert result.to_dict()["crossfadeSeconds"] == pytest.approx(0.03)
     assert AUDIO_QUALITY_DETECTOR_VERSION >= 1
+
+
+def test_repair_accepts_an_isolated_two_second_defect(tmp_path: Path):
+    source = tmp_path / "source.wav"
+    repaired = tmp_path / "repaired.wav"
+    _write_wav(source, _sine(24000, 3.4, 440, 0.2))
+
+    result = repair_short_suspicious_intervals(
+        source,
+        repaired,
+        ((0.7, 2.6),),
+    )
+
+    assert result.repaired
+    assert result.intervals[0] == pytest.approx((0.68, 2.62))
+    assert repaired.is_file()
+
+
+def test_scattered_tonal_events_are_review_only_not_repair_targets():
+    intervals = (
+        (0.1, 0.2),
+        (0.6, 0.7),
+        (1.1, 1.2),
+        (1.6, 1.7),
+        (2.1, 2.2),
+    )
+
+    actionable, review = _classify_recovery_intervals((), intervals)
+
+    assert actionable == ()
+    assert review == intervals
 
 
 def test_repair_rejects_interval_at_audio_edge(tmp_path: Path):

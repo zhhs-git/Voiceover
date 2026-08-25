@@ -1998,6 +1998,31 @@ def ensure_audio_music_coverage(
     return ChapterAudioPlan(scenes=expanded)
 
 
+def normalize_serialized_audio_plan_music_coverage(
+    audio_plan: Any,
+    *,
+    segment_count: int,
+    language: str = "zh",
+    segments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normalize saved audio-plan JSON through the canonical coverage rules.
+
+    Fresh LLM analysis already calls :func:`ensure_audio_music_coverage`, but
+    imported and older chapter scripts can bypass that stage. Keeping parsing,
+    coverage, and serialization together prevents Stable Audio generation from
+    inventing a second interpretation of the audio-plan schema.
+    """
+
+    plan = _parse_audio_plan(audio_plan)
+    covered = ensure_audio_music_coverage(
+        plan,
+        segment_count=segment_count,
+        language=language,
+        segments=segments,
+    )
+    return audio_plan_to_dict(covered)
+
+
 def audio_plan_to_dict(audio_plan: ChapterAudioPlan) -> dict[str, Any]:
     """Serialize the analysis audio plan into the chapter-script JSON shape."""
     serialized_scenes: list[dict[str, Any]] = []

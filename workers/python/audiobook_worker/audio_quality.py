@@ -24,9 +24,13 @@ _FRAME_RE = re.compile(
     r"^frame:(?P<index>\d+)\s+pts:\S+\s+pts_time:(?P<time>\S+)"
 )
 SHARP_PEAK_THRESHOLD_DBFS = -10.0
-AUDIO_QUALITY_DETECTOR_VERSION = 1
-MAX_REPAIR_INTERVAL_SECONDS = 0.15
-MAX_REPAIR_TOTAL_SECONDS = 0.50
+AUDIO_QUALITY_DETECTOR_VERSION = 2
+# The reviewed defects are isolated short bursts.  A two-second ceiling lets
+# the recovery path remove them without treating a damaged or musical passage
+# as a sequence of tiny edits.
+MAX_REPAIR_INTERVAL_SECONDS = 2.0
+MAX_REPAIR_TOTAL_SECONDS = 2.0
+MAX_ACTIONABLE_TONAL_INTERVALS = 4
 REPAIR_PADDING_SECONDS = 0.02
 REPAIR_CROSSFADE_SECONDS = 0.03
 MIN_REPAIR_RETAINED_PIECE_SECONDS = 0.06
@@ -82,10 +86,35 @@ class AudioQualityResult:
     windows_analyzed: int
     clipped_windows: int
     high_frequency_burst_windows: int
+    actionable_intervals: tuple[tuple[float, float], ...] = ()
+    review_intervals: tuple[tuple[float, float], ...] = ()
 
     @property
     def is_suspicious(self) -> bool:
         return self.status != "normal"
+
+    @property
+    def requires_repair(self) -> bool:
+        """Whether this candidate has a bounded defect that must be removed.
+
+        ``actionable_intervals`` was added after the original result contract.
+        Treat an older, manually-created suspicious result with no explicit
+        review ranges as actionable so existing callers retain their previous
+        safe behavior. Results emitted by this module always populate one of
+        the two interval categories.
+        """
+
+        if self.actionable_intervals:
+            return True
+        if self.review_intervals:
+            return False
+        return self.is_suspicious
+
+    @property
+    def review_only(self) -> bool:
+        """Whether diagnostics remain but no destructive recovery is needed."""
+
+        return self.is_suspicious and not self.requires_repair
 
     def to_dict(self) -> dict[str, object]:
         """Return a stable JSON-safe representation for manifests and reports."""
@@ -97,6 +126,10 @@ class AudioQualityResult:
             "riskScore": self.risk_score,
             "suspiciousTimes": list(self.suspicious_times),
             "suspiciousIntervals": [list(interval) for interval in self.suspicious_intervals],
+            "actionableIntervals": [list(interval) for interval in self.actionable_intervals],
+            "reviewIntervals": [list(interval) for interval in self.review_intervals],
+            "requiresRepair": self.requires_repair,
+            "reviewOnly": self.review_only,
             "issues": list(self.issues),
             "windowsAnalyzed": self.windows_analyzed,
             "clippedWindows": self.clipped_windows,
@@ -412,6 +445,42 @@ def _merge_intervals(
         else:
             merged.append([start, end])
     return tuple((round(start, 2), round(end, 2)) for start, end in merged)
+
+
+def _interval_duration(intervals: Iterable[tuple[float, float]]) -> float:
+    """Return the summed duration of already merged time ranges."""
+
+    return sum(end - start for start, end in intervals)
+
+
+def _classify_recovery_intervals(
+    hard_intervals: tuple[tuple[float, float], ...],
+    tonal_intervals: tuple[tuple[float, float], ...],
+) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]:
+    """Separate hard audible defects from non-blocking musical observations.
+
+    Narrow tonal crests can identify a short artifact in a quiet effect, but
+    generated music naturally contains many of them.  Only a small, isolated
+    tonal set is safe to remove. Hard clipping or broadband/high-frequency
+    bursts remain actionable even when the same file also has tonal reviews.
+    """
+
+    if hard_intervals:
+        return hard_intervals, tonal_intervals
+
+    tonal_duration = _interval_duration(tonal_intervals)
+    tonal_isolated = (
+        bool(tonal_intervals)
+        and len(tonal_intervals) <= MAX_ACTIONABLE_TONAL_INTERVALS
+        and tonal_duration <= MAX_REPAIR_TOTAL_SECONDS + 1e-9
+        and all(
+            end - start <= MAX_REPAIR_INTERVAL_SECONDS + 1e-9
+            for start, end in tonal_intervals
+        )
+    )
+    if tonal_isolated:
+        return tonal_intervals, ()
+    return (), tonal_intervals
 
 
 def _safe_repair_intervals(
@@ -810,14 +879,27 @@ def analyze_audio(
     # feature covers a full 2048-sample analysis window.  Report that full
     # listening span instead of the shorter hop distance.
     spectral_frame_duration = SPECTRAL_WINDOW_SIZE / sample_rate
-    spectral_intervals = _group_intervals(
-        [*tonal_times, *broadband_times],
+    tonal_intervals = _group_intervals(
+        tonal_times,
         frame_duration_seconds=spectral_frame_duration,
         maximum_gap_seconds=0.07,
     )
-    suspicious_intervals = _merge_intervals([
+    broadband_intervals = _group_intervals(
+        broadband_times,
+        frame_duration_seconds=spectral_frame_duration,
+        maximum_gap_seconds=0.07,
+    )
+    hard_intervals = _merge_intervals([
         *regular_intervals,
-        *spectral_intervals,
+        *broadband_intervals,
+    ])
+    actionable_intervals, review_intervals = _classify_recovery_intervals(
+        hard_intervals,
+        tonal_intervals,
+    )
+    suspicious_intervals = _merge_intervals([
+        *hard_intervals,
+        *tonal_intervals,
     ])
     issues: list[str] = []
     if clipped_windows:
@@ -858,6 +940,8 @@ def analyze_audio(
         windows_analyzed=len(windows),
         clipped_windows=clipped_windows,
         high_frequency_burst_windows=burst_windows,
+        actionable_intervals=actionable_intervals,
+        review_intervals=review_intervals,
     )
 
 
@@ -887,9 +971,16 @@ def _status_label(status: str) -> str:
 def print_result(result: AudioQualityResult) -> None:
     print(f"文件：{result.path}")
     print(f"时长：{result.duration_seconds:.2f}s")
-    print(f"结果：{_status_label(result.status)}")
+    label = (
+        "仅供复核（不阻断背景音生成）"
+        if result.review_only
+        else _status_label(result.status)
+    )
+    print(f"结果：{label}")
     print(f"风险分：{result.risk_score:.3f}")
     print(f"异常时间段：{_format_intervals(result.suspicious_intervals)}")
+    print(f"需要修复：{_format_intervals(result.actionable_intervals)}")
+    print(f"仅供复核：{_format_intervals(result.review_intervals)}")
     print(f"风险时间点：{_format_times(result.suspicious_times)}")
     print(f"原因：{'、'.join(result.issues) if result.issues else '未发现短时高频峰值或削波'}")
 

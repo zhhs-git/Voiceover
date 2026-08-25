@@ -620,6 +620,24 @@ def build_audio_mix_plan(
             )
         )
 
+    if not any(track.kind == "music" for track in tracks):
+        has_planned_sfx = any(
+            isinstance(raw_scene, dict)
+            and isinstance(raw_scene.get("sfx"), list)
+            and bool(raw_scene["sfx"])
+            for raw_scene in raw_scenes
+        )
+        if has_planned_sfx:
+            warnings.append("sfx_suppressed_without_approved_music")
+        if not tracks:
+            warnings.append("no_mix_tracks")
+        return AudioMixPlan(
+            timeline=tuple(timeline),
+            tracks=tuple(tracks),
+            duration_seconds=cursor if timeline else 0.0,
+            warnings=tuple(dict.fromkeys(warnings)),
+        )
+
     for (
         _scene_index,
         raw_scene,

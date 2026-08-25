@@ -428,6 +428,47 @@ def test_quality_rejected_assets_never_use_filesystem_fallback(tmp_path: Path):
     assert any(warning.startswith("quality_music_fallback:scene_001:") for warning in plan.warnings)
 
 
+def test_sfx_is_suppressed_without_an_approved_music_track(tmp_path: Path):
+    backend = MockTTSBackend()
+    segment_directory = tmp_path / "segments"
+    segment = backend.synthesize_segment(
+        {"id": "seg_0001", "text": "门被推开。"},
+        segment_directory,
+    )
+    asset_directory = tmp_path / "audio-assets"
+    backend.synthesize_segment(
+        {"id": "door", "text": "door creak"},
+        asset_directory / "sfx",
+    )
+
+    plan = build_audio_mix_plan(
+        [segment.path],
+        [{"id": "seg_0001", "sourceSegmentIds": ["seg_0001"]}],
+        {
+            "segments": [{"id": "seg_0001", "text": "门被推开。"}],
+            "audioPlan": {
+                "scenes": [{
+                    "id": "scene_001",
+                    "startSegmentIndex": 0,
+                    "endSegmentIndex": 0,
+                    "music": {"model": "sm-music"},
+                    "sfx": [{
+                        "id": "door",
+                        "anchorSegmentIndex": 0,
+                        "timing": "during",
+                    }],
+                }]
+            },
+        },
+        asset_directory,
+    )
+
+    assert plan.tracks == ()
+    assert "missing_music_asset:scene_001" in plan.warnings
+    assert "sfx_suppressed_without_approved_music" in plan.warnings
+    assert "no_mix_tracks" in plan.warnings
+
+
 def test_sfx_anchor_spanning_segments_is_kept_at_chapter_start(tmp_path: Path):
     backend = MockTTSBackend()
     segment_dir = tmp_path / "segments"
@@ -438,7 +479,11 @@ def test_sfx_anchor_spanning_segments_is_kept_at_chapter_start(tmp_path: Path):
         segment_dir,
     )
     asset_dir = tmp_path / "audio-assets"
+    (asset_dir / "music").mkdir(parents=True)
     (asset_dir / "sfx").mkdir(parents=True)
+    backend.synthesize_segment(
+        {"id": "scene_001", "text": "music"}, asset_dir / "music"
+    )
     effect = backend.synthesize_segment(
         {"id": "door", "text": "door creak"},
         asset_dir / "sfx",
@@ -462,7 +507,7 @@ def test_sfx_anchor_spanning_segments_is_kept_at_chapter_start(tmp_path: Path):
                     "id": "scene_001",
                     "startSegmentIndex": 0,
                     "endSegmentIndex": 2,
-                    "music": None,
+                    "music": {"model": "sm-music"},
                     "sfx": [{
                         "id": "door",
                         "anchorSegmentIndex": 0,
@@ -490,7 +535,11 @@ def test_unmatched_before_sfx_is_not_silently_dropped(tmp_path: Path):
     segment_dir = tmp_path / "segments"
     first = backend.synthesize_segment({"id": "seg_0001", "text": "门"}, segment_dir)
     asset_dir = tmp_path / "audio-assets"
+    (asset_dir / "music").mkdir(parents=True)
     (asset_dir / "sfx").mkdir(parents=True)
+    backend.synthesize_segment(
+        {"id": "scene_001", "text": "music"}, asset_dir / "music"
+    )
     backend.synthesize_segment({"id": "door", "text": "door creak"}, asset_dir / "sfx")
 
     plan = build_audio_mix_plan(
@@ -503,7 +552,7 @@ def test_unmatched_before_sfx_is_not_silently_dropped(tmp_path: Path):
                     "id": "scene_001",
                     "startSegmentIndex": 0,
                     "endSegmentIndex": 0,
-                    "music": None,
+                    "music": {"model": "sm-music"},
                     "sfx": [{
                         "id": "door",
                         "anchorSegmentIndex": 0,
@@ -516,7 +565,7 @@ def test_unmatched_before_sfx_is_not_silently_dropped(tmp_path: Path):
         asset_dir,
     )
 
-    assert [track.kind for track in plan.tracks] == ["sfx"]
+    assert [track.kind for track in plan.tracks] == ["music", "sfx"]
     assert "unmatched_sfx_anchor_text:door" in plan.warnings
     assert "sfx_shifted_to_chapter_start:door" in plan.warnings
 
